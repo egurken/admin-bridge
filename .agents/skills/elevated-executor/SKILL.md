@@ -20,27 +20,54 @@ The bridge utility runs silently in the background (via `pythonw` without any bl
 
 ---
 
-## Hybrid Execution Model & HOTP Authentication (RFC 4226)
+## Execution Workflows
 
-The bridge operates in a **Hybrid Mode** with reinforced security:
+### Workflow A (Recommended): 2-Step Chat Pre-Authorization (Valid for 45 min)
+Use this workflow whenever the user provides an OTP in chat before or during a task:
+1. **Immediate Pre-Authorization** (first action upon receiving the OTP):
+   ```powershell
+   & "C:\Utilitario\AntigravityBridge.exe" preauth --otp "123456"
+   # Or via client:
+   python C:\Utilitario\client.py preauth --otp "123456"
+   ```
+   - This validates the OTP immediately and advances the HOTP counter.
+   - Generates a secure single-use ticket in `C:\Utilitario\queue\preauth_ticket.json` valid for **45 minutes** (2700s).
+   - Prevents counter desynchronization and OTP expiration while planning or formulating scripts.
 
-1. **Automated Mode with OTP**:
-   - When the user sends `OTP: 123456` in the chat, pass `--otp <digits>` to `client.py`.
-   - The bridge validates the HOTP atomically.
-   - On success, the counter advances and execution runs **100% automatically in background** (`CREATE_NO_WINDOW`), auto-closing within 1.5s.
-   - On failure, execution is blocked immediately and the counter **advances as well** (preventing brute-force/replay attacks).
+2. **Subsequent Execution** (within the 45-minute window):
+   ```powershell
+   & "C:\Utilitario\AntigravityBridge.exe" run --title "Titulo da Tarefa" --description "Descricao" --type cmd --code "ipconfig /flushdns"
+   # Or via client:
+   python C:\Utilitario\client.py run --title "Titulo da Tarefa" --description "Descricao" --type cmd --code "ipconfig /flushdns"
+   ```
+   - The daemon automatically validates and atomically consumes the pre-authorization ticket.
+   - Execution runs **100% in the background** (`CREATE_NO_WINDOW`) without user interaction on the computer screen.
 
-2. **Interactive Mode without OTP (UAC Fallback)**:
-   - If no OTP is provided, the bridge falls back to interactive UAC approval.
-   - The central UI opens with "Aprovar & Executar via UAC" and "Rejeitar".
-   - The user must explicitly authorize the execution via the official Windows UAC dialog (`-Verb RunAs`).
+---
+
+### Workflow B: Legacy 1-Step Immediate Execution
+If the command and script are already prepared when the OTP is received:
+```powershell
+& "C:\Utilitario\AntigravityBridge.exe" run --title "Titulo da Tarefa" --description "Descricao" --type cmd --code "ipconfig /flushdns" --otp "123456"
+# Or via client:
+python C:\Utilitario\client.py run --title "Titulo da Tarefa" --description "Descricao" --type cmd --code "ipconfig /flushdns" --otp "123456"
+```
+
+---
+
+### Workflow C: Interactive UAC Fallback (Without OTP)
+If no OTP or pre-auth ticket is present:
+```powershell
+& "C:\Utilitario\AntigravityBridge.exe" run --title "Titulo da Tarefa" --description "Descricao" --type cmd --code "ipconfig /flushdns"
+```
+The central UI opens a prompt on the desktop requesting physical confirmation via Windows UAC.
 
 ---
 
 ## 10 Security Rules Enforced by the Bridge
 
 1. **Single-Provisioning**: Key is generated only once during initial setup.
-2. **DPAPI / TPM Protection**: Secret key and recovery password hash are encrypted using Windows DPAPI (backed by LSASS and TPM).
+2. **DPAPI Machine-Level Protection**: Secret key and recovery password hash are encrypted using Windows DPAPI with `CRYPTPROTECT_LOCAL_MACHINE` and custom application entropy, allowing system service operation while strictly bound to hardware TPM/LSASS.
 3. **Locked State (Flag = 1)**: While `provisioned_flag == 1`, generating a new key is strictly forbidden.
 4. **Strict Reset Requirements**: Resetting the key requires BOTH:
    - Correct Recovery Password (verified via PBKDF2 with 600.000 iterations).
@@ -48,25 +75,27 @@ The bridge operates in a **Hybrid Mode** with reinforced security:
 5. **Flag Lifecycle**: Reset unlocks flag to 0 -> generates new key -> relocks flag to 1.
 6. **Strict Counter Advancement**: The counter advances on **EVERY** validation attempt (both SUCCESS and FAIL).
 7. **Atomic Operations**: Thread-safe and process-safe validation using Windows Named Mutex and file locks.
-8. **Position Query Without Advance**: `python C:\Utilitario\gerar_otp.py --status` checks counter without computing or advancing OTP.
-9. **Origin Verification**: Requests are validated against caller PID and approved script paths.
+8. **Position Query Without Advance**: `& "C:\Utilitario\AntigravityBridge.exe" status` checks counter and service state without advancing OTP.
+9. **Origin Verification & ACL Isolation**:
+   - `C:\Utilitario\config\` is restricted strictly to `SYSTEM` and `Administrators`. Standard users cannot read configuration files directly.
+   - `C:\Utilitario\queue\` and `logs\` allow execution submission from any machine user.
+   - Pre-auth tickets are bound to the caller's Windows username and token SHA-256 hash.
 10. **Full Audit Logging**: All operations logged in `C:\Utilitario\logs\auth.log` with timestamp, caller, before/after counter, and masked OTP.
 
 ---
 
-## How to Execute Commands
+## Utility Status & Diagnostics
 
-### 1. With User OTP (100% Automated):
+### Consult Bridge Status & Counter:
 ```powershell
-python C:\Utilitario\client.py run --title "Titulo da Tarefa" --description "Descricao" --type bat --code "ipconfig /flushdns" --otp "123456"
+& "C:\Utilitario\AntigravityBridge.exe" status
+# Or:
+python C:\Utilitario\client.py status
 ```
 
-### 2. Without OTP (Prompts Windows UAC):
+### Consult Audit History:
 ```powershell
-python C:\Utilitario\client.py run --title "Titulo da Tarefa" --description "Descricao" --type bat --code "ipconfig /flushdns"
-```
-
-### 3. Consult Counter Position Without Advancing:
-```powershell
-python C:\Utilitario\gerar_otp.py --status
+& "C:\Utilitario\AntigravityBridge.exe" history
+# Or:
+python C:\Utilitario\client.py history
 ```

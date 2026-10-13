@@ -122,6 +122,27 @@ def test_all_security_rules():
         assert "Origem" in msg
         print("  -> PASSOU: Origem suspeita bloqueada com sucesso!")
 
+        print("[*] 9. Testando Canal de Pré-Autorização (Ticket de até 45 Minutos)...")
+        res_pre = auth.provision("SenhaSegura@2026", force=True, caller_info=caller)
+        secret_b32_pre = urllib.parse.parse_qs(urllib.parse.urlparse(res_pre["uri"]).query)["secret"][0]
+        secret_bytes_pre = base64.b32decode(secret_b32_pre)
+        valid_otp_pre = HOTPAuth._compute_hotp_internal(bytearray(secret_bytes_pre), 0, 6)
+
+        # 1. Cria ticket de pré-autorização de 45 minutos (2700s)
+        ok_pre, msg_pre, data_pre = auth.create_preauth_ticket(valid_otp_pre, caller, lifetime_seconds=2700)
+        assert ok_pre
+        assert "token" in data_pre
+        assert data_pre["expires_in"] == 2700
+
+        # 2. Consome o ticket com sucesso
+        ok_consume, msg_consume = auth.consume_preauth_ticket(data_pre["token"], caller.get("user"))
+        assert ok_consume, f"Falha ao consumir ticket: {msg_consume}"
+
+        # 3. Tentativa de reuso do mesmo ticket deve falhar (uso estritamente único)
+        ok_reuse, _ = auth.consume_preauth_ticket(data_pre["token"], caller.get("user"))
+        assert not ok_reuse
+        print("  -> PASSOU: Pré-autorização e consumo atômico de ticket funcionam com sucesso!")
+
     print("\n=======================================================")
     print("TODOS OS REQUISITOS DE SEGURANÇA FORAM TESTADOS E APROVADOS!")
     print("=======================================================")

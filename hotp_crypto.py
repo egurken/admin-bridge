@@ -32,6 +32,8 @@ kernel32 = ctypes.windll.kernel32
 DPAPI_ENTROPY = b"AntigravityBridge_TPM_DPAPI_Entropy_2026"
 DPAPI_MAC_ENTROPY = b"AntigravityConfigIntegrityV2"
 CRYPTPROTECT_UI_FORBIDDEN = 0x1
+CRYPTPROTECT_LOCAL_MACHINE = 0x4
+DPAPI_FLAGS = CRYPTPROTECT_UI_FORBIDDEN | CRYPTPROTECT_LOCAL_MACHINE  # 0x5
 
 
 def wipe_buffer(buf):
@@ -46,8 +48,9 @@ def wipe_buffer(buf):
 
 
 def dpapi_protect(plaintext: bytes, entropy: bytes = DPAPI_ENTROPY) -> bytes:
-    """Criptografa dados usando a DPAPI do Windows (vinculada ao usuário e TPM da máquina).
+    """Criptografa dados usando a DPAPI do Windows com escopo de máquina (TPM/LSA).
 
+    Permite que o serviço SYSTEM e administradores autentiquem os dados sem falha de integridade.
     Sobrescreve os buffers nativos antes de desalocar.
     """
     raw_len = len(plaintext)
@@ -66,7 +69,7 @@ def dpapi_protect(plaintext: bytes, entropy: bytes = DPAPI_ENTROPY) -> bytes:
         ctypes.byref(entropy_blob) if entropy else None,
         None,
         None,
-        CRYPTPROTECT_UI_FORBIDDEN,
+        DPAPI_FLAGS,
         ctypes.byref(data_out)
     )
 
@@ -147,14 +150,16 @@ def compute_integrity_mac(cfg: dict) -> str:
     return base64.b64encode(encrypted_digest).decode("ascii")
 
 
-def verify_integrity_mac(cfg: dict) -> bool:
-    """Verifica se a assinatura de integridade corresponde aos metadados do JSON.
+def check_integrity_mac(cfg: dict) -> Tuple[bool, str]:
+    """Valida a assinatura de integridade e diagnostica com precisão o motivo da falha.
 
-    Retorna True se íntegro, False se adulterado ou corrompido.
+    Retorna (True, 'ok') se íntegro.
+    Retorna (False, 'tampered') se o arquivo foi adulterado externamente.
+    Retorna (False, 'decrypt_error') se a chave DPAPI não pôde ser lida no contexto atual.
     """
     mac_b64 = cfg.get("integrity_mac")
     if not mac_b64:
-        return False
+        return False, "missing_mac"
     try:
         raw_mac = base64.b64decode(mac_b64)
         expected_digest_ba = dpapi_unprotect(raw_mac, entropy=DPAPI_MAC_ENTROPY)
@@ -163,9 +168,21 @@ def verify_integrity_mac(cfg: dict) -> bool:
 
         payload = _canonical_payload(cfg)
         actual_digest = hashlib.sha256(payload).digest()
-        return hmac.compare_digest(actual_digest, expected_digest)
+        if hmac.compare_digest(actual_digest, expected_digest):
+            return True, "ok"
+        else:
+            return False, "tampered"
     except Exception:
-        return False
+        return False, "decrypt_error"
+
+
+def verify_integrity_mac(cfg: dict) -> bool:
+    """Verifica se a assinatura de integridade corresponde aos metadados do JSON.
+
+    Retorna True se íntegro, False se adulterado ou corrompido.
+    """
+    ok, _ = check_integrity_mac(cfg)
+    return ok
 
 
 def read_passive_metadata(config_path: Path) -> dict:
@@ -248,44 +265,41 @@ def verify_recovery_password(password: str, expected_hash_b64: str, salt_b64: st
     return hmac.compare_digest(derived, expected_hash)
 
 
-def apply_system_only_ntfs_acls(target_path: Path):
-    """Aplica permissões ACL restritas: Exclusivo para AUTORIDADE NT\\SISTEMA (*S-1-5-18).
+def apply_isolated_bridge_ntfs_acls(base_dir: Path = BASE_DIR):
+    """Aplica permissões ACL granulares e blindadas:
 
-    Desativa totalmente a herança (/inheritance:r) e NÃO concede permissão para
-    Administradores nem para usuários comuns.
+    - config: Acesso total EXCLUSIVO a SYSTEM (*S-1-5-18) e Administradores (*S-1-5-32-544). Bloqueio total a Users.
+    - queue: SYSTEM/Admins (F) e Users (*S-1-5-32-545) com Modificar (M) para envio e leitura de comandos na fila.
+    - logs: SYSTEM/Admins (F) e Users com Modificar (M).
     """
-    try:
-        if not target_path.exists():
-            return
-    except (PermissionError, OSError):
-        pass
+    config_dir = base_dir / "config"
+    queue_dir = base_dir / "queue"
+    logs_dir = base_dir / "logs"
 
-    target_str = str(target_path)
-    perm_system = "*S-1-5-18:(OI)(CI)(F)"
-
-    # Desativa herança e concede acesso total EXCLUSIVAMENTE a SYSTEM
-    cmd = f'icacls "{target_str}" /inheritance:r /grant:r {perm_system}'
+    # 1. Blindagem estrita de config (somente SYSTEM e Administradores)
     try:
-        subprocess.run(
-            ["cmd.exe", "/c", cmd],
-            capture_output=True,
-            check=False,
-            creationflags=0x08000000  # CREATE_NO_WINDOW
-        )
+        if config_dir.exists():
+            cfg_str = str(config_dir)
+            cmd_cfg = f'icacls "{cfg_str}" /inheritance:r /grant:r *S-1-5-18:(OI)(CI)(F) *S-1-5-32-544:(OI)(CI)(F)'
+            subprocess.run(["cmd.exe", "/c", cmd_cfg], capture_output=True, check=False, creationflags=0x08000000)
+            subprocess.run(["cmd.exe", "/c", f'icacls "{cfg_str}\\*" /grant:r *S-1-5-18:(F) *S-1-5-32-544:(F)'], capture_output=True, check=False, creationflags=0x08000000)
     except Exception:
         pass
 
-    # Aplica aos arquivos internos também
-    cmd_files = f'icacls "{target_str}\\*" /inheritance:r /grant:r *S-1-5-18:(F)'
-    try:
-        subprocess.run(
-            ["cmd.exe", "/c", cmd_files],
-            capture_output=True,
-            check=False,
-            creationflags=0x08000000
-        )
-    except Exception:
-        pass
+    # 2. Canal público da fila (queue) e logs para qualquer usuário da máquina
+    for d in (queue_dir, logs_dir):
+        try:
+            if d.exists():
+                d_str = str(d)
+                cmd_d = f'icacls "{d_str}" /grant *S-1-5-18:(OI)(CI)(F) *S-1-5-32-544:(OI)(CI)(F) *S-1-5-32-545:(OI)(CI)(M)'
+                subprocess.run(["cmd.exe", "/c", cmd_d], capture_output=True, check=False, creationflags=0x08000000)
+        except Exception:
+            pass
+
+
+def apply_system_only_ntfs_acls(target_path: Path):
+    """Alias para compatibilidade retroativa com chamadas anteriores."""
+    apply_isolated_bridge_ntfs_acls()
 
 
 def restore_ntfs_acls_for_removal(target_path: Path):

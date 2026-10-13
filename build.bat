@@ -40,6 +40,14 @@ if %ERRORLEVEL% EQU 0 (
     echo %~dp0dist\AntigravityBridge.exe
     echo ========================================================
 
+    echo Copiando para C:\Utilitario\AntigravityBridge.exe...
+    if exist "C:\Utilitario\AntigravityBridge.exe" (
+        del /f /q "C:\Utilitario\AntigravityBridge.old.exe" 2>nul
+        move /y "C:\Utilitario\AntigravityBridge.exe" "C:\Utilitario\AntigravityBridge.old.exe" >nul 2>nul
+    )
+    copy /y "%~dp0dist\AntigravityBridge.exe" "C:\Utilitario\AntigravityBridge.exe" >nul
+    echo Executavel copiado para C:\Utilitario com sucesso!
+
     set "DESK_DIR="
     if exist "%USERPROFILE%\OneDrive\Desktop" (
         set "DESK_DIR=%USERPROFILE%\OneDrive\Desktop"

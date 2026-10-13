@@ -57,7 +57,7 @@ def ensure_app_running(timeout_wait: float = 12.0) -> bool:
     return False
 
 
-def submit_request(title: str, description: str, script_type: str, code: str, otp: str = None, timeout: int = 120) -> dict:
+def submit_request(title: str, description: str, script_type: str, code: str, otp: str = None, preauth_token: str = None, timeout: int = 120) -> dict:
     """Envia uma requisição de script para o utilitário desktop e aguarda a resposta."""
     REQUESTS_DIR.mkdir(parents=True, exist_ok=True)
     RESPONSES_DIR.mkdir(parents=True, exist_ok=True)
@@ -74,6 +74,7 @@ def submit_request(title: str, description: str, script_type: str, code: str, ot
         "script_type": script_type,
         "code": code,
         "otp": otp,
+        "preauth_token": preauth_token,
         "timeout": timeout,
         "created_at": datetime.now(timezone.utc).isoformat(),
         "caller": {
@@ -153,6 +154,11 @@ def main():
     p_uninst = subparsers.add_parser("uninstall", help="Desinstala o utilitário completamente")
     p_uninst.add_argument("--force", action="store_true", help="Força desinstalação sem confirmação")
 
+    # Subcomando: preauth
+    p_preauth = subparsers.add_parser("preauth", help="Consome OTP e gera ticket de pré-autorização válido por até 45 minutos")
+    p_preauth.add_argument("--otp", required=True, help="Código OTP de 6 dígitos")
+    p_preauth.add_argument("--lifetime", type=int, default=2700, help="Tempo limite em segundos (padrão 2700s = 45 minutos)")
+
     # Subcomando: run
     run_parser = subparsers.add_parser("run", help="Envia um script para execução elevada")
     run_parser.add_argument("--title", required=True, help="Título da tarefa")
@@ -160,6 +166,7 @@ def main():
     run_parser.add_argument("--type", choices=["bat", "cmd", "ps1"], default="cmd", help="Tipo de script")
     run_parser.add_argument("--code", required=True, help="Comando ou código a ser executado")
     run_parser.add_argument("--otp", default=None, help="Código de uso único HOTP")
+    run_parser.add_argument("--preauth-token", default=None, help="Token de pré-autorização")
     run_parser.add_argument("--timeout", type=int, default=120, help="Tempo limite em segundos")
 
     args = parser.parse_args()
@@ -234,6 +241,15 @@ def main():
         res = subprocess.run(cmd)
         sys.exit(res.returncode)
 
+    elif args.command == "preauth":
+        exe_path = BASE_DIR / "AntigravityBridge.exe"
+        if exe_path.exists():
+            cmd = [str(exe_path), "preauth", "--otp", args.otp, "--lifetime", str(args.lifetime)]
+        else:
+            cmd = [sys.executable, str(BASE_DIR / "app.py"), "preauth", "--otp", args.otp, "--lifetime", str(args.lifetime)]
+        res = subprocess.run(cmd)
+        sys.exit(res.returncode)
+
     elif args.command == "run":
         result = submit_request(
             title=args.title,
@@ -241,6 +257,7 @@ def main():
             script_type=args.type,
             code=args.code,
             otp=args.otp,
+            preauth_token=getattr(args, "preauth_token", None),
             timeout=args.timeout
         )
         try:

@@ -27,14 +27,14 @@ from PyQt6.QtWidgets import (
     QHeaderView, QAbstractItemView
 )
 
-from hotp_auth import HOTPAuth, SecurityError
+from hotp_auth import HOTPAuth, SecurityError, PREAUTH_TICKET_FILE
 from hotp_crypto import (
-    wipe_buffer, apply_system_only_ntfs_acls, restore_ntfs_acls_for_removal,
+    wipe_buffer, apply_isolated_bridge_ntfs_acls, apply_system_only_ntfs_acls, restore_ntfs_acls_for_removal,
     verify_caller_origin, generate_physical_challenge, read_passive_metadata
 )
 from app_icon import get_app_icon
 
-LOCAL_SERVER_NAME = "AntigravityBridge_GUI_SingleInstance"
+LOCAL_SERVER_NAME = f"AntigravityBridge_GUI_{os.getenv('USERNAME', 'default')}"
 BASE_DIR = Path("C:/Utilitario")
 CONFIG_DIR = BASE_DIR / "config"
 QUEUE_DIR = BASE_DIR / "queue"
@@ -167,29 +167,36 @@ def get_desktop_dir() -> Optional[Path]:
 def create_desktop_shortcut():
     """Garante a existência do atalho da Central de Gestão na Área de Trabalho do usuário."""
     try:
-        desktop = get_desktop_dir()
-        if not desktop:
-            return
-        lnk_path = desktop / "Antigravity Bridge.lnk"
-        if lnk_path.exists():
-            return
+        desktops_to_create = []
+        user_desktop = get_desktop_dir()
+        if user_desktop:
+            desktops_to_create.append(user_desktop)
+        pub_desktop = Path(os.environ.get("PUBLIC", "C:/Users/Public")) / "Desktop"
+        if pub_desktop.exists() and pub_desktop not in desktops_to_create:
+            desktops_to_create.append(pub_desktop)
+
         target = (BASE_DIR / "AntigravityBridge.exe").resolve()
         icon_path = (BASE_DIR / "icon.ico").resolve()
-        ps_cmd = (
-            f'$ws = New-Object -ComObject WScript.Shell; '
-            f'$s = $ws.CreateShortcut("{lnk_path}"); '
-            f'$s.TargetPath = "{target}"; '
-            f'$s.WorkingDirectory = "{BASE_DIR}"; '
-            f'$s.IconLocation = "{icon_path},0"; '
-            f'$s.Description = "Antigravity Admin Bridge & Central de Gestao"; '
-            f'$s.Save()'
-        )
-        subprocess.run(
-            ["powershell.exe", "-NoProfile", "-Command", ps_cmd],
-            capture_output=True,
-            check=False,
-            creationflags=0x08000000
-        )
+
+        for d in desktops_to_create:
+            lnk_path = d / "Antigravity Bridge.lnk"
+            if lnk_path.exists():
+                continue
+            ps_cmd = (
+                f'$ws = New-Object -ComObject WScript.Shell; '
+                f'$s = $ws.CreateShortcut("{lnk_path}"); '
+                f'$s.TargetPath = "{target}"; '
+                f'$s.WorkingDirectory = "{BASE_DIR}"; '
+                f'$s.IconLocation = "{icon_path},0"; '
+                f'$s.Description = "Antigravity Admin Bridge & Central de Gestao"; '
+                f'$s.Save()'
+            )
+            subprocess.run(
+                ["powershell.exe", "-NoProfile", "-Command", ps_cmd],
+                capture_output=True,
+                check=False,
+                creationflags=0x08000000
+            )
     except Exception:
         pass
 
@@ -222,7 +229,14 @@ def ensure_environment_installed():
 
     # Aplica permissões restritas exclusivas para SYSTEM se for Administrador
     if is_admin():
-        apply_system_only_ntfs_acls(CONFIG_DIR)
+        apply_isolated_bridge_ntfs_acls(BASE_DIR)
+
+    # Migração automática transparente para DPAPI de máquina
+    try:
+        hotp_auth = HOTPAuth()
+        hotp_auth.migrate_config_to_machine_dpapi()
+    except Exception:
+        pass
 
     create_desktop_shortcut()
 
@@ -1436,8 +1450,17 @@ class AdminBridgeWindow(QMainWindow):
             logging.info(f"[HOTP APROVADO] Req: {req_id} autenticado! Contador: {used_counter - 1}")
             self.execute_authenticated_request(data, used_counter - 1, processing_file)
         else:
-            # Modo Híbrido: exige UAC manual na tela
-            logging.info(f"[MODO HÍBRIDO] Req: {req_id} sem OTP. Exigindo confirmação UAC.")
+            # Verifica se há ticket de pré-autorização ativo (gerado via preauth no início do chat)
+            preauth_token = data.get("preauth_token")
+            caller_user = (caller_info or {}).get("user")
+            ok_ticket, ticket_msg = self.hotp_auth.consume_preauth_ticket(preauth_token, caller_user)
+            if ok_ticket:
+                logging.info(f"[PRÉ-AUTORIZAÇÃO APROVADA] Req: {req_id} autenticado e executado via ticket.")
+                self.execute_authenticated_request(data, 0, processing_file)
+                return
+
+            # Modo Híbrido: sem OTP nem ticket prévio, exibe na tela para aprovação
+            logging.info(f"[MODO HÍBRIDO] Req: {req_id} sem OTP nem ticket prévio. Exigindo confirmação.")
             self.display_manual_uac_request(data, processing_file)
 
     def display_manual_uac_request(self, data, processing_file: Path):
@@ -1671,8 +1694,12 @@ def run_daemon_loop(hotp_auth: HOTPAuth):
                     time.sleep(0.5)
                     continue
 
-                if not peek_data.get("otp"):
-                    # Sem OTP: é solicitação manual que requer confirmação UAC na tela do usuário
+                has_otp = bool(peek_data.get("otp"))
+                has_token = bool(peek_data.get("preauth_token"))
+                has_ticket = PREAUTH_TICKET_FILE.exists()
+
+                if not (has_otp or has_token or has_ticket):
+                    # Sem OTP e sem ticket pré-autorizado: é solicitação manual que requer confirmação UAC na tela
                     time.sleep(1.0)
                     continue
 
@@ -1687,74 +1714,86 @@ def run_daemon_loop(hotp_auth: HOTPAuth):
                 data = peek_data
 
                 provided_otp = data.get("otp")
-                caller_info = data.get("caller")
+                preauth_token = data.get("preauth_token")
+                caller_info = data.get("caller") or {}
+                caller_user = caller_info.get("user")
+
+                auth_approved = False
+                auth_msg = ""
 
                 if provided_otp:
                     is_valid, auth_msg, used_counter = hotp_auth.verify_and_advance(provided_otp, caller_info)
-                    if not is_valid:
-                        res = {
-                            "id": req_id,
-                            "status": "rejected_auth",
-                            "reason": auth_msg,
-                            "exit_code": 401,
-                            "output": f"[ACESSO RECUSADO]: {auth_msg}",
-                            "completed_at": datetime.now(timezone.utc).isoformat()
-                        }
-                        with open(RESPONSES_DIR / f"{req_id}.json", "w", encoding="utf-8") as f:
-                            json.dump(res, f, indent=2, ensure_ascii=False)
-                        proc_file.unlink(missing_ok=True)
-                        continue
+                    auth_approved = is_valid
+                else:
+                    # Valida via Ticket de Pré-Autorização (até 45 minutos)
+                    ok_ticket, ticket_msg = hotp_auth.consume_preauth_ticket(preauth_token, caller_user)
+                    auth_approved = ok_ticket
+                    auth_msg = ticket_msg
 
-                    # Executa comando autenticado
-                    script_type = data.get("script_type", "bat").lower()
-                    code = data.get("code", "")
-                    ext = "ps1" if script_type == "ps1" else "bat"
-                    sc_path = SCRIPTS_DIR / f"{req_id}.{ext}"
-                    lg_path = RESPONSES_DIR / f"{req_id}.log"
-                    ex_path = RESPONSES_DIR / f"{req_id}.exit"
-
-                    with open(sc_path, "w", encoding="utf-8") as f:
-                        f.write(code)
-
-                    cmd = [
-                        "powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass",
-                        "-File", str(RUNNER_PS1),
-                        "-ScriptPath", str(sc_path),
-                        "-ScriptType", script_type,
-                        "-LogPath", str(lg_path),
-                        "-ExitPath", str(ex_path)
-                    ]
-                    subprocess.run(cmd, capture_output=True, check=False, creationflags=0x08000000)
-
-                    out_txt = ""
-                    ec = 0
-                    if lg_path.exists():
-                        try:
-                            with open(lg_path, "r", encoding="utf-8", errors="replace") as f:
-                                out_txt = f.read()
-                        except Exception:
-                            pass
-                    if ex_path.exists():
-                        try:
-                            with open(ex_path, "r", encoding="utf-8") as f:
-                                ec = int(f.read().strip())
-                        except Exception:
-                            pass
-
+                if not auth_approved:
                     res = {
                         "id": req_id,
-                        "status": "approved",
-                        "exit_code": ec,
-                        "output": out_txt,
+                        "status": "rejected_auth",
+                        "reason": auth_msg,
+                        "exit_code": 401,
+                        "output": f"[ACESSO RECUSADO]: {auth_msg}",
                         "completed_at": datetime.now(timezone.utc).isoformat()
                     }
                     with open(RESPONSES_DIR / f"{req_id}.json", "w", encoding="utf-8") as f:
                         json.dump(res, f, indent=2, ensure_ascii=False)
-
-                    sc_path.unlink(missing_ok=True)
-                    lg_path.unlink(missing_ok=True)
-                    ex_path.unlink(missing_ok=True)
                     proc_file.unlink(missing_ok=True)
+                    continue
+
+                # Executa comando autenticado
+                script_type = data.get("script_type", "bat").lower()
+                code = data.get("code", "")
+                ext = "ps1" if script_type == "ps1" else "bat"
+                sc_path = SCRIPTS_DIR / f"{req_id}.{ext}"
+                lg_path = RESPONSES_DIR / f"{req_id}.log"
+                ex_path = RESPONSES_DIR / f"{req_id}.exit"
+
+                with open(sc_path, "w", encoding="utf-8") as f:
+                    f.write(code)
+
+                cmd = [
+                    "powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass",
+                    "-File", str(RUNNER_PS1),
+                    "-ScriptPath", str(sc_path),
+                    "-ScriptType", script_type,
+                    "-LogPath", str(lg_path),
+                    "-ExitPath", str(ex_path)
+                ]
+                subprocess.run(cmd, capture_output=True, check=False, creationflags=0x08000000)
+
+                out_txt = ""
+                ec = 0
+                if lg_path.exists():
+                    try:
+                        with open(lg_path, "r", encoding="utf-8", errors="replace") as f:
+                            out_txt = f.read()
+                    except Exception:
+                        pass
+                if ex_path.exists():
+                    try:
+                        with open(ex_path, "r", encoding="utf-8") as f:
+                            ec = int(f.read().strip())
+                    except Exception:
+                        pass
+
+                res = {
+                    "id": req_id,
+                    "status": "approved",
+                    "exit_code": ec,
+                    "output": out_txt,
+                    "completed_at": datetime.now(timezone.utc).isoformat()
+                }
+                with open(RESPONSES_DIR / f"{req_id}.json", "w", encoding="utf-8") as f:
+                    json.dump(res, f, indent=2, ensure_ascii=False)
+
+                sc_path.unlink(missing_ok=True)
+                lg_path.unlink(missing_ok=True)
+                ex_path.unlink(missing_ok=True)
+                proc_file.unlink(missing_ok=True)
 
         except Exception as e:
             logging.error(f"[DAEMON ERROR]: {e}")
@@ -1859,6 +1898,23 @@ def run_cli_client(args, hotp_auth: HOTPAuth):
         run_cli_setup(args, hotp_auth)
         sys.exit(0)
 
+    elif args.subcommand == "preauth":
+        caller_info = {
+            "pid": os.getpid(),
+            "exe": sys.executable,
+            "script": "CLI_preauth",
+            "user": os.getenv("USERNAME", "unknown")
+        }
+        lifetime = getattr(args, "lifetime", 2700)
+        ok, msg, res = hotp_auth.create_preauth_ticket(args.otp, caller_info, lifetime)
+        output = {
+            "status": "authorized" if ok else "rejected",
+            "message": msg,
+            **res
+        }
+        print(json.dumps(output, indent=2, ensure_ascii=False))
+        sys.exit(0 if ok else 1)
+
     elif args.subcommand == "run":
         # Envia requisição para a fila
         REQUESTS_DIR.mkdir(parents=True, exist_ok=True)
@@ -1872,6 +1928,7 @@ def run_cli_client(args, hotp_auth: HOTPAuth):
             "script_type": args.type or "cmd",
             "code": args.code,
             "otp": args.otp,
+            "preauth_token": getattr(args, "preauth_token", None),
             "timeout": args.timeout or 120,
             "created_at": datetime.now(timezone.utc).isoformat(),
             "caller": {
@@ -2033,13 +2090,19 @@ def main():
     p_uninst = subparsers.add_parser("uninstall", help="Desinstala o utilitário completamente")
     p_uninst.add_argument("--force", action="store_true", help="Força desinstalação sem confirmação")
 
+    # Comando preauth (consome OTP imediatamente e gera ticket de pré-autorização)
+    p_preauth = subparsers.add_parser("preauth", help="Consome o OTP imediatamente no início da interação e gera ticket válido por até 45 minutos")
+    p_preauth.add_argument("--otp", required=True, help="Código OTP de 6 dígitos do autenticador")
+    p_preauth.add_argument("--lifetime", type=int, default=2700, help="Tempo de validade em segundos (padrão: 2700s = 45 minutos)")
+
     # Comando run
     p_run = subparsers.add_parser("run", help="Envia um comando para execução elevada")
     p_run.add_argument("--title", default="Comando Administrativo", help="Título da solicitação")
     p_run.add_argument("--description", default="", help="Descrição da solicitação")
     p_run.add_argument("--type", choices=["bat", "cmd", "ps1"], default="cmd", help="Tipo de script")
     p_run.add_argument("--code", required=True, help="Comando ou código a executar")
-    p_run.add_argument("--otp", default=None, help="Código OTP de 6 dígitos")
+    p_run.add_argument("--otp", default=None, help="Código OTP de 6 dígitos (modo legado imediato)")
+    p_run.add_argument("--preauth-token", default=None, help="Token de pré-autorização opcional")
     p_run.add_argument("--timeout", type=int, default=120, help="Tempo limite em segundos")
 
     args, unknown = parser.parse_known_args()

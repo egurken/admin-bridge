@@ -15,7 +15,9 @@ from typing import Optional, Tuple
 
 from hotp_crypto import (
     AtomicLock,
+    apply_isolated_bridge_ntfs_acls,
     apply_system_only_ntfs_acls,
+    check_integrity_mac,
     compute_integrity_mac,
     dpapi_protect,
     dpapi_unprotect,
@@ -27,6 +29,7 @@ from hotp_crypto import (
     verify_integrity_mac,
     verify_recovery_password,
     wipe_buffer,
+    DPAPI_ENTROPY,
 )
 
 BASE_DIR = Path("C:/Utilitario")
@@ -36,11 +39,13 @@ LOGS_DIR = BASE_DIR / "logs"
 CONFIG_FILE = CONFIG_DIR / "hotp_config.json"
 STATUS_FILE = QUEUE_DIR / "status.json"
 AUTH_LOG_FILE = LOGS_DIR / "auth.log"
+PREAUTH_TICKET_FILE = QUEUE_DIR / "preauth_ticket.json"
 
 DEFAULT_DIGITS = 6
 DEFAULT_LOOK_AHEAD_WINDOW = 5
 FAIL_SAFE_MAX_FAILURES = 3
 FAIL_SAFE_WINDOW_SECONDS = 300  # 5 minutos
+DEFAULT_PREAUTH_LIFETIME = 2700  # 45 minutos de validade máxima para pré-autorização
 
 
 class SecurityError(RuntimeError):
@@ -74,13 +79,25 @@ class HOTPAuth:
             return {}
 
         # Validação estrita da assinatura de integridade
-        if not verify_integrity_mac(cfg):
+        is_valid, reason = check_integrity_mac(cfg)
+        if not is_valid:
+            if reason == "decrypt_error":
+                # Tenta auto-migração se a chave foi protegida sob a conta de usuário legada
+                try:
+                    if self.migrate_config_to_machine_dpapi():
+                        with open(self.config_file, "r", encoding="utf-8") as f:
+                            cfg = json.load(f)
+                        if verify_integrity_mac(cfg):
+                            return cfg
+                except Exception:
+                    pass
+
             self._log_audit(
                 "TAMPER_DETECTED",
                 cfg.get("counter", 0),
                 cfg.get("counter", 0),
                 False,
-                "Assinatura de integridade inválida! O arquivo foi modificado externamente."
+                f"Assinatura de integridade inválida ({reason})! O arquivo foi modificado externamente."
             )
             raise SecurityError(
                 "VIOLAÇÃO DE SEGURANÇA: A assinatura de integridade do arquivo hotp_config.json falhou. "
@@ -88,6 +105,48 @@ class HOTPAuth:
             )
 
         return cfg
+
+    def migrate_config_to_machine_dpapi(self) -> bool:
+        """Migra de forma transparente o arquivo hotp_config.json legado para DPAPI de máquina.
+
+        Permite que o serviço SYSTEM e o usuário autentiquem sem violações de integridade.
+        """
+        with AtomicLock():
+            if not self.config_file.exists():
+                return False
+            try:
+                with open(self.config_file, "r", encoding="utf-8") as f:
+                    cfg = json.load(f)
+                if not cfg.get("secret_dpapi"):
+                    return False
+
+                sec_raw = base64.b64decode(cfg["secret_dpapi"])
+                sec_plain = dpapi_unprotect(sec_raw, DPAPI_ENTROPY)
+                new_sec_dpapi = dpapi_protect(bytes(sec_plain), DPAPI_ENTROPY)
+                wipe_buffer(sec_plain)
+
+                rec_raw = base64.b64decode(cfg["recovery_hash_dpapi"])
+                rec_plain = dpapi_unprotect(rec_raw, DPAPI_ENTROPY)
+                new_rec_dpapi = dpapi_protect(bytes(rec_plain), DPAPI_ENTROPY)
+                wipe_buffer(rec_plain)
+
+                cfg["secret_dpapi"] = base64.b64encode(new_sec_dpapi).decode("ascii")
+                cfg["recovery_hash_dpapi"] = base64.b64encode(new_rec_dpapi).decode("ascii")
+                cfg["integrity_mac"] = compute_integrity_mac(cfg)
+
+                # Gravação atômica
+                tmp_file = self.config_file.with_suffix(".tmp")
+                with open(tmp_file, "w", encoding="utf-8") as f:
+                    json.dump(cfg, f, indent=2, ensure_ascii=False)
+                tmp_file.replace(self.config_file)
+
+                apply_isolated_bridge_ntfs_acls(BASE_DIR)
+                self._update_public_status(cfg)
+                logging.info("[MIGRAÇÃO] hotp_config.json migrado para DPAPI de máquina com sucesso.")
+                return True
+            except Exception as e:
+                logging.warning(f"[MIGRAÇÃO] Falha ao migrar hotp_config.json: {e}")
+                return False
 
     def _save_config_raw(self, config_data: dict):
         """Salva a configuração atomicamente com assinatura de integridade e permissões SYSTEM."""
@@ -100,8 +159,8 @@ class HOTPAuth:
             json.dump(config_data, f, indent=2, ensure_ascii=False)
         tmp_file.replace(self.config_file)
 
-        # 3. Aplica permissões restritas exclusivas a SYSTEM (*S-1-5-18)
-        apply_system_only_ntfs_acls(CONFIG_DIR)
+        # 3. Aplica permissões restritas exclusivas a SYSTEM e Administradores
+        apply_isolated_bridge_ntfs_acls(BASE_DIR)
 
         # 4. Atualiza o snapshot público para o Dashboard
         self._update_public_status(config_data)
@@ -598,3 +657,107 @@ class HOTPAuth:
             "status_text": "Aguardando Provisionamento",
             "tampered": False
         }
+
+    # -------------------------------------------------------------------------
+    # CANAL DE PRÉ-AUTORIZAÇÃO (TICKET TEMPORÁRIO DE ATÉ 45 MINUTOS)
+    # -------------------------------------------------------------------------
+    def create_preauth_ticket(
+        self,
+        otp: str,
+        caller_info: Optional[dict] = None,
+        lifetime_seconds: int = DEFAULT_PREAUTH_LIFETIME
+    ) -> Tuple[bool, str, dict]:
+        """Consome o OTP imediatamente no início da interação, avança o contador (+1)
+
+        e gera um ticket de autorização temporário válido por até 45 minutos.
+        Garante que o código não expire enquanto o assistente pesquisa e monta os scripts.
+        """
+        caller = caller_info or {"pid": os.getpid(), "user": os.getenv("USERNAME", "unknown")}
+        is_valid, auth_msg, used_counter = self.verify_and_advance(otp, caller)
+        if not is_valid:
+            return False, auth_msg, {}
+
+        token = secrets.token_hex(24)
+        token_hash = hashlib.sha256(token.encode("ascii")).hexdigest()
+        ticket_data = {
+            "token_hash": token_hash,
+            "caller_user": caller.get("user", os.getenv("USERNAME", "unknown")),
+            "caller_pid": caller.get("pid", 0),
+            "counter_used": used_counter - 1,
+            "created_at": time.time(),
+            "expires_at": time.time() + lifetime_seconds,
+            "lifetime_seconds": lifetime_seconds,
+            "used": False
+        }
+
+        with AtomicLock():
+            QUEUE_DIR.mkdir(parents=True, exist_ok=True)
+            tmp_t = PREAUTH_TICKET_FILE.with_suffix(".tmp")
+            with open(tmp_t, "w", encoding="utf-8") as f:
+                json.dump(ticket_data, f, indent=2)
+            tmp_t.replace(PREAUTH_TICKET_FILE)
+
+        self._log_audit(
+            "PREAUTH_TICKET_CREATED",
+            used_counter - 1,
+            used_counter,
+            True,
+            f"Ticket de pré-autorização gerado com sucesso (validade: {lifetime_seconds // 60}m).",
+            otp,
+            caller
+        )
+
+        return True, f"Pré-autorização confirmada com sucesso! Válida por até {lifetime_seconds // 60} minutos.", {
+            "token": token,
+            "expires_in": lifetime_seconds,
+            "counter": used_counter - 1
+        }
+
+    def consume_preauth_ticket(
+        self,
+        token: Optional[str] = None,
+        caller_user: Optional[str] = None
+    ) -> Tuple[bool, str]:
+        """Valida e consome atomicamente o ticket de pré-autorização para execução de comando."""
+        with AtomicLock():
+            if not PREAUTH_TICKET_FILE.exists():
+                return False, "Nenhum ticket de pré-autorização ativo encontrado."
+
+            try:
+                with open(PREAUTH_TICKET_FILE, "r", encoding="utf-8") as f:
+                    ticket = json.load(f)
+            except Exception as e:
+                return False, f"Falha ao ler ticket de pré-autorização: {e}"
+
+            now = time.time()
+            if now > ticket.get("expires_at", 0):
+                PREAUTH_TICKET_FILE.unlink(missing_ok=True)
+                return False, "Ticket de pré-autorização expirado (tempo limite de 45 minutos excedido)."
+
+            # Validação por token explícito
+            if token:
+                expected_hash = hashlib.sha256(token.strip().encode("ascii")).hexdigest()
+                if not hmac.compare_digest(expected_hash, ticket.get("token_hash", "")):
+                    return False, "Token de pré-autorização fornecido é inválido."
+            else:
+                # Validação por usuário chamador do Windows
+                t_user = ticket.get("caller_user")
+                c_user = caller_user or os.getenv("USERNAME", "unknown")
+                if t_user and c_user and t_user != "unknown" and c_user != "unknown":
+                    if t_user.lower() != c_user.lower():
+                        return False, f"O ticket de pré-autorização pertence a outro usuário ({t_user} != {c_user})."
+
+            # Consumo estritamente único
+            try:
+                PREAUTH_TICKET_FILE.unlink(missing_ok=True)
+            except Exception:
+                pass
+
+            self._log_audit(
+                "PREAUTH_TICKET_CONSUMED",
+                ticket.get("counter_used", 0),
+                ticket.get("counter_used", 0) + 1,
+                True,
+                "Ticket de pré-autorização validado e consumido com sucesso para execução imediata."
+            )
+            return True, "Ticket de pré-autorização validado e consumido com sucesso."
