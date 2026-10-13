@@ -754,59 +754,6 @@ class HOTPAuth:
             )
             return True, "Ticket de pre-autorizacao validado e consumido com sucesso."
 
-    def _diagnose_via_daemon_queue(
-        self,
-        clean_otp: str,
-        max_lookahead: int = 10,
-        max_lookback: Optional[int] = None
-    ) -> dict:
-        """Envia solicitação de probe passivo para o daemon rodando como SYSTEM via fila."""
-        import uuid
-        req_id = f"probe_{uuid.uuid4().hex[:12]}"
-        payload = {
-            "id": req_id,
-            "script_type": "sync_probe",
-            "otp": clean_otp,
-            "lookahead": max_lookahead,
-            "lookback": max_lookback,
-            "created_at": datetime.now().astimezone().isoformat(),
-            "caller": {
-                "pid": os.getpid(),
-                "user": os.getenv("USERNAME", "unknown")
-            }
-        }
-        REQUESTS_DIR.mkdir(parents=True, exist_ok=True)
-        RESPONSES_DIR.mkdir(parents=True, exist_ok=True)
-        req_file = REQUESTS_DIR / f"{req_id}.json"
-        res_file = RESPONSES_DIR / f"{req_id}.json"
-
-        try:
-            with open(req_file, "w", encoding="utf-8") as f:
-                json.dump(payload, f, indent=2, ensure_ascii=False)
-        except Exception as e:
-            return {
-                "success": False,
-                "error": f"Falha ao enviar requisição para o serviço: {e}"
-            }
-
-        start = time.time()
-        while time.time() - start < 4.0:
-            if res_file.exists():
-                try:
-                    with open(res_file, "r", encoding="utf-8") as f:
-                        res = json.load(f)
-                    res_file.unlink(missing_ok=True)
-                    return res
-                except Exception:
-                    pass
-            time.sleep(0.1)
-
-        req_file.unlink(missing_ok=True)
-        return {
-            "success": False,
-            "error": "Tempo limite esgotado aguardando resposta do serviço de sistema."
-        }
-
     def diagnose_otp_sync(
         self,
         provided_otp: str,
@@ -814,11 +761,8 @@ class HOTPAuth:
         max_lookback: Optional[int] = None
     ) -> dict:
         """
-        Modo de diagnóstico e teste de sincronia HOTP (RFC 4226).
-        NÃO AVANÇA O CONTADOR nem altera nenhum estado ou arquivo.
-        
-        Testa estritamente até 10 posições acima e todas as posições anteriores até 0.
-        Informa o índice exato do autenticador e qual é o próximo OTP necessário.
+        Modo de diagnóstico e teste de sincronia HOTP RFC 4226.
+        Aplica a máquina de estados estrita em duas fases no próprio processo.
         """
         clean_otp = str(provided_otp).strip()
         if not clean_otp.isdigit() or len(clean_otp) != DEFAULT_DIGITS:
@@ -828,12 +772,7 @@ class HOTPAuth:
             }
 
         with AtomicLock():
-            try:
-                cfg = self._load_config_raw()
-            except PermissionError:
-                # Se não puder ler C:\Utilitario\config diretamente (processo não elevado com ACLs restritas a SYSTEM),
-                # delega a verificação passiva para o daemon rodando como SYSTEM através da fila.
-                return self._diagnose_via_daemon_queue(clean_otp, max_lookahead, max_lookback)
+            cfg = self._load_config_raw()
 
             if not cfg or cfg.get("provisioned_flag") != 1:
                 return {

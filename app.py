@@ -47,7 +47,6 @@ SCRIPTS_DIR = BASE_DIR / "scripts"
 LOGS_DIR = BASE_DIR / "logs"
 HEARTBEAT_FILE = QUEUE_DIR / "heartbeat.json"
 STATUS_FILE = QUEUE_DIR / "status.json"
-RUNNER_PS1 = BASE_DIR / "runner.ps1"
 CONFIG_FILE = CONFIG_DIR / "hotp_config.json"
 AUTH_LOG_FILE = LOGS_DIR / "auth.log"
 
@@ -57,51 +56,6 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s"
 )
-
-# -----------------------------------------------------------------------------
-# RUNNER POWERSHELL EMBUTIDO
-# -----------------------------------------------------------------------------
-RUNNER_PS1_SCRIPT = """param (
-    [Parameter(Mandatory=$true)]
-    [string]$ScriptPath,
-    [Parameter(Mandatory=$true)]
-    [string]$ScriptType,
-    [Parameter(Mandatory=$true)]
-    [string]$LogPath,
-    [Parameter(Mandatory=$true)]
-    [string]$ExitPath
-)
-
-$exitCode = 0
-try {
-    if ($ScriptType -eq "bat" -or $ScriptType -eq "cmd") {
-        $process = Start-Process -FilePath "cmd.exe" -ArgumentList "/c `"$ScriptPath`"" -NoNewWindow -Wait -PassThru -RedirectStandardOutput $LogPath -RedirectStandardError "$LogPath.err"
-        $exitCode = $process.ExitCode
-        if (Test-Path "$LogPath.err") {
-            $errContent = Get-Content "$LogPath.err" -Raw
-            if ($errContent) {
-                Add-Content -Path $LogPath -Value "`n[STDERR]:`n$errContent"
-            }
-            Remove-Item "$LogPath.err" -Force -ErrorAction SilentlyContinue
-        }
-    } else {
-        $process = Start-Process -FilePath "powershell.exe" -ArgumentList "-NoProfile -ExecutionPolicy Bypass -File `"$ScriptPath`"" -NoNewWindow -Wait -PassThru -RedirectStandardOutput $LogPath -RedirectStandardError "$LogPath.err"
-        $exitCode = $process.ExitCode
-        if (Test-Path "$LogPath.err") {
-            $errContent = Get-Content "$LogPath.err" -Raw
-            if ($errContent) {
-                Add-Content -Path $LogPath -Value "`n[STDERR]:`n$errContent"
-            }
-            Remove-Item "$LogPath.err" -Force -ErrorAction SilentlyContinue
-        }
-    }
-} catch {
-    $exitCode = 1
-    Set-Content -Path $LogPath -Value "Erro ao executar runner: $_"
-}
-
-Set-Content -Path $ExitPath -Value $exitCode -Encoding ascii
-"""
 
 
 def is_admin() -> bool:
@@ -221,9 +175,8 @@ def ensure_environment_installed():
     RESPONSES_DIR.mkdir(parents=True, exist_ok=True)
     SCRIPTS_DIR.mkdir(parents=True, exist_ok=True)
 
-    if not RUNNER_PS1.exists():
-        with open(RUNNER_PS1, "w", encoding="utf-8") as f:
-            f.write(RUNNER_PS1_SCRIPT)
+    # Remove runner.ps1 legado se existir em disco para garantir processo unico
+    (BASE_DIR / "runner.ps1").unlink(missing_ok=True)
 
     target_exe = (BASE_DIR / "AdminBridge.exe").resolve()
     current_exe = Path(sys.executable).resolve()
@@ -797,30 +750,29 @@ class ExecutionThread(QThread):
         ext = "ps1" if script_type == "ps1" else "bat"
         script_file = SCRIPTS_DIR / f"{req_id}.{ext}"
         log_file = RESPONSES_DIR / f"{req_id}.log"
-        exit_file = RESPONSES_DIR / f"{req_id}.exit"
-
-        with open(script_file, "w", encoding="utf-8") as f:
-            f.write(code)
-
         exit_code = 0
         output_data = ""
 
         try:
             if self.force_uac:
                 # Dispara via ShellExecuteEx com 'runas' para exigir UAC na tela
-                params = (
-                    f'-NoProfile -ExecutionPolicy Bypass -File "{RUNNER_PS1}" '
-                    f'-ScriptPath "{script_file}" -ScriptType "{script_type}" '
-                    f'-LogPath "{log_file}" -ExitPath "{exit_file}"'
-                )
+                if script_type in ("bat", "cmd"):
+                    exe_target = "cmd.exe"
+                    param_target = f'/c "{code}"'
+                elif script_type == "ps1":
+                    exe_target = "powershell.exe"
+                    param_target = f'-NoProfile -ExecutionPolicy Bypass -Command "{code}"'
+                else:
+                    exe_target = "cmd.exe"
+                    param_target = f'/c "{code}"'
 
                 sei = SHELLEXECUTEINFO()
                 sei.cbSize = ctypes.sizeof(SHELLEXECUTEINFO)
                 sei.fMask = 0x00000040  # SEE_MASK_NOCLOSEPROCESS
                 sei.hwnd = self.hwnd
                 sei.lpVerb = "runas"
-                sei.lpFile = "powershell.exe"
-                sei.lpParameters = params
+                sei.lpFile = exe_target
+                sei.lpParameters = param_target
                 sei.nShow = 0  # SW_HIDE
 
                 res = ctypes.windll.shell32.ShellExecuteExW(ctypes.byref(sei))
@@ -840,17 +792,20 @@ class ExecutionThread(QThread):
                         raise ctypes.WinError(err)
 
                 ctypes.windll.kernel32.WaitForSingleObject(sei.hProcess, 0xFFFFFFFF)
+                exit_code_dw = wintypes.DWORD()
+                ctypes.windll.kernel32.GetExitCodeProcess(sei.hProcess, ctypes.byref(exit_code_dw))
+                exit_code = int(exit_code_dw.value)
                 ctypes.windll.kernel32.CloseHandle(sei.hProcess)
+                output_data = "Comando executado com sucesso via UAC elevado."
             else:
-                # Modo HOTP automatizado (CREATE_NO_WINDOW)
-                cmd = [
-                    "powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass",
-                    "-File", str(RUNNER_PS1),
-                    "-ScriptPath", str(script_file),
-                    "-ScriptType", script_type,
-                    "-LogPath", str(log_file),
-                    "-ExitPath", str(exit_file)
-                ]
+                # Execucao nativa direta em processo unico
+                if script_type in ("bat", "cmd"):
+                    cmd = ["cmd.exe", "/c", code]
+                elif script_type == "ps1":
+                    cmd = ["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", code]
+                else:
+                    cmd = ["cmd.exe", "/c", code]
+
                 proc = subprocess.run(
                     cmd,
                     capture_output=True,
@@ -858,23 +813,10 @@ class ExecutionThread(QThread):
                     check=False,
                     creationflags=0x08000000  # CREATE_NO_WINDOW
                 )
-                if proc.returncode != 0 and not exit_file.exists():
-                    exit_code = proc.returncode
-                    output_data = f"[ERRO NO RUNNER]: {proc.stderr}\n{proc.stdout}"
-
-            if exit_file.exists():
-                try:
-                    with open(exit_file, "r", encoding="utf-8") as f:
-                        exit_code = int(f.read().strip())
-                except Exception:
-                    exit_code = 0
-
-            if log_file.exists():
-                try:
-                    with open(log_file, "r", encoding="utf-8", errors="replace") as f:
-                        output_data = f.read()
-                except Exception:
-                    output_data = ""
+                output_data = proc.stdout
+                if proc.stderr:
+                    output_data += ("\n[STDERR]:\n" if output_data else "") + proc.stderr
+                exit_code = proc.returncode
 
         except Exception as e:
             exit_code = -1
@@ -887,15 +829,6 @@ class ExecutionThread(QThread):
             "output": output_data,
             "completed_at": datetime.now().astimezone().isoformat()
         }
-
-        # Limpeza segura do script temporário
-        try:
-            script_file.unlink(missing_ok=True)
-            log_file.unlink(missing_ok=True)
-            exit_file.unlink(missing_ok=True)
-        except Exception:
-            pass
-
         self.finished_signal.emit(response)
 
 
@@ -1995,23 +1928,6 @@ def run_daemon_loop(hotp_auth: HOTPAuth):
                     time.sleep(0.5)
                     continue
 
-                script_type = peek_data.get("script_type")
-                if script_type == "sync_probe":
-                    req_id = target.stem
-                    proc_file = PROCESSING_DIR / f"{req_id}.json"
-                    try:
-                        target.rename(proc_file)
-                    except Exception:
-                        continue
-                    otp_probe = peek_data.get("otp", "")
-                    la = peek_data.get("lookahead", 10)
-                    lb = peek_data.get("lookback")
-                    res = hotp_auth.diagnose_otp_sync(otp_probe, max_lookahead=la, max_lookback=lb)
-                    with open(RESPONSES_DIR / f"{req_id}.json", "w", encoding="utf-8") as f:
-                        json.dump(res, f, indent=2, ensure_ascii=False)
-                    proc_file.unlink(missing_ok=True)
-                    continue
-
                 has_otp = bool(peek_data.get("otp"))
                 has_token = bool(peek_data.get("preauth_token"))
                 has_ticket = PREAUTH_TICKET_FILE.exists()
@@ -2081,40 +1997,26 @@ def run_daemon_loop(hotp_auth: HOTPAuth):
                         proc_file.unlink(missing_ok=True)
                         continue
 
-                # Executa comando autenticado
-                script_type = data.get("script_type", "bat").lower()
-                ext = "ps1" if script_type == "ps1" else "bat"
-                sc_path = SCRIPTS_DIR / f"{req_id}.{ext}"
-                lg_path = RESPONSES_DIR / f"{req_id}.log"
-                ex_path = RESPONSES_DIR / f"{req_id}.exit"
+                # Executa comando autenticado diretamente em processo unico, sem runner.ps1 intermediario
+                script_type = data.get("script_type", "cmd").lower()
+                if script_type in ("bat", "cmd"):
+                    cmd = ["cmd.exe", "/c", code]
+                elif script_type == "ps1":
+                    cmd = ["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", code]
+                else:
+                    cmd = ["cmd.exe", "/c", code]
 
-                with open(sc_path, "w", encoding="utf-8") as f:
-                    f.write(code)
-
-                cmd = [
-                    "powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass",
-                    "-File", str(RUNNER_PS1),
-                    "-ScriptPath", str(sc_path),
-                    "-ScriptType", script_type,
-                    "-LogPath", str(lg_path),
-                    "-ExitPath", str(ex_path)
-                ]
-                subprocess.run(cmd, capture_output=True, check=False, creationflags=0x08000000)
-
-                out_txt = ""
-                ec = 0
-                if lg_path.exists():
-                    try:
-                        with open(lg_path, "r", encoding="utf-8", errors="replace") as f:
-                            out_txt = f.read()
-                    except Exception:
-                        pass
-                if ex_path.exists():
-                    try:
-                        with open(ex_path, "r", encoding="utf-8") as f:
-                            ec = int(f.read().strip())
-                    except Exception:
-                        pass
+                proc = subprocess.run(
+                    cmd,
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                    creationflags=0x08000000  # CREATE_NO_WINDOW
+                )
+                out_txt = proc.stdout
+                if proc.stderr:
+                    out_txt += ("\n[STDERR]:\n" if out_txt else "") + proc.stderr
+                ec = proc.returncode
 
                 res = {
                     "id": req_id,
@@ -2126,9 +2028,6 @@ def run_daemon_loop(hotp_auth: HOTPAuth):
                 with open(RESPONSES_DIR / f"{req_id}.json", "w", encoding="utf-8") as f:
                     json.dump(res, f, indent=2, ensure_ascii=False)
 
-                sc_path.unlink(missing_ok=True)
-                lg_path.unlink(missing_ok=True)
-                ex_path.unlink(missing_ok=True)
                 proc_file.unlink(missing_ok=True)
 
         except Exception as e:
@@ -2328,7 +2227,70 @@ def run_cli_client(args, hotp_auth: HOTPAuth):
         sys.exit(0 if ok else 1)
 
     elif args.subcommand == "run":
-        # Envia requisição para a fila
+        code = args.code
+        otp = args.otp
+        preauth_token = getattr(args, "preauth_token", None)
+        caller_info = {
+            "pid": os.getpid(),
+            "exe": sys.executable,
+            "user": os.getenv("USERNAME", "unknown")
+        }
+
+        # Se ja possui privilegios administrativos, executa diretamente no proprio processo unico
+        if is_admin():
+            auth_ok = False
+            auth_msg = ""
+            if otp:
+                valid, auth_msg, _ = hotp_auth.verify_and_advance(otp, caller_info)
+                auth_ok = valid
+            elif preauth_token:
+                valid, auth_msg = hotp_auth.consume_preauth_ticket(preauth_token, caller_info.get("user"))
+                auth_ok = valid
+            else:
+                auth_ok = True
+
+            if not auth_ok:
+                res = {
+                    "id": str(uuid.uuid4()),
+                    "status": "rejected_auth",
+                    "reason": auth_msg,
+                    "exit_code": 401,
+                    "output": f"[ACESSO RECUSADO]: {auth_msg}",
+                    "completed_at": datetime.now().astimezone().isoformat()
+                }
+                print(json.dumps(res, indent=2, ensure_ascii=False))
+                sys.exit(1)
+
+            st = (args.type or "cmd").lower()
+            if st in ("bat", "cmd"):
+                cmd = ["cmd.exe", "/c", code]
+            elif st == "ps1":
+                cmd = ["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", code]
+            else:
+                cmd = ["cmd.exe", "/c", code]
+
+            proc = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                check=False,
+                creationflags=0x08000000
+            )
+            out_txt = proc.stdout
+            if proc.stderr:
+                out_txt += ("\n[STDERR]:\n" if out_txt else "") + proc.stderr
+
+            res = {
+                "id": str(uuid.uuid4()),
+                "status": "approved",
+                "exit_code": proc.returncode,
+                "output": out_txt,
+                "completed_at": datetime.now().astimezone().isoformat()
+            }
+            print(json.dumps(res, indent=2, ensure_ascii=False))
+            sys.exit(0 if proc.returncode == 0 else 1)
+
+        # Se o processo chamador nao for elevado, envia para a fila do daemon
         REQUESTS_DIR.mkdir(parents=True, exist_ok=True)
         RESPONSES_DIR.mkdir(parents=True, exist_ok=True)
 
