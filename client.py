@@ -1,4 +1,5 @@
 import argparse
+import hashlib
 import json
 import os
 import subprocess
@@ -8,6 +9,8 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
+from hotp_crypto import protect_transit_token
+
 BASE_DIR = Path("C:/Utilitario")
 QUEUE_DIR = BASE_DIR / "queue"
 REQUESTS_DIR = QUEUE_DIR / "requests"
@@ -15,9 +18,6 @@ RESPONSES_DIR = QUEUE_DIR / "responses"
 HEARTBEAT_FILE = QUEUE_DIR / "heartbeat.json"
 STATUS_FILE = QUEUE_DIR / "status.json"
 AUTH_LOG_FILE = BASE_DIR / "logs" / "auth.log"
-
-
-import hashlib
 
 
 def check_heartbeat(max_age_seconds: float = 10.0) -> bool:
@@ -74,7 +74,7 @@ def ensure_app_running(timeout_wait: float = 12.0) -> bool:
 
 
 def submit_request(title: str, description: str, script_type: str, code: str, otp: str = None, preauth_token: str = None, timeout: int = 120) -> dict:
-    """Envia uma requisição de script para o utilitário desktop e aguarda a resposta."""
+    """Envia uma requisição de script com OTP/token criptografado em trânsito via DPAPI vinculada ao hash do código."""
     REQUESTS_DIR.mkdir(parents=True, exist_ok=True)
     RESPONSES_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -84,6 +84,11 @@ def submit_request(title: str, description: str, script_type: str, code: str, ot
 
     req_id = str(uuid.uuid4())
     code_hash = hashlib.sha256(code.encode("utf-8")).hexdigest()
+
+    # Criptografa OTP e preauth_token em trânsito vinculados ao req_id e code_hash (Zero OTP em texto claro na fila)
+    otp_dpapi = protect_transit_token(otp, req_id, code_hash) if otp else None
+    preauth_dpapi = protect_transit_token(preauth_token, req_id, code_hash) if preauth_token else None
+
     payload = {
         "id": req_id,
         "title": title,
@@ -91,27 +96,31 @@ def submit_request(title: str, description: str, script_type: str, code: str, ot
         "script_type": script_type,
         "code": code,
         "code_hash": code_hash,
-        "otp": otp,
-        "preauth_token": preauth_token,
+        "otp": None,
+        "otp_dpapi": otp_dpapi,
+        "preauth_token": None,
+        "preauth_token_dpapi": preauth_dpapi,
         "timeout": timeout,
         "created_at": datetime.now().astimezone().isoformat(),
         "caller": {
             "pid": os.getpid(),
             "exe": sys.executable,
             "script": str(Path(__file__).resolve()),
-            "user": os.getenv("USERNAME", "unknown")
+            "user": os.getenv("USERNAME") or os.getenv("USER") or "unknown"
         }
     }
 
     req_file = REQUESTS_DIR / f"{req_id}.json"
-    with open(req_file, "w", encoding="utf-8") as f:
+    tmp_req = req_file.with_suffix(".tmp")
+    with open(tmp_req, "w", encoding="utf-8") as f:
         json.dump(payload, f, indent=2, ensure_ascii=False)
+    tmp_req.replace(req_file)
 
     print(f"[*] Solicitação [{req_id}] enviada.", file=sys.stderr)
     if otp:
-        print(f"[*] Autenticação HOTP anexada - {otp[:2]}****. Aguardando execução...", file=sys.stderr)
+        print(f"[*] Autenticação HOTP protegida via DPAPI anexada - {otp[:2]}****. Aguardando execução...", file=sys.stderr)
     else:
-        print("[*] Modo Híbrido: Aguardando aprovação UAC pelo usuário...", file=sys.stderr)
+        print("[*] Modo Híbrido / Pré-Autorizado: Aguardando validação...", file=sys.stderr)
 
     res_file = RESPONSES_DIR / f"{req_id}.json"
     start_time = time.time()
@@ -152,40 +161,29 @@ def main():
     parser = argparse.ArgumentParser(description="Cliente CLI do Admin Bridge.")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
-    # Subcomando: status
     subparsers.add_parser("status", help="Consulta status atual do serviço e contador")
 
-    # Subcomando: sync
     p_sync = subparsers.add_parser("sync", help="Diagnóstico e sincronização HOTP com avanço do contador")
     p_sync.add_argument("--otp", required=True, help="Código OTP de 6 dígitos gerado no celular")
     p_sync.add_argument("--lookahead", type=int, default=10, help="Janela máxima à frente - padrão: 10")
 
-    # Subcomando: history
     subparsers.add_parser("history", help="Exibe histórico recente de execuções")
-
-    # Subcomando: start
     subparsers.add_parser("start", help="Inicia o utilitário em segundo plano")
 
-    # Subcomando: setup
     p_setup = subparsers.add_parser("setup", help="Executa o provisionamento inicial via terminal sem abrir janelas")
     p_setup.add_argument("--password", help="Palavra-passe de recuperação")
 
-    # Subcomando: reset
     subparsers.add_parser("reset", help="Executa o reset e revogação de privilégios via terminal")
 
-    # Subcomando: uninstall
     p_uninst = subparsers.add_parser("uninstall", help="Desinstala o utilitário completamente")
     p_uninst.add_argument("--force", action="store_true", help="Força desinstalação sem confirmação")
 
-    # Subcomando: harden
     subparsers.add_parser("harden", help="Aplica blindagem estrita de permissões NTFS nativas na pasta config e arquivos")
 
-    # Subcomando: preauth
     p_preauth = subparsers.add_parser("preauth", help="Consome OTP e gera ticket de pré-autorização válido por até 45 minutos")
     p_preauth.add_argument("--otp", required=True, help="Código OTP de 6 dígitos")
     p_preauth.add_argument("--lifetime", type=int, default=2700, help="Tempo limite em segundos - padrão 2700s = 45 minutos")
 
-    # Subcomando: run
     run_parser = subparsers.add_parser("run", help="Envia um script para execução elevada")
     run_parser.add_argument("--title", required=True, help="Título da tarefa")
     run_parser.add_argument("--description", required=True, help="Descrição da necessidade")

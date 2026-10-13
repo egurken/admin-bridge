@@ -8,7 +8,15 @@ echo ========================================================
 
 cd /d "%~dp0"
 
-echo Iniciando compilacao do executavel...
+echo.
+echo [1/2] Executando testes automatizados de seguranca...
+python test_security_rules.py
+if %ERRORLEVEL% NEQ 0 (
+    echo.
+    echo [ERRO CRITICO] Falha nos testes de seguranca! Compilacao abortada.
+    pause
+    exit /b 1
+)
 
 echo.
 echo [2/2] Gerando executavel standalone (Onefile)...
@@ -36,9 +44,16 @@ if %ERRORLEVEL% EQU 0 (
     echo ========================================================
 
     echo Atualizando C:\Utilitario...
+    if exist "C:\Utilitario\AdminBridge.exe" (
+        attrib -r "C:\Utilitario\AdminBridge.exe" >nul 2>&1
+    )
+    if exist "C:\Utilitario\AntigravityBridge.exe" (
+        attrib -r "C:\Utilitario\AntigravityBridge.exe" >nul 2>&1
+    )
     copy /y "%~dp0dist\AdminBridge.exe" "C:\Utilitario\AdminBridge.exe" >nul
     copy /y "%~dp0dist\AdminBridge.exe" "C:\Utilitario\AntigravityBridge.exe" >nul
     echo Executavel copiado para C:\Utilitario com sucesso!
+    echo [IMPORTANTE] Se o utilitario ja estava provisionado, abra o painel e clique em 'Corrigir' com sua Senha Mestra para re-ancorar o novo hash do executavel.
 
     set "DESK_DIR="
     if exist "%USERPROFILE%\OneDrive\Desktop" (
@@ -70,4 +85,3 @@ if %ERRORLEVEL% EQU 0 (
     exit /b 1
 )
 pause
-

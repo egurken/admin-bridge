@@ -4,7 +4,6 @@ import hashlib
 import hmac
 import json
 import logging
-import msvcrt
 import os
 import re
 import secrets
@@ -12,10 +11,23 @@ import subprocess
 import sys
 import threading
 import time
-from ctypes import wintypes
 from datetime import datetime
 from pathlib import Path
 from typing import Optional, Tuple
+
+if sys.platform == "win32":
+    import msvcrt
+    from ctypes import wintypes
+else:
+    msvcrt = None
+    class wintypes:
+        DWORD = ctypes.c_uint32
+        HANDLE = ctypes.c_void_p
+        HWND = ctypes.c_void_p
+        ULONG = ctypes.c_ulong
+        LPCWSTR = ctypes.c_wchar_p
+        HINSTANCE = ctypes.c_void_p
+        HKEY = ctypes.c_void_p
 
 BASE_DIR = Path("C:/Utilitario")
 CONFIG_DIR = BASE_DIR / "config"
@@ -24,6 +36,7 @@ LOGS_DIR = BASE_DIR / "logs"
 LOCK_FILE = QUEUE_DIR / "hotp.lock"
 LEDGER_FILE = LOGS_DIR / "ledger.jsonl"
 LEDGER_ANCHOR_FILE = LOGS_DIR / "ledger.anchor"
+HW_SALT_FILE = CONFIG_DIR / "hw_salt.bin"
 
 # DPAPI Structures & Functions
 class DATA_BLOB(ctypes.Structure):
@@ -32,37 +45,110 @@ class DATA_BLOB(ctypes.Structure):
         ("pbData", ctypes.POINTER(ctypes.c_byte))
     ]
 
-crypt32 = ctypes.windll.crypt32
-kernel32 = ctypes.windll.kernel32
+crypt32 = getattr(ctypes, "windll", None).crypt32 if hasattr(ctypes, "windll") else None
+kernel32 = getattr(ctypes, "windll", None).kernel32 if hasattr(ctypes, "windll") else None
+advapi32 = getattr(ctypes, "windll", None).advapi32 if hasattr(ctypes, "windll") else None
 
 DPAPI_ENTROPY = b"AntigravityBridge_TPM_DPAPI_Entropy_2026"
 DPAPI_MAC_ENTROPY = b"AntigravityConfigIntegrityV2"
+DPAPI_QUEUE_ENTROPY = b"AntigravityQueueTransitProtectionV2"
 CRYPTPROTECT_UI_FORBIDDEN = 0x1
 CRYPTPROTECT_LOCAL_MACHINE = 0x4
-DPAPI_FLAGS = CRYPTPROTECT_LOCAL_MACHINE | CRYPTPROTECT_UI_FORBIDDEN  # 0x5 - Escopo de maquina seguro com entropia restrita e ACL NTFS estrita
+DPAPI_FLAGS = CRYPTPROTECT_LOCAL_MACHINE | CRYPTPROTECT_UI_FORBIDDEN  # 0x5 - Escopo de maquina seguro com entropia composta e ACL NTFS estrita
+
+
+def _get_machine_guid_bytes() -> bytes:
+    """Obtém o MachineGuid único da instalação do Windows para vincular a entropia ao host."""
+    if sys.platform != "win32":
+        return b"NonWinHostGuid"
+    try:
+        import winreg
+        with winreg.OpenKey(
+            winreg.HKEY_LOCAL_MACHINE,
+            r"SOFTWARE\Microsoft\Cryptography",
+            0,
+            winreg.KEY_READ | winreg.KEY_WOW64_64KEY
+        ) as key:
+            val, _ = winreg.QueryValueEx(key, "MachineGuid")
+            if val:
+                return str(val).strip().encode("utf-8")
+    except Exception:
+        pass
+    return b"FallbackMachineGuid"
+
+
+def get_composite_entropy(base_entropy: bytes = DPAPI_ENTROPY, config_dir: Optional[Path] = None) -> bytes:
+    """Combina a entropia base com o MachineGuid do Windows e o salt local protegido em config/."""
+    target_cfg_dir = config_dir or CONFIG_DIR
+    salt_file = target_cfg_dir / "hw_salt.bin"
+    hw_salt = b""
+    try:
+        if salt_file.exists():
+            with open(salt_file, "rb") as sf:
+                hw_salt = sf.read(32)
+    except Exception:
+        hw_salt = b""
+    return hashlib.sha256(base_entropy + b"|" + _get_machine_guid_bytes() + b"|" + hw_salt).digest()
+
+
+def ensure_hw_salt(config_dir: Optional[Path] = None) -> bytes:
+    """Garante a existência de um salt aleatório de 256 bits exclusivo em config/hw_salt.bin."""
+    target_cfg_dir = config_dir or CONFIG_DIR
+    salt_file = target_cfg_dir / "hw_salt.bin"
+    try:
+        target_cfg_dir.mkdir(parents=True, exist_ok=True)
+        if salt_file.exists() and salt_file.stat().st_size >= 32:
+            with open(salt_file, "rb") as sf:
+                return sf.read(32)
+        new_salt = secrets.token_bytes(32)
+        with open(salt_file, "wb") as sf:
+            sf.write(new_salt)
+        if sys.platform == "win32":
+            subprocess.run(
+                ["cmd.exe", "/c", f'icacls "{salt_file}" /inheritance:r /grant:r "*S-1-5-18:(F)" "*S-1-5-32-544:(F)" /c /q'],
+                capture_output=True,
+                check=False,
+                creationflags=0x08000000
+            )
+        return new_salt
+    except Exception:
+        return b""
 
 
 def wipe_buffer(buf):
-    """Sobrescreve buffers de memoria com zeros para higiene estrita de memoria."""
+    """Sobrescreve buffers de memória mutáveis com zeros e desbloqueia páginas físicas."""
     if buf is None:
         return
     if isinstance(buf, bytearray):
         raw_len = len(buf)
         if raw_len > 0:
             try:
-                p_buf = (ctypes.c_char * raw_len).from_buffer(buf)
-                kernel32.RtlZeroMemory(ctypes.byref(p_buf), raw_len)
+                if kernel32 is not None:
+                    p_buf = (ctypes.c_char * raw_len).from_buffer(buf)
+                    kernel32.RtlZeroMemory(ctypes.byref(p_buf), raw_len)
+                else:
+                    for i in range(raw_len):
+                        buf[i] = 0
             except Exception:
                 for i in range(raw_len):
                     buf[i] = 0
-    elif isinstance(buf, (bytes, str)):
-        pass
+            try:
+                unlock_memory_page(buf)
+            except Exception:
+                pass
+    elif isinstance(buf, memoryview):
+        try:
+            if not buf.readonly:
+                for i in range(len(buf)):
+                    buf[i] = 0
+        except Exception:
+            pass
 
 
 def lock_memory_page(buf: bytearray) -> bool:
-    """Bloqueia paginas de memoria fisica no Windows impedindo descarregamento no arquivo pagefile.sys."""
+    """Bloqueia páginas de memória física no Windows impedindo descarregamento no pagefile.sys."""
     try:
-        if not buf:
+        if not buf or kernel32 is None:
             return False
         raw_len = len(buf)
         p_buf = (ctypes.c_char * raw_len).from_buffer(buf)
@@ -72,9 +158,9 @@ def lock_memory_page(buf: bytearray) -> bool:
 
 
 def unlock_memory_page(buf: bytearray) -> bool:
-    """Desbloqueia paginas de memoria fisica previamente travadas."""
+    """Desbloqueia páginas de memória física previamente travadas."""
     try:
-        if not buf:
+        if not buf or kernel32 is None:
             return False
         raw_len = len(buf)
         p_buf = (ctypes.c_char * raw_len).from_buffer(buf)
@@ -84,9 +170,19 @@ def unlock_memory_page(buf: bytearray) -> bool:
 
 
 def configure_anti_dump_mitigations():
-    """Desativa caixas de dialogo de falha e despejos de memoria crash dump no Windows."""
+    """Desativa caixas de diálogo de falha, crash dumps e carregamento inseguro de DLLs no Windows."""
+    if kernel32 is None:
+        return
     try:
-        kernel32.SetErrorMode(0x0001 | 0x0002)
+        # SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX | SEM_NOOPENFILEERRORBOX
+        kernel32.SetErrorMode(0x0001 | 0x0002 | 0x8000)
+        # Remove o diretório de trabalho atual da busca padrão de DLLs para mitigar DLL Hijacking
+        if hasattr(kernel32, "SetDllDirectoryW"):
+            kernel32.SetDllDirectoryW("")
+        # Habilita política de mitigação de carregamento de imagens (ProcessImageLoadPolicy = 10)
+        if hasattr(kernel32, "SetProcessMitigationPolicy"):
+            policy_val = ctypes.c_uint64(0x1 | 0x2)  # NoRemoteImages | NoLowMandatoryLabelImages
+            kernel32.SetProcessMitigationPolicy(10, ctypes.byref(policy_val), ctypes.sizeof(policy_val))
     except Exception:
         pass
 
@@ -94,16 +190,25 @@ def configure_anti_dump_mitigations():
 def dpapi_protect(plaintext: bytes, entropy: bytes = DPAPI_ENTROPY) -> bytes:
     """Criptografa dados usando a DPAPI do Windows com escopo de máquina (TPM/LSA).
 
-    Permite que o serviço SYSTEM e administradores autentiquem os dados sem falha de integridade.
-    Sobrescreve os buffers nativos antes de desalocar.
+    Sobrescreve todos os buffers nativos imediatamente antes de desalocar.
     """
+    if crypt32 is None or kernel32 is None:
+        # Fallback determinístico apenas para testes automatizados fora do Windows
+        key = hashlib.sha256((entropy or b"") + _get_machine_guid_bytes()).digest()
+        nonce = secrets.token_bytes(16)
+        stream = hashlib.pbkdf2_hmac("sha256", key, nonce, 1000, dklen=len(plaintext))
+        enc = bytes(a ^ b for a, b in zip(plaintext, stream))
+        mac = hmac.new(key, nonce + enc, hashlib.sha256).digest()
+        return b"SIM_DPAPI_V2|" + nonce + mac + enc
+
     raw_len = len(plaintext)
-    p_buffer = ctypes.create_string_buffer(plaintext, raw_len)
+    p_buffer = ctypes.create_string_buffer(bytes(plaintext), raw_len)
     data_in = DATA_BLOB(raw_len, ctypes.cast(p_buffer, ctypes.POINTER(ctypes.c_byte)))
 
+    ent_buf = ctypes.create_string_buffer(entropy, len(entropy)) if entropy else None
     entropy_blob = DATA_BLOB(
         len(entropy),
-        ctypes.cast(ctypes.create_string_buffer(entropy, len(entropy)), ctypes.POINTER(ctypes.c_byte))
+        ctypes.cast(ent_buf, ctypes.POINTER(ctypes.c_byte))
     ) if entropy else DATA_BLOB(0, None)
     data_out = DATA_BLOB()
 
@@ -117,31 +222,50 @@ def dpapi_protect(plaintext: bytes, entropy: bytes = DPAPI_ENTROPY) -> bytes:
         ctypes.byref(data_out)
     )
 
-    # Limpa buffer nativo de entrada imediatamente
+    # Limpa buffers nativos de entrada e entropia imediatamente
     ctypes.memset(ctypes.cast(p_buffer, ctypes.c_void_p), 0, raw_len)
+    if ent_buf is not None:
+        ctypes.memset(ctypes.cast(ent_buf, ctypes.c_void_p), 0, len(entropy))
 
     if not res:
         err = ctypes.GetLastError()
         raise ctypes.WinError(err)
 
-    buf = ctypes.string_at(data_out.pbData, data_out.cbData)
-    ctypes.memset(data_out.pbData, 0, data_out.cbData)
+    out_len = int(data_out.cbData)
+    buf = ctypes.string_at(data_out.pbData, out_len)
+    ctypes.memset(data_out.pbData, 0, out_len)
     kernel32.LocalFree(data_out.pbData)
     return buf
 
 
 def dpapi_unprotect(ciphertext: bytes, entropy: bytes = DPAPI_ENTROPY) -> bytearray:
-    """Descriptografa dados usando DPAPI e retorna bytearray mutável.
+    """Descriptografa dados usando DPAPI diretamente para bytearray mutável travado em RAM.
 
-    Limpa buffers nativos com memset antes de desalocar.
+    NUNCA cria objetos bytes/str imutáveis em Python com o segredo em texto claro.
     """
+    if crypt32 is None or kernel32 is None:
+        if not ciphertext.startswith(b"SIM_DPAPI_V2|"):
+            raise RuntimeError("Blob DPAPI inválido.")
+        raw = ciphertext[len(b"SIM_DPAPI_V2|"):]
+        nonce, mac, enc = raw[:16], raw[16:48], raw[48:]
+        key = hashlib.sha256((entropy or b"") + _get_machine_guid_bytes()).digest()
+        expected_mac = hmac.new(key, nonce + enc, hashlib.sha256).digest()
+        if not hmac.compare_digest(mac, expected_mac):
+            raise RuntimeError("Falha de autenticação DPAPI: entropia ou integridade inválida.")
+        stream = hashlib.pbkdf2_hmac("sha256", key, nonce, 1000, dklen=len(enc))
+        out_ba = bytearray(a ^ b for a, b in zip(enc, stream))
+        lock_memory_page(out_ba)
+        return out_ba
+
+    in_buf = ctypes.create_string_buffer(ciphertext, len(ciphertext))
     data_in = DATA_BLOB(
         len(ciphertext),
-        ctypes.cast(ctypes.create_string_buffer(ciphertext, len(ciphertext)), ctypes.POINTER(ctypes.c_byte))
+        ctypes.cast(in_buf, ctypes.POINTER(ctypes.c_byte))
     )
+    ent_buf = ctypes.create_string_buffer(entropy, len(entropy)) if entropy else None
     entropy_blob = DATA_BLOB(
         len(entropy),
-        ctypes.cast(ctypes.create_string_buffer(entropy, len(entropy)), ctypes.POINTER(ctypes.c_byte))
+        ctypes.cast(ent_buf, ctypes.POINTER(ctypes.c_byte))
     ) if entropy else DATA_BLOB(0, None)
     data_out = DATA_BLOB()
 
@@ -154,17 +278,60 @@ def dpapi_unprotect(ciphertext: bytes, entropy: bytes = DPAPI_ENTROPY) -> bytear
         CRYPTPROTECT_UI_FORBIDDEN,
         ctypes.byref(data_out)
     )
+    if ent_buf is not None:
+        ctypes.memset(ctypes.cast(ent_buf, ctypes.c_void_p), 0, len(entropy))
+
     if not res:
         err = ctypes.GetLastError()
         raise ctypes.WinError(err)
 
-    raw_bytes = ctypes.string_at(data_out.pbData, data_out.cbData)
-    # Higiene de memória nativa: zera os bytes descriptografados na memória do Windows
-    ctypes.memset(data_out.pbData, 0, data_out.cbData)
+    out_len = int(data_out.cbData)
+    mutable_out = bytearray(out_len)
+    if out_len > 0:
+        dst_buf = (ctypes.c_char * out_len).from_buffer(mutable_out)
+        ctypes.memmove(dst_buf, data_out.pbData, out_len)
+        ctypes.memset(data_out.pbData, 0, out_len)
     kernel32.LocalFree(data_out.pbData)
 
-    # Retorna bytearray mutável para posterior sobrescrita pelo chamador
-    return bytearray(raw_bytes)
+    lock_memory_page(mutable_out)
+    return mutable_out
+
+
+def protect_transit_token(token_str: str, req_id: str, code_hash: str) -> str:
+    """Criptografa um OTP ou token de pré-autorização em trânsito na fila vinculando-o ao ID e ao hash do script.
+
+    Impede que processos de usuários comuns leiam o OTP em queue/requests e impede adulteração TOCTOU do comando.
+    """
+    if not token_str:
+        return ""
+    bound_entropy = hashlib.sha256(
+        DPAPI_QUEUE_ENTROPY + b"|" + str(req_id).encode("utf-8") + b"|" + str(code_hash).encode("utf-8")
+    ).digest()
+    raw_ba = bytearray(str(token_str).strip().encode("utf-8"))
+    try:
+        enc = dpapi_protect(bytes(raw_ba), entropy=bound_entropy)
+        return base64.b64encode(enc).decode("ascii")
+    finally:
+        wipe_buffer(raw_ba)
+
+
+def unprotect_transit_token(enc_b64: str, req_id: str, code_hash: str) -> Optional[str]:
+    """Descriptografa e valida um OTP/token em trânsito vinculado criptograficamente ao ID e ao script."""
+    if not enc_b64:
+        return None
+    bound_entropy = hashlib.sha256(
+        DPAPI_QUEUE_ENTROPY + b"|" + str(req_id).encode("utf-8") + b"|" + str(code_hash).encode("utf-8")
+    ).digest()
+    plain_ba = None
+    try:
+        raw_enc = base64.b64decode(enc_b64)
+        plain_ba = dpapi_unprotect(raw_enc, entropy=bound_entropy)
+        return plain_ba.decode("utf-8")
+    except Exception:
+        return None
+    finally:
+        if plain_ba is not None:
+            wipe_buffer(plain_ba)
 
 
 def _canonical_payload(cfg: dict) -> bytes:
@@ -188,7 +355,7 @@ _usn_cache = {}
 
 
 def get_file_usn(file_path: Path) -> str:
-    """Obtem o USN [Update Sequence Number] do registro NTFS usando fsutil com cache inteligente."""
+    """Obtém o USN [Update Sequence Number] do registro NTFS usando fsutil com cache inteligente."""
     try:
         stat_res = file_path.stat()
         mtime_ns = int(stat_res.st_mtime_ns)
@@ -200,20 +367,21 @@ def get_file_usn(file_path: Path) -> str:
         return "0x0"
 
     usn_val = None
-    try:
-        p = subprocess.run(
-            ["fsutil", "usn", "readdata", str(file_path)],
-            capture_output=True,
-            text=True,
-            check=False,
-            creationflags=0x08000000
-        )
-        if p.returncode == 0:
-            m = re.search(r"Usn\s*:\s*(0x[0-9a-fA-F]+)", p.stdout, re.IGNORECASE)
-            if m:
-                usn_val = m.group(1).lower()
-    except Exception:
-        pass
+    if sys.platform == "win32":
+        try:
+            p = subprocess.run(
+                ["fsutil", "usn", "readdata", str(file_path)],
+                capture_output=True,
+                text=True,
+                check=False,
+                creationflags=0x08000000
+            )
+            if p.returncode == 0:
+                m = re.search(r"Usn\s*:\s*(0x[0-9a-fA-F]+)", p.stdout, re.IGNORECASE)
+                if m:
+                    usn_val = m.group(1).lower()
+        except Exception:
+            pass
 
     if not usn_val:
         usn_val = hex(mtime_ns)
@@ -222,9 +390,24 @@ def get_file_usn(file_path: Path) -> str:
     return usn_val
 
 
+def _resolve_mesh_root(base_dir: Path = BASE_DIR) -> Path:
+    """Normaliza o diretório raiz do aplicativo para cálculo consistente do hash da malha estática."""
+    b = Path(base_dir)
+    if (b / "AdminBridge.exe").exists():
+        return b
+    if b.name == "config" and (b.parent / "AdminBridge.exe").exists():
+        return b.parent
+    if (b.parent / "AdminBridge.exe").exists():
+        return b.parent
+    if (BASE_DIR / "AdminBridge.exe").exists():
+        return BASE_DIR
+    return b.parent if b.name == "config" else b
+
+
 def get_static_mesh_hash(base_dir: Path = BASE_DIR) -> str:
-    """Calcula a ancora estatica unindo o executavel e a tarefa agendada com cache em memoria."""
-    exe_file = base_dir / "AdminBridge.exe"
+    """Calcula a âncora estática unindo o executável e a tarefa agendada com cache invalidado por mtime/size."""
+    root_dir = _resolve_mesh_root(base_dir)
+    exe_file = root_dir / "AdminBridge.exe"
     exe_mtime = 0
     exe_size = 0
     if exe_file.exists():
@@ -243,12 +426,12 @@ def get_static_mesh_hash(base_dir: Path = BASE_DIR) -> str:
     except Exception:
         pass
 
-    cache_key = (str(base_dir), exe_mtime, exe_size, task_mtime)
+    cache_key = (str(root_dir), exe_mtime, exe_size, task_mtime)
     if cache_key in _static_mesh_cache:
         return _static_mesh_cache[cache_key]
 
     components = []
-    # 1. Executavel principal
+    # 1. Executável principal
     if exe_file.exists():
         try:
             with open(exe_file, "rb") as ef:
@@ -270,7 +453,7 @@ def get_static_mesh_hash(base_dir: Path = BASE_DIR) -> str:
     except Exception:
         components.append("task_read_error")
 
-    # 3. Entropia de maquina
+    # 3. Entropia de máquina
     components.append(hashlib.sha256(DPAPI_ENTROPY).hexdigest())
 
     combined = "|".join(components).encode("utf-8")
@@ -282,7 +465,7 @@ def get_static_mesh_hash(base_dir: Path = BASE_DIR) -> str:
 def compute_integrity_mac(cfg: dict) -> str:
     """Gera uma assinatura de integridade protegida por DPAPI sobre os metadados do JSON.
 
-    Impede qualquer adulteracao manual externa [por exemplo, edicao com Bloco de Notas].
+    Impede qualquer adulteração manual externa [por exemplo, edição com Bloco de Notas].
     """
     payload = _canonical_payload(cfg)
     digest = hashlib.sha256(payload).digest()
@@ -291,12 +474,10 @@ def compute_integrity_mac(cfg: dict) -> str:
 
 
 def check_integrity_mac(cfg: dict, config_path: Optional[Path] = None) -> Tuple[bool, str]:
-    """Valida a assinatura de integridade e diagnostica com precisao o motivo da falha.
+    """Valida a assinatura de integridade, o arquivo .sig acompanhante, o USN e a malha estática.
 
-    Retorna [True, 'ok'] se integro.
-    Retorna [False, 'tampered'] se o arquivo foi adulterado externamente.
-    Retorna [False, 'usn_tampered'] se o USN do NTFS divergir da assinatura legítima.
-    Retorna [False, 'decrypt_error'] se a chave DPAPI nao pode ser lida no contexto atual.
+    Retorna [True, 'ok'] se íntegro.
+    Retorna [False, motivo] se o arquivo, assinatura, USN ou executável foi adulterado.
     """
     mac_b64 = cfg.get("integrity_mac")
     if not mac_b64:
@@ -314,11 +495,14 @@ def check_integrity_mac(cfg: dict, config_path: Optional[Path] = None) -> Tuple[
     except Exception:
         return False, "decrypt_error"
 
-    # Verificacao adicional do arquivo acompanhante .sig e USN
+    # Verificação obrigatória do arquivo acompanhante .sig, USN e static_mesh_hash
     if config_path and Path(config_path).exists():
         cp = Path(config_path)
         sig_file = cp.with_name(cp.name + ".sig")
-        if sig_file.exists():
+        if not sig_file.exists():
+            if cfg.get("provisioned_flag", 0) == 1 and cp.name == "hotp_config.json":
+                return False, "sig_missing"
+        else:
             try:
                 with open(sig_file, "r", encoding="utf-8") as sf:
                     sig_data = json.load(sf)
@@ -333,6 +517,11 @@ def check_integrity_mac(cfg: dict, config_path: Optional[Path] = None) -> Tuple[
                     curr_usn = get_file_usn(cp)
                     if curr_usn != "0x0" and curr_usn != sig_usn:
                         return False, "usn_tampered"
+                recorded_mesh = sig_data.get("static_mesh_hash")
+                if recorded_mesh:
+                    curr_mesh = get_static_mesh_hash(cp.parent)
+                    if not hmac.compare_digest(recorded_mesh, curr_mesh):
+                        return False, "static_mesh_tampered"
             except PermissionError:
                 pass
             except Exception:
@@ -342,18 +531,15 @@ def check_integrity_mac(cfg: dict, config_path: Optional[Path] = None) -> Tuple[
 
 
 def verify_integrity_mac(cfg: dict, config_path: Optional[Path] = None) -> bool:
-    """Verifica se a assinatura de integridade corresponde aos metadados do JSON.
-
-    Retorna True se integro, False se adulterado ou corrompido.
-    """
+    """Verifica se a assinatura de integridade corresponde aos metadados do JSON e malha estática."""
     ok, _ = check_integrity_mac(cfg, config_path)
     return ok
 
 
 def read_passive_metadata(config_path: Path) -> dict:
-    """Le metadados passivos [contador, flag, falhas, lockdown] SEM decodificar a chave secreta.
+    """Lê metadados passivos [contador, flag, falhas, lockdown] SEM decodificar a chave secreta.
 
-    Verifica a assinatura de integridade antes de retornar os dados.
+    Verifica a assinatura de integridade e a âncora do proprietário antes de retornar os dados.
     """
     try:
         if not config_path.exists():
@@ -369,7 +555,6 @@ def read_passive_metadata(config_path: Path) -> dict:
         with open(config_path, "r", encoding="utf-8") as f:
             cfg = json.load(f)
     except PermissionError:
-        # Quando restrito a SYSTEM, processos de usuario recebem Acesso Negado
         raise
     except Exception:
         return {
@@ -382,6 +567,13 @@ def read_passive_metadata(config_path: Path) -> dict:
         }
 
     is_valid = verify_integrity_mac(cfg, config_path)
+    if is_valid and cfg.get("provisioned_flag", 0) == 1:
+        anchor_candidate = config_path.parent / "owner_anchor.json"
+        if anchor_candidate.exists():
+            ok_anchor, _ = verify_owner_anchor(anchor_candidate, config_path.parent)
+            if not ok_anchor:
+                is_valid = False
+
     now = time.time()
     failures_5m = [t for t in cfg.get("failures", []) if (now - t) < 300]
     lockdown = cfg.get("lockdown", False) or not is_valid
@@ -414,7 +606,7 @@ def generate_physical_challenge() -> str:
 
 
 def hash_recovery_password(password: str, salt: Optional[bytes] = None) -> Tuple[str, str]:
-    """Gera hash seguro PBKDF2-HMAC-SHA256 para a senha de recuperacao [600.000 iteracoes]."""
+    """Gera hash seguro PBKDF2-HMAC-SHA256 para a senha de recuperação [600.000 iterações]."""
     if salt is None:
         salt = secrets.token_bytes(16)
     pw_bytes = password.encode("utf-8")
@@ -423,7 +615,7 @@ def hash_recovery_password(password: str, salt: Optional[bytes] = None) -> Tuple
 
 
 def verify_recovery_password(password: str, expected_hash_b64: str, salt_b64: str) -> bool:
-    """Valida a senha de recuperacao utilizando comparacao de tempo constante."""
+    """Valida a senha de recuperação utilizando comparação de tempo constante."""
     salt = base64.b64decode(salt_b64)
     expected_hash = base64.b64decode(expected_hash_b64)
     derived = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, 600000)
@@ -431,7 +623,7 @@ def verify_recovery_password(password: str, expected_hash_b64: str, salt_b64: st
 
 
 def create_detached_signature_file(config_file: Path, cfg: dict) -> Path:
-    """Gera arquivo acompanhante de assinatura digital de integridade com USN e malha estatica."""
+    """Gera arquivo acompanhante de assinatura digital de integridade com USN e malha estática."""
     sig_file = config_file.with_name(config_file.name + ".sig")
     try:
         if config_file.exists():
@@ -442,8 +634,8 @@ def create_detached_signature_file(config_file: Path, cfg: dict) -> Path:
         else:
             file_hash = ""
             file_usn = "0x0"
-        
-        static_mesh = get_static_mesh_hash(config_file.parent.parent)
+
+        static_mesh = get_static_mesh_hash(config_file.parent)
         sig_payload = {
             "file": config_file.name,
             "sha256": file_hash,
@@ -453,9 +645,9 @@ def create_detached_signature_file(config_file: Path, cfg: dict) -> Path:
             "signed_at": time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime()),
             "signer": "AdminBridge DPAPI Machine Seal"
         }
-        if sig_file.exists():
+        if sig_file.exists() and kernel32 is not None:
             try:
-                ctypes.windll.kernel32.SetFileAttributesW(str(sig_file), 0x80)
+                kernel32.SetFileAttributesW(str(sig_file), 0x80)
             except Exception:
                 pass
         try:
@@ -471,14 +663,25 @@ def create_detached_signature_file(config_file: Path, cfg: dict) -> Path:
     return sig_file
 
 
-def create_owner_anchor(password: str, base_dir: Path = BASE_DIR) -> dict:
-    """Gera e registra a ancora criptografica Ed25519 soberana do proprietario."""
+def _resolve_anchor_file(base_dir: Path = BASE_DIR, anchor_path: Optional[Path] = None) -> Path:
+    """Resolve de forma determinística o caminho para owner_anchor.json."""
+    if anchor_path is not None:
+        return Path(anchor_path)
+    b = Path(base_dir)
+    if b.name == "config" or (b / "hotp_config.json").exists() or any(b.glob("*config*.json")):
+        return b / "owner_anchor.json"
+    return b / "config" / "owner_anchor.json"
+
+
+def create_owner_anchor(password: str, base_dir: Path = BASE_DIR, anchor_path: Optional[Path] = None) -> dict:
+    """Gera e registra a âncora criptográfica Ed25519 soberana do proprietário vinculada ao binário e tarefa."""
     from cryptography.hazmat.primitives.asymmetric import ed25519
     from cryptography.hazmat.primitives import serialization
 
     salt = secrets.token_bytes(16)
     derived = hashlib.scrypt(password.encode("utf-8"), salt=salt, n=16384, r=8, p=1, maxmem=32 * 1024 * 1024, dklen=32)
     derived_ba = bytearray(derived)
+    lock_memory_page(derived_ba)
 
     try:
         priv_key = ed25519.Ed25519PrivateKey.from_private_bytes(bytes(derived_ba))
@@ -501,17 +704,20 @@ def create_owner_anchor(password: str, base_dir: Path = BASE_DIR) -> dict:
             "created_at": time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime())
         }
 
-        if base_dir.name == "config":
-            anchor_file = base_dir / "owner_anchor.json"
-        else:
-            anchor_file = base_dir / "config" / "owner_anchor.json"
+        anchor_file = _resolve_anchor_file(base_dir, anchor_path)
         anchor_file.parent.mkdir(parents=True, exist_ok=True)
-        if anchor_file.exists():
+        if anchor_file.exists() and sys.platform == "win32":
             subprocess.run(["attrib", "-r", str(anchor_file)], capture_output=True, check=False, creationflags=0x08000000)
         with open(anchor_file, "w", encoding="utf-8") as af:
             json.dump(anchor_data, af, indent=2, ensure_ascii=False)
-        subprocess.run(["attrib", "+r", str(anchor_file)], capture_output=True, check=False, creationflags=0x08000000)
-        subprocess.run(["cmd.exe", "/c", f'icacls "{anchor_file}" /inheritance:r /grant:r "*S-1-5-18:(F)" "*S-1-5-32-544:(F)" /c /q'], capture_output=True, check=False, creationflags=0x08000000)
+        if sys.platform == "win32":
+            subprocess.run(["attrib", "+r", str(anchor_file)], capture_output=True, check=False, creationflags=0x08000000)
+            subprocess.run(
+                ["cmd.exe", "/c", f'icacls "{anchor_file}" /inheritance:r /grant:r "*S-1-5-18:(F)" "*S-1-5-32-544:(RX)" /c /q'],
+                capture_output=True,
+                check=False,
+                creationflags=0x08000000
+            )
         return anchor_data
     finally:
         wipe_buffer(derived_ba)
@@ -519,25 +725,28 @@ def create_owner_anchor(password: str, base_dir: Path = BASE_DIR) -> dict:
 
 
 def verify_owner_anchor(anchor_path: Optional[Path] = None, base_dir: Path = BASE_DIR) -> Tuple[bool, str]:
-    """Valida a assinatura Ed25519 da ancora do proprietario contra a malha estatica atual."""
+    """Valida a assinatura Ed25519 da âncora do proprietário CONTRA a malha estática real em disco."""
     from cryptography.hazmat.primitives.asymmetric import ed25519
 
-    if anchor_path is None:
-        anchor_path = base_dir / "owner_anchor.json" if base_dir.name == "config" else base_dir / "config" / "owner_anchor.json"
-
-    if not anchor_path.exists():
-        return True, "owner_anchor_not_present"
+    target_anchor = _resolve_anchor_file(base_dir, anchor_path)
+    if not target_anchor.exists():
+        return False, "owner_anchor_missing: arquivo owner_anchor.json ausente ou removido"
 
     try:
-        with open(anchor_path, "r", encoding="utf-8") as af:
+        with open(target_anchor, "r", encoding="utf-8") as af:
             anchor_data = json.load(af)
 
         pub_bytes = base64.b64decode(anchor_data["public_key_b64"])
         signature = base64.b64decode(anchor_data["signature_b64"])
         recorded_mesh = anchor_data.get("static_mesh_hash", "")
 
+        # Recalcula o hash atual do executável AdminBridge.exe e da Tarefa Agendada no disco
+        actual_mesh = get_static_mesh_hash(base_dir)
+        if not hmac.compare_digest(recorded_mesh, actual_mesh):
+            return False, "static_mesh_tampered: executavel AdminBridge.exe ou tarefa agendada foram alterados"
+
         pub_key = ed25519.Ed25519PublicKey.from_public_bytes(pub_bytes)
-        sign_payload = f"AdminBridge_OwnerAnchor_v1|{recorded_mesh}".encode("utf-8")
+        sign_payload = f"AdminBridge_OwnerAnchor_v1|{actual_mesh}".encode("utf-8")
         pub_key.verify(signature, sign_payload)
         return True, "ok"
     except Exception as e:
@@ -545,18 +754,16 @@ def verify_owner_anchor(anchor_path: Optional[Path] = None, base_dir: Path = BAS
 
 
 def verify_owner_password(password: str, anchor_path: Optional[Path] = None, base_dir: Path = BASE_DIR) -> bool:
-    """Verifica se a Senha Mestra digitada corresponde a chave publica Ed25519 registrada na ancora."""
+    """Verifica se a Senha Mestra digitada corresponde à chave pública Ed25519 registrada na âncora."""
     from cryptography.hazmat.primitives.asymmetric import ed25519
     from cryptography.hazmat.primitives import serialization
 
-    if anchor_path is None:
-        anchor_path = base_dir / "owner_anchor.json" if base_dir.name == "config" else base_dir / "config" / "owner_anchor.json"
-
-    if not anchor_path.exists():
+    target_anchor = _resolve_anchor_file(base_dir, anchor_path)
+    if not target_anchor.exists():
         return False
 
     try:
-        with open(anchor_path, "r", encoding="utf-8") as af:
+        with open(target_anchor, "r", encoding="utf-8") as af:
             anchor_data = json.load(af)
 
         salt = base64.b64decode(anchor_data["salt_b64"])
@@ -564,6 +771,7 @@ def verify_owner_password(password: str, anchor_path: Optional[Path] = None, bas
 
         derived = hashlib.scrypt(password.encode("utf-8"), salt=salt, n=16384, r=8, p=1, maxmem=32 * 1024 * 1024, dklen=32)
         derived_ba = bytearray(derived)
+        lock_memory_page(derived_ba)
         try:
             priv_key = ed25519.Ed25519PrivateKey.from_private_bytes(bytes(derived_ba))
             pub_key = priv_key.public_key()
@@ -580,7 +788,7 @@ def verify_owner_password(password: str, anchor_path: Optional[Path] = None, bas
 
 
 def generate_mutual_confirmation_code(secret_bytes: bytes, otp_code: str) -> str:
-    """Gera contra-senha deterministica de confirmacao mutua para provar autenticidade do servico."""
+    """Gera contra-senha determinística de confirmação mútua para provar autenticidade do serviço."""
     clean_otp = str(otp_code).strip()
     key_material = (clean_otp + "_CONFIRMACAO").encode("utf-8")
     digest = hmac.new(secret_bytes, key_material, hashlib.sha256).hexdigest()
@@ -588,20 +796,28 @@ def generate_mutual_confirmation_code(secret_bytes: bytes, otp_code: str) -> str
 
 
 def harden_process_dacl() -> bool:
-    """Endurece a seguranca do processo atual para mitigar encerramento trivial por terceiros."""
+    """Endurece a segurança do processo atual (mitigações anti-dump, anti-DLL hijacking e proteção de processo)."""
     try:
-        # Define mitigacoes basicas de processo no Windows
-        kernel32 = ctypes.windll.kernel32
-        kernel32.SetErrorMode(0x0001 | 0x0002)
+        configure_anti_dump_mitigations()
         return True
     except Exception:
         return False
 
 
 def check_config_acl_isolation(base_dir: Path = BASE_DIR) -> bool:
-    """Verifica se a pasta config e arquivos sensiveis estao estritamente isolados contra usuarios comuns."""
-    forbidden_principals = ["usuários", "usuarios", "users", "autenticados", "authenticated", "s-1-5-32-545", "s-1-5-11"]
-    for rel_path in ("config/hotp_config.json", "config/hotp_config.json.sig", "config/owner_anchor.json", "scripts"):
+    """Verifica se a pasta config e arquivos sensíveis estão estritamente isolados contra usuários comuns."""
+    if sys.platform != "win32":
+        return True
+    forbidden_principals = ["usuários", "usuarios", "users", "autenticados", "authenticated", "s-1-5-32-545", "s-1-5-11", "everyone", "todos", "s-1-1-0"]
+    for rel_path in (
+        "config",
+        "config/hotp_config.json",
+        "config/hotp_config.json.sig",
+        "config/owner_anchor.json",
+        "config/preauth_ticket.json",
+        "scripts",
+        "queue/processing"
+    ):
         target = base_dir / rel_path
         if not target.exists():
             continue
@@ -617,102 +833,157 @@ def check_config_acl_isolation(base_dir: Path = BASE_DIR) -> bool:
 
 
 def apply_isolated_bridge_ntfs_acls(base_dir: Path = BASE_DIR) -> bool:
-    """Aplica permissoes ACL granulares e blindadas sem depender de scripts externos:
-    - Posse exclusiva definida para SYSTEM / Administradores
-    - config: Acesso total EXCLUSIVO a SYSTEM e Administradores. Bloqueio estrito a usuarios comuns.
-    - hotp_config.json: Bloqueio estrito de heranca e acesso exclusivo a SYSTEM / Administradores.
-    - scripts: Acesso total EXCLUSIVO a SYSTEM e Administradores.
-    - queue: SYSTEM [F], Admins [M] e Users [M] para envio de comandos.
-    - logs: SYSTEM [F] e Admins [M].
-    - AdminBridge.exe: Unico executavel com permissao de execucao para usuarios.
+    """Aplica permissões ACL granulares e blindadas em toda a árvore C:\\Utilitario:
+    - Raiz C:\\Utilitario: Remove herança da raiz C:\\, impedindo que usuários comuns criem arquivos/DLLs ou renomeiem o executável.
+    - AdminBridge.exe: Posse de SYSTEM, atributo somente-leitura, herança removida e apenas RX para Admins e Usuários.
+    - config e queue/processing: Acesso EXCLUSIVO a SYSTEM (Controle Total) e Administradores, ZERO acesso a usuários comuns.
+    - scripts e logs: Acesso exclusivo a SYSTEM e Administradores.
+    - queue/requests e queue/responses: Escrita controlada para submissão de requisições criptografadas via DPAPI.
     """
+    if sys.platform != "win32":
+        return True
+
     config_dir = base_dir / "config"
     scripts_dir = base_dir / "scripts"
     queue_dir = base_dir / "queue"
+    req_dir = queue_dir / "requests"
+    proc_dir = queue_dir / "processing"
+    resp_dir = queue_dir / "responses"
     logs_dir = base_dir / "logs"
     exe_file = base_dir / "AdminBridge.exe"
+    legacy_exe = base_dir / "AntigravityBridge.exe"
 
-    # 1. Garante que as pastas fiquem visiveis normalmente, sem atributos ocultos
-    for d in (config_dir, scripts_dir, queue_dir, logs_dir):
-        if d.exists():
-            try:
-                subprocess.run(["attrib", "-h", "-s", str(d)], capture_output=True, check=False, creationflags=0x08000000)
-            except Exception:
-                pass
+    for d in (config_dir, scripts_dir, queue_dir, req_dir, proc_dir, resp_dir, logs_dir):
+        try:
+            d.mkdir(parents=True, exist_ok=True)
+            subprocess.run(["attrib", "-h", "-s", str(d)], capture_output=True, check=False, creationflags=0x08000000)
+        except Exception:
+            pass
 
-    # 2. Assume posse recursiva de C:\Utilitario\config para SYSTEM e Administradores
+    # 1. Blindagem da pasta raiz C:\Utilitario (Remove herança de C:\ para impedir plantio de DLLs ou substituição de binários)
     try:
-        if config_dir.exists():
-            subprocess.run(["takeown", "/f", str(config_dir), "/r", "/d", "y"], capture_output=True, check=False, creationflags=0x08000000)
+        if base_dir.exists():
+            subprocess.run(["takeown", "/f", str(base_dir), "/d", "y"], capture_output=True, check=False, creationflags=0x08000000)
+            subprocess.run(
+                ["cmd.exe", "/c", f'icacls "{base_dir}" /inheritance:r /grant:r "*S-1-5-18:(OI)(CI)(F)" "*S-1-5-32-544:(RX)" "*S-1-5-32-545:(RX)" /c /q'],
+                capture_output=True,
+                check=False,
+                creationflags=0x08000000
+            )
     except Exception:
         pass
 
-    # 3. Blindagem estrita de config - EXCLUSIVO SYSTEM e Administradores total [Zero acesso a usuarios comuns]
+    # 2. Assume posse recursiva de C:\Utilitario\config e restringe a SYSTEM e Administradores
     try:
         if config_dir.exists():
             cfg_str = str(config_dir)
-            # Remove heranca recursivamente e concede acesso exclusivo a SYSTEM e Administradores
-            subprocess.run(["cmd.exe", "/c", f'icacls "{cfg_str}" /inheritance:r /grant:r "*S-1-5-18:(OI)(CI)(F)" "*S-1-5-32-544:(OI)(CI)(F)" /t /c /q'], capture_output=True, check=False, creationflags=0x08000000)
-            subprocess.run(["cmd.exe", "/c", f'icacls "{cfg_str}\\*" /inheritance:r /grant:r "*S-1-5-18:(F)" "*S-1-5-32-544:(F)" /c /q'], capture_output=True, check=False, creationflags=0x08000000)
-            for specific_file in ("hotp_config.json", "hotp_config.json.sig", "owner_anchor.json"):
+            subprocess.run(["takeown", "/f", cfg_str, "/r", "/d", "y"], capture_output=True, check=False, creationflags=0x08000000)
+            subprocess.run(
+                ["cmd.exe", "/c", f'icacls "{cfg_str}" /inheritance:r /grant:r "*S-1-5-18:(OI)(CI)(F)" "*S-1-5-32-544:(OI)(CI)(F)" /t /c /q'],
+                capture_output=True,
+                check=False,
+                creationflags=0x08000000
+            )
+            for specific_file in ("hotp_config.json", "hotp_config.json.sig", "owner_anchor.json", "preauth_ticket.json", "hw_salt.bin", "canary.bin"):
                 sp = config_dir / specific_file
                 if sp.exists():
-                    subprocess.run(["cmd.exe", "/c", f'icacls "{sp}" /inheritance:r /grant:r "*S-1-5-18:(F)" "*S-1-5-32-544:(F)" /c /q'], capture_output=True, check=False, creationflags=0x08000000)
+                    subprocess.run(
+                        ["cmd.exe", "/c", f'icacls "{sp}" /inheritance:r /grant:r "*S-1-5-18:(F)" "*S-1-5-32-544:(F)" /c /q'],
+                        capture_output=True,
+                        check=False,
+                        creationflags=0x08000000
+                    )
     except Exception:
         pass
 
-    # 4. Blindagem estrita de scripts - somente SYSTEM e Administradores
-    try:
-        if scripts_dir.exists():
-            sc_str = str(scripts_dir)
-            subprocess.run(["cmd.exe", "/c", f'icacls "{sc_str}" /inheritance:r /grant:r "*S-1-5-18:(OI)(CI)(F)" "*S-1-5-32-544:(OI)(CI)(F)" /t /c /q'], capture_output=True, check=False, creationflags=0x08000000)
-    except Exception:
-        pass
+    # 3. Blindagem estrita de scripts e queue/processing - somente SYSTEM e Administradores (Zero acesso a usuários comuns)
+    for restricted_dir in (scripts_dir, proc_dir, logs_dir):
+        try:
+            if restricted_dir.exists():
+                r_str = str(restricted_dir)
+                subprocess.run(
+                    ["cmd.exe", "/c", f'icacls "{r_str}" /inheritance:r /grant:r "*S-1-5-18:(OI)(CI)(F)" "*S-1-5-32-544:(OI)(CI)(F)" /t /c /q'],
+                    capture_output=True,
+                    check=False,
+                    creationflags=0x08000000
+                )
+        except Exception:
+            pass
 
-    # 5. Canal de logs
-    try:
-        if logs_dir.exists():
-            l_str = str(logs_dir)
-            subprocess.run(["cmd.exe", "/c", f'icacls "{l_str}" /inheritance:r /grant:r "*S-1-5-18:(OI)(CI)(F)" "*S-1-5-32-544:(OI)(CI)(F)" /t /c /q'], capture_output=True, check=False, creationflags=0x08000000)
-    except Exception:
-        pass
-
-    # 6. Canal de fila para envio de solicitacoes pelo usuario
+    # 4. Canal de fila: pasta queue permite leitura de status/heartbeat, e subpastas requests/responses isolam por CREATOR OWNER
     try:
         if queue_dir.exists():
             q_str = str(queue_dir)
-            subprocess.run(["cmd.exe", "/c", f'icacls "{q_str}" /inheritance:r /grant:r "*S-1-5-18:(OI)(CI)(F)" "*S-1-5-32-544:(OI)(CI)(M)" "*S-1-5-32-545:(OI)(CI)(M)" /c /q'], capture_output=True, check=False, creationflags=0x08000000)
+            subprocess.run(
+                ["cmd.exe", "/c", f'icacls "{q_str}" /inheritance:r /grant:r "*S-1-5-18:(OI)(CI)(F)" "*S-1-5-32-544:(OI)(CI)(M)" "*S-1-5-32-545:(RX)" /c /q'],
+                capture_output=True,
+                check=False,
+                creationflags=0x08000000
+            )
+            for status_f in (queue_dir / "status.json", queue_dir / "heartbeat.json", LOCK_FILE):
+                if status_f.exists():
+                    subprocess.run(
+                        ["cmd.exe", "/c", f'icacls "{status_f}" /inheritance:r /grant:r "*S-1-5-18:(F)" "*S-1-5-32-544:(M)" "*S-1-5-32-545:(M)" /c /q'],
+                        capture_output=True,
+                        check=False,
+                        creationflags=0x08000000
+                    )
+        # Em requests e responses: Usuários podem criar arquivos e ler/apagar APENAS arquivos dos quais são CREATOR OWNER (*S-1-3-0)
+        for sub_q in (req_dir, resp_dir):
+            if sub_q.exists():
+                sq_str = str(sub_q)
+                subprocess.run(
+                    ["cmd.exe", "/c", f'icacls "{sq_str}" /inheritance:r /grant:r "*S-1-5-18:(OI)(CI)(F)" "*S-1-5-32-544:(OI)(CI)(F)" "*S-1-3-0:(IO)(F)" "*S-1-5-32-545:(CI)(RX,W,DC)" /c /q'],
+                    capture_output=True,
+                    check=False,
+                    creationflags=0x08000000
+                )
     except Exception:
         pass
 
-    # 7. Permissao no executavel principal: unico arquivo executavel para o usuario
-    try:
-        if exe_file.exists():
-            cmd_exe = f'icacls "{exe_file}" /grant "*S-1-5-18:(F)" "*S-1-5-32-544:(RX)" "*S-1-5-32-545:(RX)" /c /q'
-            subprocess.run(["cmd.exe", "/c", cmd_exe], capture_output=True, check=False, creationflags=0x08000000)
-    except Exception:
-        pass
+    # 5. Blindagem estrita do executável principal (Remove herança e concede apenas RX para Administradores e Usuários; F apenas para SYSTEM)
+    for target_bin in (exe_file, legacy_exe):
+        try:
+            if target_bin.exists():
+                subprocess.run(["takeown", "/f", str(target_bin)], capture_output=True, check=False, creationflags=0x08000000)
+                subprocess.run(
+                    ["cmd.exe", "/c", f'icacls "{target_bin}" /inheritance:r /grant:r "*S-1-5-18:(F)" "*S-1-5-32-544:(RX)" "*S-1-5-32-545:(RX)" /c /q'],
+                    capture_output=True,
+                    check=False,
+                    creationflags=0x08000000
+                )
+                subprocess.run(["attrib", "+r", str(target_bin)], capture_output=True, check=False, creationflags=0x08000000)
+        except Exception:
+            pass
 
     return check_config_acl_isolation(base_dir)
 
 
 def check_forensic_integrity(config_file: Path) -> Tuple[bool, str]:
-    """Verifica se a posse ou integridade do arquivo foi violada durante a inatividade."""
+    """Verifica se a posse, o arquivo canário ou a âncora soberana foram violados durante a inatividade."""
     if not config_file.exists():
         return True, "Configuracao ainda nao existe."
 
     try:
-        ps_cmd = f"(Get-Acl -LiteralPath '{config_file}').Owner"
-        res = subprocess.run(
-            ["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", ps_cmd],
-            capture_output=True,
-            text=True,
-            check=False,
-            creationflags=0x08000000
-        )
-        owner = res.stdout.strip()
-        if owner and not ("SISTEMA" in owner.upper() or "SYSTEM" in owner.upper() or "S-1-5-18" in owner):
-            return False, f"Alerta forense: Posse do arquivo de configuracao alterada para {owner} durante a inatividade."
+        if sys.platform == "win32":
+            ps_cmd = f"(Get-Acl -LiteralPath '{config_file}').Owner"
+            res = subprocess.run(
+                ["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", ps_cmd],
+                capture_output=True,
+                text=True,
+                check=False,
+                creationflags=0x08000000
+            )
+            owner = res.stdout.strip()
+            if owner and not (
+                "SISTEMA" in owner.upper()
+                or "SYSTEM" in owner.upper()
+                or "ADMINISTRADORES" in owner.upper()
+                or "ADMINISTRATORS" in owner.upper()
+                or "S-1-5-18" in owner
+                or "S-1-5-32-544" in owner
+            ):
+                return False, f"Alerta forense: Posse do arquivo de configuracao alterada para {owner} durante a inatividade."
 
         canary_file = config_file.parent / "canary.bin"
         if canary_file.exists():
@@ -730,6 +1001,13 @@ def check_forensic_integrity(config_file: Path) -> Tuple[bool, str]:
             except Exception:
                 pass
 
+        # Verifica a âncora soberana do proprietário e o hash do executável
+        anchor_file = config_file.parent / "owner_anchor.json"
+        if anchor_file.exists():
+            ok_anc, msg_anc = verify_owner_anchor(anchor_file, config_file.parent)
+            if not ok_anc:
+                return False, f"Alerta forense: Violacao da ancora do proprietario ({msg_anc})."
+
         return True, "Integridade forense confirmada."
     except Exception as e:
         return True, f"Verificacao forense ignorada por erro de ambiente: {e}"
@@ -742,18 +1020,16 @@ def apply_system_only_ntfs_acls(target_path: Path):
 
 def restore_ntfs_acls_for_removal(target_path: Path):
     """Assume posse (takeown) e restaura permissões para Administradores para permitir remoção/desinstalação."""
-    if not target_path.exists():
+    if sys.platform != "win32" or not target_path.exists():
         return
 
     try:
-        # 1. Assume a posse do diretório e arquivos
         subprocess.run(
             ["takeown", "/f", str(target_path), "/r", "/d", "y"],
             capture_output=True,
             check=False,
             creationflags=0x08000000
         )
-        # 2. Concede controle total para Administradores (*S-1-5-32-544)
         subprocess.run(
             ["icacls", str(target_path), "/grant", "*S-1-5-32-544:(OI)(CI)(F)", "/t"],
             capture_output=True,
@@ -786,29 +1062,32 @@ class AtomicLock:
             return self
 
         # 1. Named Mutex do Windows
-        handle = kernel32.CreateMutexW(None, False, self.mutex_name)
-        if handle:
-            wait_res = kernel32.WaitForSingleObject(handle, self.timeout_ms)
-            if wait_res not in (0, 0x80):
-                kernel32.CloseHandle(handle)
-                raise TimeoutError("Tempo limite esgotado ao aguardar mutex do HOTP.")
+        handle = None
+        if kernel32 is not None:
+            handle = kernel32.CreateMutexW(None, False, self.mutex_name)
+            if handle:
+                wait_res = kernel32.WaitForSingleObject(handle, self.timeout_ms)
+                if wait_res not in (0, 0x80):
+                    kernel32.CloseHandle(handle)
+                    raise TimeoutError("Tempo limite esgotado ao aguardar mutex do HOTP.")
         _lock_local.mutex_handle = handle
 
         # 2. File Lock
         try:
             fd = os.open(str(LOCK_FILE), os.O_CREAT | os.O_RDWR)
             start_time = time.time()
-            while True:
-                try:
-                    msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
-                    break
-                except (BlockingIOError, OSError):
-                    if (time.time() - start_time) * 1000 > self.timeout_ms:
-                        raise TimeoutError("Tempo limite esgotado ao aguardar lock de arquivo do HOTP.")
-                    time.sleep(0.05)
+            if msvcrt is not None:
+                while True:
+                    try:
+                        msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+                        break
+                    except (BlockingIOError, OSError):
+                        if (time.time() - start_time) * 1000 > self.timeout_ms:
+                            raise TimeoutError("Tempo limite esgotado ao aguardar lock de arquivo do HOTP.")
+                        time.sleep(0.05)
             _lock_local.lock_file_fd = fd
         except Exception:
-            if _lock_local.mutex_handle:
+            if _lock_local.mutex_handle and kernel32 is not None:
                 kernel32.ReleaseMutex(_lock_local.mutex_handle)
                 kernel32.CloseHandle(_lock_local.mutex_handle)
                 _lock_local.mutex_handle = None
@@ -825,16 +1104,16 @@ class AtomicLock:
         if _lock_local.depth > 0:
             return
 
-        # Libera recursos no nível 0
         if _lock_local.lock_file_fd is not None:
             try:
-                msvcrt.locking(_lock_local.lock_file_fd, msvcrt.LK_UNLCK, 1)
+                if msvcrt is not None:
+                    msvcrt.locking(_lock_local.lock_file_fd, msvcrt.LK_UNLCK, 1)
                 os.close(_lock_local.lock_file_fd)
             except Exception:
                 pass
             _lock_local.lock_file_fd = None
 
-        if _lock_local.mutex_handle:
+        if _lock_local.mutex_handle and kernel32 is not None:
             try:
                 kernel32.ReleaseMutex(_lock_local.mutex_handle)
                 kernel32.CloseHandle(_lock_local.mutex_handle)
@@ -844,30 +1123,65 @@ class AtomicLock:
 
 
 def get_current_caller_info() -> dict:
-    """Coleta dados do processo cliente atual para rastreabilidade de origem."""
+    """Coleta dados reais do processo cliente atual para rastreabilidade de origem."""
     return {
         "pid": os.getpid(),
         "exe": sys.executable,
         "script": str(Path(__file__).resolve()),
-        "user": os.getenv("USERNAME", "unknown"),
+        "user": os.getenv("USERNAME") or os.getenv("USER") or "unknown",
         "timestamp": time.time()
     }
 
 
+def _get_os_process_image_path(pid: int) -> Optional[str]:
+    """Consulta diretamente no kernel do Windows o caminho real do executável de um PID ativo."""
+    if sys.platform != "win32" or kernel32 is None or not pid:
+        return None
+    PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+    h_proc = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, int(pid))
+    if not h_proc:
+        return None
+    try:
+        buf_len = wintypes.DWORD(1024)
+        buf = ctypes.create_unicode_buffer(1024)
+        if kernel32.QueryFullProcessImageNameW(h_proc, 0, buf, ctypes.byref(buf_len)):
+            return buf.value
+        return None
+    except Exception:
+        return None
+    finally:
+        kernel32.CloseHandle(h_proc)
+
+
 def verify_caller_origin(caller_data: Optional[dict]) -> Tuple[bool, str]:
-    """Verifica se a origem da requisição pertence ao executável/ambiente oficial."""
+    """Verifica se a origem da requisição pertence ao executável/ambiente oficial e valida o PID no SO."""
     if not caller_data or not isinstance(caller_data, dict):
         return False, "Origem da requisição não informada ou formato inválido."
 
     pid = caller_data.get("pid")
     exe = str(caller_data.get("exe", "")).lower()
 
-    if not pid:
-        return False, "PID do chamador não informado."
+    if not pid or not isinstance(pid, int) or pid <= 0:
+        return False, "PID do chamador não informado ou inválido."
+
+    # Se o PID estiver ativo no Windows, confere o caminho real do processo no kernel contra falsificação de JSON
+    real_exe = _get_os_process_image_path(pid)
+    if real_exe:
+        real_exe_lower = real_exe.lower()
+        real_valid = (
+            "python" in real_exe_lower
+            or "adminbridge" in real_exe_lower
+            or "antigravitybridge" in real_exe_lower
+            or "powershell" in real_exe_lower
+            or "c:\\utilitario" in real_exe_lower
+        )
+        if not real_valid:
+            return False, f"Processo real do PID {pid} não autorizado pelo kernel: {real_exe}"
 
     is_valid_exe = (
         "python" in exe
         or "adminbridge" in exe
+        or "antigravitybridge" in exe
         or "powershell" in exe
         or "c:\\utilitario" in exe
     )
@@ -879,7 +1193,7 @@ def verify_caller_origin(caller_data: Optional[dict]) -> Tuple[bool, str]:
 
 
 def append_ledger_block(action: str, counter: int, code_hash: str, caller_info: Optional[dict] = None, status: str = "SUCCESS", details: str = "") -> dict:
-    """Registra um bloco encadeado por hash criptografico [estilo blockchain] no log imutavel de auditoria."""
+    """Registra um bloco encadeado por hash criptográfico [estilo blockchain] no log imutável de auditoria."""
     try:
         LOGS_DIR.mkdir(parents=True, exist_ok=True)
         prev_hash = "0" * 64
@@ -898,7 +1212,6 @@ def append_ledger_block(action: str, counter: int, code_hash: str, caller_info: 
         timestamp = datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S UTC")
         caller_str = f"PID:{caller_info.get('pid', '?')}|User:{caller_info.get('user', '?')}" if caller_info else "N/A"
 
-        # Formato de payload canônico para cálculo de hash do bloco
         block_payload = f"{index}|{prev_hash}|{timestamp}|{counter}|{action}|{code_hash}|{status}|{caller_str}".encode("utf-8")
         block_hash = hashlib.sha256(block_payload).hexdigest()
 
@@ -927,7 +1240,7 @@ def append_ledger_block(action: str, counter: int, code_hash: str, caller_info: 
 
 
 def verify_ledger_integrity() -> Tuple[bool, str]:
-    """Verifica a integridade matematica estrita da cadeia de blocos de auditoria."""
+    """Verifica a integridade matemática estrita da cadeia de blocos de auditoria."""
     if not LEDGER_FILE.exists() or LEDGER_FILE.stat().st_size == 0:
         return True, "Ledger vazio ou ainda nao iniciado."
     try:
@@ -957,4 +1270,3 @@ def verify_ledger_integrity() -> Tuple[bool, str]:
         return True, "Cadeia de blocos integra e verificada com sucesso."
     except Exception as e:
         return False, f"Falha na verificacao do ledger: {e}"
-

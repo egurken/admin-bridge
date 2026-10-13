@@ -19,26 +19,49 @@ import uuid
 from datetime import datetime, timezone
 from typing import Optional, Tuple
 
-import qrcode
-from PyQt6.QtCore import Qt, QTimer, QThread, pyqtSignal
-from PyQt6.QtGui import QFont, QIcon, QColor, QPalette, QCursor, QAction, QPixmap
-from PyQt6.QtNetwork import QLocalServer, QLocalSocket
-from PyQt6.QtWidgets import (
-    QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
-    QLabel, QPushButton, QPlainTextEdit, QFrame, QSystemTrayIcon,
-    QMenu, QMessageBox, QDialog, QLineEdit, QTableWidget, QTableWidgetItem,
-    QHeaderView, QAbstractItemView, QInputDialog, QGridLayout, QLayout,
-    QProgressBar
-)
+import re
+try:
+    import qrcode
+except ImportError:
+    qrcode = None
+
+try:
+    from PyQt6.QtCore import Qt, QTimer, QThread, pyqtSignal
+    from PyQt6.QtGui import QFont, QIcon, QColor, QPalette, QCursor, QAction, QPixmap
+    from PyQt6.QtNetwork import QLocalServer, QLocalSocket
+    from PyQt6.QtWidgets import (
+        QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
+        QLabel, QPushButton, QPlainTextEdit, QFrame, QSystemTrayIcon,
+        QMenu, QMessageBox, QDialog, QLineEdit, QTableWidget, QTableWidgetItem,
+        QHeaderView, QAbstractItemView, QInputDialog, QGridLayout, QLayout,
+        QProgressBar
+    )
+    from app_icon import get_app_icon
+except ImportError:
+    Qt = QTimer = QFont = QIcon = QColor = QPalette = QCursor = QAction = QPixmap = None
+    QLocalServer = QLocalSocket = None
+    QApplication = QWidget = QVBoxLayout = QHBoxLayout = QLabel = QPushButton = None
+    QPlainTextEdit = QFrame = QSystemTrayIcon = QMenu = QMessageBox = QLineEdit = None
+    QTableWidget = QTableWidgetItem = QHeaderView = QAbstractItemView = QInputDialog = None
+    QGridLayout = QLayout = QProgressBar = None
+    class QThread:
+        pass
+    class QDialog:
+        pass
+    class QMainWindow:
+        pass
+    def pyqtSignal(*args, **kwargs):
+        return None
+    def get_app_icon():
+        return None
 
 from hotp_auth import HOTPAuth, SecurityError, PREAUTH_TICKET_FILE
 from hotp_crypto import (
     wipe_buffer, apply_isolated_bridge_ntfs_acls, apply_system_only_ntfs_acls, restore_ntfs_acls_for_removal,
     verify_caller_origin, generate_physical_challenge, read_passive_metadata, check_forensic_integrity,
     configure_anti_dump_mitigations, harden_process_dacl, append_ledger_block, verify_ledger_integrity,
-    check_config_acl_isolation
+    check_config_acl_isolation, protect_transit_token, unprotect_transit_token, verify_owner_anchor
 )
-from app_icon import get_app_icon
 
 LOCAL_SERVER_NAME = f"AdminBridge_GUI_{os.getenv('USERNAME', 'default')}"
 BASE_DIR = Path("C:/Utilitario")
@@ -54,12 +77,15 @@ STATUS_FILE = QUEUE_DIR / "status.json"
 CONFIG_FILE = CONFIG_DIR / "hotp_config.json"
 AUTH_LOG_FILE = LOGS_DIR / "auth.log"
 
-LOGS_DIR.mkdir(parents=True, exist_ok=True)
 root_logger = logging.getLogger()
 root_logger.setLevel(logging.INFO)
-file_handler = logging.FileHandler(str(LOGS_DIR / "app.log"), encoding="utf-8")
-file_handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
-root_logger.addHandler(file_handler)
+try:
+    LOGS_DIR.mkdir(parents=True, exist_ok=True)
+    file_handler = logging.FileHandler(str(LOGS_DIR / "app.log"), encoding="utf-8")
+    file_handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
+    root_logger.addHandler(file_handler)
+except Exception:
+    pass
 
 if sys.stdout is not None:
     try:
@@ -194,7 +220,8 @@ def ensure_environment_installed():
 
     target_exe = (BASE_DIR / "AdminBridge.exe").resolve()
     current_exe = Path(sys.executable).resolve()
-    if getattr(sys, "frozen", False) and current_exe != target_exe:
+    # Apenas permite instalar/copiar o executável se for Administrador E ainda não estiver provisionado/ancorado
+    if getattr(sys, "frozen", False) and current_exe != target_exe and is_admin() and not CONFIG_FILE.exists():
         try:
             shutil.copy2(str(current_exe), str(target_exe))
         except Exception as e:
@@ -210,13 +237,16 @@ def ensure_environment_installed():
     create_desktop_shortcut()
 
 
-def is_self_targeting_command(cmd_text: str) -> bool:
-    r"""Verifica se uma linha de comando tenta inspecionar, alterar ou afetar a pasta C:\Utilitario ou seus processos."""
-    if not cmd_text:
+def is_self_targeting_command(cmd_text: str, _depth: int = 0) -> bool:
+    r"""Verifica se uma linha de comando tenta inspecionar, alterar ou afetar a pasta C:\Utilitario, seus arquivos ou processos."""
+    if not cmd_text or _depth > 3:
         return False
-    raw = cmd_text.lower()
 
-    # 1. Alvos diretos e caminhos proibidos
+    raw = cmd_text.lower()
+    # Remove caracteres de escape/ofuscação de shell (aspas, circunflexo do CMD, crase do PowerShell)
+    deobfuscated = raw.translate(str.maketrans("", "", "\"\x27^`"))
+
+    # 1. Alvos diretos, arquivos internos e nomes de tarefas/serviços
     forbidden_targets = [
         "c:\\utilitario",
         "c:/utilitario",
@@ -224,31 +254,44 @@ def is_self_targeting_command(cmd_text: str) -> bool:
         "/utilitario",
         "utilit~1",
         "adminbridge.exe",
+        "antigravitybridge.exe",
         "adminbridge",
-        "hotp_config.json",
-        "owner_anchor.json",
+        "antigravityadminbridge",
+        "hotp_config",
+        "owner_anchor",
+        "preauth_ticket",
+        "hw_salt",
+        "canary.bin",
+        "ledger.jsonl",
+        "ledger.anchor",
         "system32\\tasks\\adminbridge",
         "system32/tasks/adminbridge",
     ]
 
-    for target in forbidden_targets:
-        if target in raw:
+    for candidate in (raw, deobfuscated):
+        for target in forbidden_targets:
+            if target in candidate:
+                return True
+
+        # 2. Bloqueia curingas apontando para C:\Utilitario (ex: C:\Uti*, C:/Util?)
+        if re.search(r"c:[\\/]+uti[a-z0-9*?~]*", candidate):
             return True
 
-    # 2. Desofuscacao de comandos PowerShell codificados em Base64 [-enc ou -encodedcommand]
-    if "-enc" in raw or "-encodedcommand" in raw:
-        try:
-            parts = cmd_text.split()
-            for idx, part in enumerate(parts):
-                if part.lower() in ("-enc", "-encodedcommand") and idx + 1 < len(parts):
-                    b64_str = parts[idx + 1]
-                    decoded_bytes = base64.b64decode(b64_str)
-                    decoded_str = decoded_bytes.decode("utf-16le", errors="ignore").lower()
-                    for target in forbidden_targets:
-                        if target in decoded_str:
-                            return True
-        except Exception:
-            pass
+        # 3. Bloqueia acesso por caminho relativo às subpastas críticas (ex: type config\*.json)
+        if re.search(r"(?:^|[\s;&|><(])(config|queue|scripts)[\\/]", candidate):
+            return True
+
+    # 4. Desofuscação de comandos PowerShell codificados em Base64 (-e, -en, -enc, -encodedcommand, FromBase64String)
+    b64_tokens = re.findall(r"(?:-[eE][nN]?[cC]?[oO]?[dD]?[eE]?[dD]?[cC]?[oO]?[mM]?[mM]?[aA]?[nN]?[dD]?\s+|frombase64string\s*\(\s*[\"\x27]?)([A-Za-z0-9+/=]{12,})", cmd_text)
+    for b64_str in b64_tokens:
+        for enc_name in ("utf-16le", "utf-8", "latin-1"):
+            try:
+                decoded_bytes = base64.b64decode(b64_str)
+                decoded_str = decoded_bytes.decode(enc_name, errors="ignore")
+                if is_self_targeting_command(decoded_str, _depth + 1):
+                    return True
+            except Exception:
+                pass
 
     return False
 
@@ -1105,12 +1148,14 @@ class ExecutionThread(QThread):
                 else:
                     cmd = ["cmd.exe", "/c", code]
 
+                safe_cwd = os.environ.get("SystemRoot", "C:\\Windows\\System32") if sys.platform == "win32" else None
                 proc = subprocess.run(
                     cmd,
+                    cwd=safe_cwd,
                     capture_output=True,
                     text=True,
                     check=False,
-                    creationflags=0x08000000  # CREATE_NO_WINDOW
+                    creationflags=0x08000000 if sys.platform == "win32" else 0
                 )
                 output_data = proc.stdout
                 if proc.stderr:
@@ -1954,14 +1999,23 @@ class AdminBridgeWindow(QMainWindow):
         target_file = req_files[0]
         req_id = target_file.stem
 
-        # Se for uma solicitação de probe passivo do daemon (sync_probe), deixa o daemon SYSTEM processar
         try:
             with open(target_file, "r", encoding="utf-8") as f:
                 peek_req = json.load(f)
             if peek_req.get("script_type") == "sync_probe":
                 return
+            has_auth_payload = bool(
+                peek_req.get("otp")
+                or peek_req.get("otp_dpapi")
+                or peek_req.get("preauth_token")
+                or peek_req.get("preauth_token_dpapi")
+            )
+            # Se a requisição possui OTP/Token e a GUI não está rodando como Administrador/SYSTEM,
+            # deixa exclusivamente o serviço SYSTEM processar para evitar falha de permissão ou disputa na fila.
+            if has_auth_payload and not is_admin():
+                return
         except Exception:
-            pass
+            return
 
         # Reivindicação atômica: move imediatamente para processing/
         PROCESSING_DIR.mkdir(parents=True, exist_ok=True)
@@ -1978,7 +2032,18 @@ class AdminBridgeWindow(QMainWindow):
             processing_file.unlink(missing_ok=True)
             return
 
+        code_str = data.get("code", "")
+        expected_code_hash = data.get("code_hash") or hashlib.sha256(code_str.encode("utf-8")).hexdigest()
+        actual_code_hash = hashlib.sha256(code_str.encode("utf-8")).hexdigest()
+        if not hmac.compare_digest(actual_code_hash, expected_code_hash):
+            processing_file.unlink(missing_ok=True)
+            return
+
         provided_otp = data.get("otp")
+        if not provided_otp and data.get("otp_dpapi"):
+            provided_otp = unprotect_transit_token(data["otp_dpapi"], req_id, actual_code_hash)
+        if data.get("preauth_token_dpapi") and not data.get("preauth_token"):
+            data["preauth_token"] = unprotect_transit_token(data["preauth_token_dpapi"], req_id, actual_code_hash)
         caller_info = data.get("caller")
 
         if provided_otp:
@@ -2324,6 +2389,8 @@ def run_daemon_loop(hotp_auth: HOTPAuth):
     ok_forensic, forensic_msg = check_forensic_integrity(CONFIG_FILE)
     if not ok_forensic:
         logging.critical(f"[FORENSE] {forensic_msg}")
+        trigger_incident_lockdown(None, forensic_msg)
+        return
 
     QUEUE_DIR.mkdir(parents=True, exist_ok=True)
     REQUESTS_DIR.mkdir(parents=True, exist_ok=True)
@@ -2340,7 +2407,6 @@ def run_daemon_loop(hotp_auth: HOTPAuth):
             req_files = list(REQUESTS_DIR.glob("*.json"))
             if req_files:
                 target = req_files[0]
-                # Verifica se a solicitação possui OTP antes de retirar da fila
                 try:
                     with open(target, "r", encoding="utf-8") as f:
                         peek_data = json.load(f)
@@ -2348,12 +2414,11 @@ def run_daemon_loop(hotp_auth: HOTPAuth):
                     time.sleep(0.5)
                     continue
 
-                has_otp = bool(peek_data.get("otp"))
-                has_token = bool(peek_data.get("preauth_token"))
+                has_otp = bool(peek_data.get("otp") or peek_data.get("otp_dpapi"))
+                has_token = bool(peek_data.get("preauth_token") or peek_data.get("preauth_token_dpapi"))
                 has_ticket = PREAUTH_TICKET_FILE.exists()
 
                 if not (has_otp or has_token or has_ticket):
-                    # Sem OTP e sem ticket pré-autorizado: é solicitação manual que requer confirmação UAC na tela
                     time.sleep(1.0)
                     continue
 
@@ -2367,19 +2432,63 @@ def run_daemon_loop(hotp_auth: HOTPAuth):
 
                 data = peek_data
 
+                # 0. Verifica integridade forense e âncora do proprietário antes de processar
+                ok_for, for_msg = check_forensic_integrity(CONFIG_FILE)
+                if not ok_for:
+                    trigger_incident_lockdown(req_id, for_msg)
+                    proc_file.unlink(missing_ok=True)
+                    continue
+
+                # 1. Valida integridade do hash do código ANTES de consumir o OTP (mitiga TOCTOU e queima de OTP)
+                code = data.get("code", "")
+                actual_code_hash = hashlib.sha256(code.encode("utf-8")).hexdigest()
+                expected_code_hash = data.get("code_hash")
+                if expected_code_hash and not hmac.compare_digest(actual_code_hash, expected_code_hash):
+                    res = {
+                        "id": req_id,
+                        "status": "rejected_auth",
+                        "reason": "Adulteracao detectada: hash do codigo nao coincide.",
+                        "exit_code": 403,
+                        "output": "[ACESSO RECUSADO]: Integridade do script violada.",
+                        "completed_at": datetime.now().astimezone().isoformat()
+                    }
+                    with open(RESPONSES_DIR / f"{req_id}.json", "w", encoding="utf-8") as f:
+                        json.dump(res, f, indent=2, ensure_ascii=False)
+                    proc_file.unlink(missing_ok=True)
+                    continue
+
+                # 2. Descriptografa OTP ou token em trânsito vinculados criptograficamente ao req_id e actual_code_hash
                 provided_otp = data.get("otp")
+                if not provided_otp and data.get("otp_dpapi"):
+                    provided_otp = unprotect_transit_token(data["otp_dpapi"], req_id, actual_code_hash)
+                    if provided_otp is None:
+                        res = {
+                            "id": req_id,
+                            "status": "rejected_auth",
+                            "reason": "Falha ao descriptografar OTP em transito (possivel adulteracao TOCTOU).",
+                            "exit_code": 403,
+                            "output": "[ACESSO RECUSADO]: Token de transito invalido ou adulterado.",
+                            "completed_at": datetime.now().astimezone().isoformat()
+                        }
+                        with open(RESPONSES_DIR / f"{req_id}.json", "w", encoding="utf-8") as f:
+                            json.dump(res, f, indent=2, ensure_ascii=False)
+                        proc_file.unlink(missing_ok=True)
+                        continue
+
                 preauth_token = data.get("preauth_token")
+                if not preauth_token and data.get("preauth_token_dpapi"):
+                    preauth_token = unprotect_transit_token(data["preauth_token_dpapi"], req_id, actual_code_hash)
+
                 caller_info = data.get("caller") or {}
                 caller_user = caller_info.get("user")
 
                 auth_approved = False
                 auth_msg = ""
 
-                if provided_otp:
+                if provided_otp or data.get("otp_dpapi"):
                     is_valid, auth_msg, used_counter = hotp_auth.verify_and_advance(provided_otp, caller_info)
                     auth_approved = is_valid
                 else:
-                    # Valida via Ticket de Pré-Autorização (até 45 minutos) com token secreto obrigatório
                     ok_ticket, ticket_msg = hotp_auth.consume_preauth_ticket(preauth_token, caller_user)
                     auth_approved = ok_ticket
                     auth_msg = ticket_msg
@@ -2398,25 +2507,6 @@ def run_daemon_loop(hotp_auth: HOTPAuth):
                     proc_file.unlink(missing_ok=True)
                     continue
 
-                # Valida integridade do hash do código para mitigar TOCTOU
-                code = data.get("code", "")
-                expected_code_hash = data.get("code_hash")
-                if expected_code_hash:
-                    actual_code_hash = hashlib.sha256(code.encode("utf-8")).hexdigest()
-                    if not hmac.compare_digest(actual_code_hash, expected_code_hash):
-                        res = {
-                            "id": req_id,
-                            "status": "rejected_auth",
-                            "reason": "Adulteracao detectada: hash do codigo nao coincide.",
-                            "exit_code": 403,
-                            "output": "[ACESSO RECUSADO]: Integridade do script violada.",
-                            "completed_at": datetime.now().astimezone().isoformat()
-                        }
-                        with open(RESPONSES_DIR / f"{req_id}.json", "w", encoding="utf-8") as f:
-                            json.dump(res, f, indent=2, ensure_ascii=False)
-                        proc_file.unlink(missing_ok=True)
-                        continue
-
                 # Bloqueia qualquer comando auto-direcionado a pasta do utilitário
                 if is_self_targeting_command(code):
                     trigger_incident_lockdown(req_id, "Tentativa de comando auto-direcionado a C:\\Utilitario detectada")
@@ -2432,12 +2522,14 @@ def run_daemon_loop(hotp_auth: HOTPAuth):
                 else:
                     cmd = ["cmd.exe", "/c", code]
 
+                safe_cwd = os.environ.get("SystemRoot", "C:\\Windows\\System32") if sys.platform == "win32" else None
                 proc = subprocess.run(
                     cmd,
+                    cwd=safe_cwd,
                     capture_output=True,
                     text=True,
                     check=False,
-                    creationflags=0x08000000  # CREATE_NO_WINDOW
+                    creationflags=0x08000000 if sys.platform == "win32" else 0
                 )
                 out_txt = proc.stdout
                 if proc.stderr:
@@ -2702,6 +2794,20 @@ def run_cli_client(args, hotp_auth: HOTPAuth):
 
         # Se ja possui privilegios administrativos, executa diretamente no proprio processo unico
         if is_admin():
+            if is_self_targeting_command(code):
+                req_incident_id = str(uuid.uuid4())
+                trigger_incident_lockdown(req_incident_id, "Tentativa de comando auto-direcionado a C:\\Utilitario detectada")
+                res = {
+                    "id": req_incident_id,
+                    "status": "security_lockdown",
+                    "reason": "Comando auto-direcionado bloqueado.",
+                    "exit_code": 403,
+                    "output": "[ACESSO BLOQUEADO]: Tentativa de afetar C:\\Utilitario detectada.",
+                    "completed_at": datetime.now().astimezone().isoformat()
+                }
+                print(json.dumps(res, indent=2, ensure_ascii=False))
+                sys.exit(1)
+
             auth_ok = False
             auth_msg = ""
             if otp:
@@ -2711,7 +2817,8 @@ def run_cli_client(args, hotp_auth: HOTPAuth):
                 valid, auth_msg = hotp_auth.consume_preauth_ticket(preauth_token, caller_info.get("user"))
                 auth_ok = valid
             else:
-                auth_ok = True
+                auth_ok = False
+                auth_msg = "OTP ou token de pre-autorizacao obrigatorio para execucao automatizada."
 
             if not auth_ok:
                 res = {
@@ -2760,6 +2867,10 @@ def run_cli_client(args, hotp_auth: HOTPAuth):
 
         req_id = str(uuid.uuid4())
         code_hash = hashlib.sha256(args.code.encode("utf-8")).hexdigest()
+        raw_preauth = getattr(args, "preauth_token", None)
+        otp_dpapi = protect_transit_token(args.otp, req_id, code_hash) if args.otp else None
+        preauth_dpapi = protect_transit_token(raw_preauth, req_id, code_hash) if raw_preauth else None
+
         payload = {
             "id": req_id,
             "title": args.title or "Comando CLI",
@@ -2767,20 +2878,24 @@ def run_cli_client(args, hotp_auth: HOTPAuth):
             "script_type": args.type or "cmd",
             "code": args.code,
             "code_hash": code_hash,
-            "otp": args.otp,
-            "preauth_token": getattr(args, "preauth_token", None),
+            "otp": None,
+            "otp_dpapi": otp_dpapi,
+            "preauth_token": None,
+            "preauth_token_dpapi": preauth_dpapi,
             "timeout": args.timeout or 120,
             "created_at": datetime.now().astimezone().isoformat(),
             "caller": {
                 "pid": os.getpid(),
                 "exe": sys.executable,
-                "user": os.getenv("USERNAME", "unknown")
+                "user": os.getenv("USERNAME") or os.getenv("USER") or "unknown"
             }
         }
 
         req_file = REQUESTS_DIR / f"{req_id}.json"
-        with open(req_file, "w", encoding="utf-8") as f:
+        tmp_req = req_file.with_suffix(".tmp")
+        with open(tmp_req, "w", encoding="utf-8") as f:
             json.dump(payload, f, indent=2, ensure_ascii=False)
+        tmp_req.replace(req_file)
 
         print(f"[*] Solicitação [{req_id}] enviada. Aguardando execução...", file=sys.stderr)
         res_file = RESPONSES_DIR / f"{req_id}.json"

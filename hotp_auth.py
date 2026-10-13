@@ -1,4 +1,5 @@
 import base64
+import ctypes
 import gc
 import hashlib
 import hmac
@@ -8,6 +9,7 @@ import os
 import secrets
 import struct
 import subprocess
+import sys
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -25,10 +27,12 @@ from hotp_crypto import (
     create_owner_anchor,
     dpapi_protect,
     dpapi_unprotect,
+    ensure_hw_salt,
     generate_mutual_confirmation_code,
     generate_physical_challenge,
     get_file_usn,
     hash_recovery_password,
+    lock_memory_page,
     read_passive_metadata,
     restore_ntfs_acls_for_removal,
     verify_caller_origin,
@@ -39,6 +43,8 @@ from hotp_crypto import (
     verify_recovery_password,
     wipe_buffer,
     DPAPI_ENTROPY,
+    DPAPI_MAC_ENTROPY,
+    _canonical_payload,
 )
 
 BASE_DIR = Path("C:/Utilitario")
@@ -77,10 +83,10 @@ class HOTPAuth:
             pass
 
     # -------------------------------------------------------------------------
-    # OPERAÇÕES DE ARQUIVO E INTEGRIDADE (DPAPI MAC)
+    # OPERAÇÕES DE ARQUIVO E INTEGRIDADE (DPAPI MAC + OWNER ANCHOR)
     # -------------------------------------------------------------------------
     def _load_config_raw(self) -> dict:
-        """Carrega a configuracao bruta e valida a assinatura de integridade HMAC/DPAPI e USN."""
+        """Carrega a configuração bruta e valida a assinatura de integridade HMAC/DPAPI, USN e Âncora Ed25519."""
         try:
             if not self.config_file.exists():
                 return {}
@@ -92,7 +98,7 @@ class HOTPAuth:
         if not cfg:
             return {}
 
-        # Validacao estrita da assinatura de integridade e do USN
+        # 1. Validação estrita da assinatura de integridade, USN e static_mesh_hash
         is_valid, reason = check_integrity_mac(cfg, self.config_file)
         if not is_valid:
             self._log_audit(
@@ -107,10 +113,27 @@ class HOTPAuth:
                 "O arquivo foi modificado externamente. Execução bloqueada."
             )
 
+        # 2. Validação da âncora criptográfica Ed25519 do proprietário contra modificação de executável/pasta
+        if cfg.get("provisioned_flag", 0) == 1:
+            anchor_file = self.config_dir / "owner_anchor.json"
+            if anchor_file.exists() or self.config_file == CONFIG_FILE:
+                ok_anc, anc_reason = verify_owner_anchor(anchor_file, self.config_dir)
+                if not ok_anc:
+                    self._log_audit(
+                        "TAMPER_DETECTED",
+                        cfg.get("counter", 0),
+                        cfg.get("counter", 0),
+                        False,
+                        f"Violacao da ancora soberana Ed25519: {anc_reason}."
+                    )
+                    raise SecurityError(
+                        f"VIOLAÇÃO DE SEGURANÇA: A âncora do proprietário ou o executável foram adulterados ({anc_reason})."
+                    )
+
         return cfg
 
     def migrate_config_to_machine_dpapi(self) -> bool:
-        """Migra o arquivo hotp_config.json para DPAPI de maquina apenas se o arquivo for autentico."""
+        """Migra o arquivo hotp_config.json para DPAPI de máquina apenas se o arquivo for autêntico."""
         with AtomicLock():
             if not self.config_file.exists():
                 return False
@@ -120,7 +143,6 @@ class HOTPAuth:
                 if not cfg.get("secret_dpapi"):
                     return False
 
-                # Nao migra e nao re-assina arquivo que ja foi adulterado
                 is_valid, _ = check_integrity_mac(cfg, self.config_file)
                 if not is_valid:
                     return False
@@ -139,7 +161,6 @@ class HOTPAuth:
                 cfg["recovery_hash_dpapi"] = base64.b64encode(new_rec_dpapi).decode("ascii")
                 cfg["integrity_mac"] = compute_integrity_mac(cfg)
 
-                # Gravacao atomica
                 tmp_file = self.config_file.with_suffix(".tmp")
                 with open(tmp_file, "w", encoding="utf-8") as f:
                     json.dump(cfg, f, indent=2, ensure_ascii=False)
@@ -155,18 +176,18 @@ class HOTPAuth:
                 return False
 
     def _save_config_raw(self, config_data: dict):
-        """Salva a configuracao atomicamente com assinatura de integridade e permissoes SYSTEM."""
+        """Salva a configuração atomicamente com assinatura de integridade e permissões restritas."""
         # 1. Calcula a assinatura de integridade protegida por DPAPI
         config_data["integrity_mac"] = compute_integrity_mac(config_data)
 
-        # 2. Desbloqueia atributo somente leitura se o arquivo ja existir
-        if self.config_file.exists():
+        # 2. Desbloqueia atributo somente leitura se o arquivo já existir
+        if self.config_file.exists() and hasattr(ctypes, "windll"):
             try:
                 ctypes.windll.kernel32.SetFileAttributesW(str(self.config_file), 0x80)
             except Exception:
                 pass
 
-        # 3. Gravacao atomica
+        # 3. Gravação atômica
         tmp_file = self.config_file.with_suffix(".tmp")
         with open(tmp_file, "w", encoding="utf-8") as f:
             json.dump(config_data, f, indent=2, ensure_ascii=False)
@@ -175,11 +196,18 @@ class HOTPAuth:
         # 4. Gera assinatura digital desanexada imediatamente em sincronia
         create_detached_signature_file(self.config_file, config_data)
 
-        # 5. Atualiza o snapshot publico para o Dashboard
+        # 5. Restaura atributo somente-leitura para dificultar edições acidentais
+        if hasattr(ctypes, "windll"):
+            try:
+                ctypes.windll.kernel32.SetFileAttributesW(str(self.config_file), 0x01)
+            except Exception:
+                pass
+
+        # 6. Atualiza o snapshot público para o Dashboard
         self._update_public_status(config_data)
 
     def _update_public_status(self, cfg: dict):
-        """Atualiza o arquivo publico queue/status.json sem vazar nenhuma chave ou senha."""
+        """Atualiza o arquivo público queue/status.json sem vazar nenhuma chave ou senha."""
         now = time.time()
         failures = [t for t in cfg.get("failures", []) if (now - t) <= FAIL_SAFE_WINDOW_SECONDS]
         lockdown = cfg.get("lockdown", False)
@@ -191,7 +219,6 @@ class HOTPAuth:
         elif not provisioned:
             status_text = "Aguardando Provisionamento"
 
-        # Verifica se o Modo Auth de 45 minutos esta ativo
         auth_mode_active = False
         auth_expires_in = 0
         if self.ticket_file.exists():
@@ -237,7 +264,7 @@ class HOTPAuth:
         otp_provided: str = "",
         caller_info: Optional[dict] = None
     ):
-        """Registra logs estruturados de auditoria e blocos encadeados no ledger imutavel."""
+        """Registra logs estruturados de auditoria e blocos encadeados no ledger imutável."""
         timestamp = datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S")
         status_str = "SUCCESS" if success else "FAIL"
         clean_otp = str(otp_provided).strip()
@@ -261,7 +288,6 @@ class HOTPAuth:
         except Exception:
             pass
 
-        # Registra no ledger criptografico imutavel [estilo blockchain]
         try:
             code_hash = hashlib.sha256(details.encode("utf-8")).hexdigest()[:16]
             append_ledger_block(action, counter_after, code_hash, caller_info, status_str, details)
@@ -285,11 +311,15 @@ class HOTPAuth:
 
     @staticmethod
     def compute_hotp(secret: bytes, counter: int, digits: int = 6) -> str:
-        """Alias para compatibilidade retroativa de calculo do HOTP RFC 4226."""
-        return HOTPAuth._compute_hotp_internal(bytearray(secret), counter, digits)
+        """Alias para compatibilidade retroativa de cálculo do HOTP RFC 4226."""
+        sec_ba = bytearray(secret)
+        try:
+            return HOTPAuth._compute_hotp_internal(sec_ba, counter, digits)
+        finally:
+            wipe_buffer(sec_ba)
 
     # -------------------------------------------------------------------------
-    # PROVISIONAMENTO INICIAL
+    # PROVISIONAMENTO INICIAL (COM BLINDAGEM PRÉ-GRAVAÇÃO)
     # -------------------------------------------------------------------------
     def is_provisioned(self) -> bool:
         """Verifica se a chave já foi provisionada e o flag está em 1."""
@@ -298,12 +328,10 @@ class HOTPAuth:
             if cfg:
                 return cfg.get("provisioned_flag", 0) == 1
         except SecurityError:
-            # Se o arquivo existe e foi adulterado, ele esta provisionado [mas bloqueado]
             return True
         except Exception:
             pass
 
-        # Fallback para snapshot público de status se o processo for de usuário
         if STATUS_FILE.exists():
             try:
                 with open(STATUS_FILE, "r", encoding="utf-8") as f:
@@ -357,11 +385,7 @@ class HOTPAuth:
                 pass
 
     def check_owner_password_status(self) -> Tuple[bool, float]:
-        """Verifica se o ciclo de 14 dias para confirmação da Senha Mestra expirou.
-
-        Retorna [True, segundos_decorridos] se ainda dentro dos 14 dias.
-        Retorna [False, segundos_decorridos] se o ciclo de 14 dias expirou.
-        """
+        """Verifica se o ciclo de 14 dias para confirmação da Senha Mestra expirou."""
         try:
             cfg = self._load_config_raw()
             last_v = cfg.get("last_owner_password_verified_at")
@@ -379,7 +403,7 @@ class HOTPAuth:
             try:
                 anchor_file = self.config_dir / "owner_anchor.json"
                 if anchor_file.exists():
-                    if not verify_owner_password(password, anchor_file, self.config_dir.parent):
+                    if not verify_owner_password(password, anchor_file, self.config_dir):
                         return False
                 else:
                     cfg = self._load_config_raw()
@@ -410,10 +434,7 @@ class HOTPAuth:
                 return False
 
     def provision(self, recovery_password: str, force: bool = False, caller_info: Optional[dict] = None) -> dict:
-        """Gera a chave secreta inicial em memória, protege com DPAPI e trava o flag em 1.
-
-        Permitido estritamente uma única vez [ou durante reset autenticado].
-        """
+        """Gera a chave secreta inicial em memória, aplica ACL NTFS ANTES de gravar, protege com DPAPI e trava flag=1."""
         with AtomicLock():
             cfg = {}
             try:
@@ -442,27 +463,34 @@ class HOTPAuth:
             if not recovery_password or len(recovery_password) < 8:
                 raise ValueError("A palavra-passe de recuperação deve conter pelo menos 8 caracteres.")
 
-            # Cria a ancora Ed25519 do proprietario
+            # 0. Blindagem NTFS prévia ANTES de gravar qualquer segredo no disco (elimina Race Condition TOCTOU)
             try:
-                create_owner_anchor(recovery_password, self.config_dir.parent)
+                self.config_dir.mkdir(parents=True, exist_ok=True)
+                ensure_hw_salt(self.config_dir)
+                apply_isolated_bridge_ntfs_acls(self.config_dir.parent)
+            except Exception:
+                pass
+
+            # 1. Cria a âncora Ed25519 do proprietário diretamente em self.config_dir
+            anchor_target = self.config_dir / "owner_anchor.json"
+            try:
+                create_owner_anchor(recovery_password, self.config_dir, anchor_path=anchor_target)
             except Exception as e:
                 logging.warning(f"Aviso ao gerar ancora do proprietario: {e}")
 
-            # 1. Gera segredo criptográfico de 160 bits - 20 bytes
-            raw_secret = secrets.token_bytes(20)
-            secret_b32 = base64.b32encode(raw_secret).decode("ascii")
+            # 2. Gera segredo criptográfico de 160 bits (20 bytes) em buffer mutável travado na RAM
+            raw_secret_ba = bytearray(secrets.token_bytes(20))
+            lock_memory_page(raw_secret_ba)
+            try:
+                secret_b32 = base64.b32encode(bytes(raw_secret_ba)).decode("ascii")
+                secret_dpapi = dpapi_protect(bytes(raw_secret_ba))
+                secret_dpapi_b64 = base64.b64encode(secret_dpapi).decode("ascii")
+            finally:
+                wipe_buffer(raw_secret_ba)
+                del raw_secret_ba
+                gc.collect()
 
-            # 2. Criptografa o segredo via DPAPI
-            secret_dpapi = dpapi_protect(raw_secret)
-            secret_dpapi_b64 = base64.b64encode(secret_dpapi).decode("ascii")
-
-            # Limpa imediatamente os bytes do segredo em texto claro da RAM
-            raw_secret_ba = bytearray(raw_secret)
-            wipe_buffer(raw_secret_ba)
-            del raw_secret, raw_secret_ba
-            gc.collect()
-
-            # 3. Hash da senha de recuperação PBKDF2 600.000 iterações e proteção DPAPI
+            # 3. Hash da senha de recuperação PBKDF2 (600.000 iterações) e proteção DPAPI
             pw_hash_b64, salt_b64 = hash_recovery_password(recovery_password)
             pw_hash_dpapi = dpapi_protect(pw_hash_b64.encode("ascii"))
             pw_hash_dpapi_b64 = base64.b64encode(pw_hash_dpapi).decode("ascii")
@@ -510,7 +538,7 @@ class HOTPAuth:
             }
 
     def verify_and_finalize_initial_otp(self, otp: str) -> Tuple[bool, str]:
-        """Valida o primeiro codigo gerado no celular para confirmar o pareamento e trava a configuracao."""
+        """Valida o primeiro código gerado no celular para confirmar o pareamento e trava a configuração."""
         clean_otp = str(otp).strip()
         if not clean_otp.isdigit() or len(clean_otp) != DEFAULT_DIGITS:
             return False, f"O codigo OTP deve conter exatamente {DEFAULT_DIGITS} digitos numericos."
@@ -524,7 +552,6 @@ class HOTPAuth:
             secret_enc = base64.b64decode(secret_dpapi_b64)
             secret_ba = dpapi_unprotect(secret_enc)
             try:
-                # Compara nas posicoes 0 a 2 para tolerar cliques iniciais no celular
                 matched = None
                 for test_c in range(0, 3):
                     expected = self._compute_hotp_internal(secret_ba, test_c, DEFAULT_DIGITS)
@@ -535,7 +562,6 @@ class HOTPAuth:
                 if matched is None:
                     return False, "Codigo incorreto. Digite os 6 digitos exibidos no aplicativo do seu celular."
 
-                # Avanco estrito: proximo sera matched + 1
                 new_c = matched + 1
                 cfg["counter"] = new_c
                 cfg["provisioned_flag"] = 1
@@ -557,13 +583,23 @@ class HOTPAuth:
                 gc.collect()
 
     def repair_corrupted_installation(self, recovery_password: str) -> Tuple[bool, str]:
-        """Restaura pastas e arquivos apos deteccao de adulteracao exigindo a palavra-passe do proprietario."""
+        """Restaura pastas e arquivos após detecção de adulteração exigindo estritamente a palavra-passe do proprietário."""
         if not recovery_password or len(recovery_password) < 8:
             return False, "A palavra-passe deve conter pelo menos 8 caracteres."
 
         with AtomicLock():
             raw_data = None
-            # Tenta validar a palavra-passe contra o hash existente se disponivel
+            password_verified = False
+
+            # 1. Valida contra owner_anchor.json se presente
+            anchor_file = self.config_dir / "owner_anchor.json"
+            if anchor_file.exists():
+                if verify_owner_password(recovery_password, anchor_file, self.config_dir):
+                    password_verified = True
+                else:
+                    return False, "Palavra-passe de recuperacao incorreta. Apenas o proprietario pode reparar o sistema."
+
+            # 2. Valida contra o hash PBKDF2 protegido por DPAPI no hotp_config.json
             if self.config_file.exists():
                 try:
                     with open(self.config_file, "r", encoding="utf-8") as f:
@@ -577,10 +613,12 @@ class HOTPAuth:
                         wipe_buffer(expected_hash_ba)
                         if not verify_recovery_password(recovery_password, expected_hash, salt_b64):
                             return False, "Palavra-passe de recuperacao incorreta. Apenas o proprietario pode reparar o sistema."
+                        password_verified = True
                 except Exception:
-                    pass
+                    if not password_verified:
+                        return False, "Nao foi possivel validar a palavra-passe de recuperacao."
 
-            # Se os dados internos do hotp_config.json forem autenticos, apenas re-ancora a assinatura
+            # Se os dados internos do hotp_config.json forem autênticos, re-ancora a assinatura
             if raw_data and isinstance(raw_data, dict):
                 mac_b64 = raw_data.get("integrity_mac")
                 if mac_b64:
@@ -595,20 +633,22 @@ class HOTPAuth:
                         if hmac.compare_digest(actual_digest, expected_digest):
                             raw_data["lockdown"] = False
                             raw_data["failures"] = []
+                            create_owner_anchor(recovery_password, self.config_dir, anchor_path=anchor_file)
                             self._save_config_raw(raw_data)
                             self._log_audit("REPAIR_SUCCESS", raw_data.get("counter", 0), raw_data.get("counter", 0), True, "Assinatura digital e integridade re-ancoradas com sucesso pelo proprietario.")
                             return True, "Integridade revalidada com sucesso pelo proprietario. Configuracao e sincronia mantidas intactas."
                     except Exception:
                         pass
 
-            # Caso esteja genuinamente corrompido, limpa os arquivos sem falha de permissao
+            # Caso esteja corrompido, limpa os arquivos para permitir novo provisionamento seguro
             try:
-                for f in [self.config_file, self.config_file.with_name(self.config_file.name + ".sig"), self.ticket_file, STATUS_FILE]:
+                for f in [self.config_file, self.config_file.with_name(self.config_file.name + ".sig"), anchor_file, self.ticket_file, STATUS_FILE]:
                     if f.exists():
-                        try:
-                            ctypes.windll.kernel32.SetFileAttributesW(str(f), 0x80)
-                        except Exception:
-                            pass
+                        if hasattr(ctypes, "windll"):
+                            try:
+                                ctypes.windll.kernel32.SetFileAttributesW(str(f), 0x80)
+                            except Exception:
+                                pass
                         try:
                             f.unlink(missing_ok=True)
                         except Exception:
@@ -634,13 +674,7 @@ class HOTPAuth:
         expected_challenge: str,
         caller_info: Optional[dict] = None
     ) -> dict:
-        """Executa a revogação estrita de privilégios e destruição de chaves:
-
-        1. Exige palavra-passe de recuperação correta e desafio de presença física.
-        2. Destrói imediatamente a chave secreta da memória e do disco.
-        3. Remove a tarefa agendada do Windows (schtasks /delete /f).
-        4. O utilitário perde todas as permissões administrativas permanentes.
-        """
+        """Executa a revogação estrita de privilégios e destruição de chaves."""
         with AtomicLock():
             cfg = self._load_config_raw()
             c_before = cfg.get("counter", 0)
@@ -668,7 +702,6 @@ class HOTPAuth:
                 raise PermissionError("Senha de recuperação incorreta.")
 
             # 3. CONDIÇÕES CUMPRIDAS: AUTODESTRUIÇÃO DE PRIVILÉGIOS E SEGREDO
-            # Destrói a chave do disco
             cfg["provisioned_flag"] = 0
             cfg["lockdown"] = False
             cfg["secret_dpapi"] = ""
@@ -676,12 +709,12 @@ class HOTPAuth:
             cfg["failures"] = []
             self._save_config_raw(cfg)
 
-            # Remove a tarefa agendada do Windows
-            try:
-                for tn in ("AdminBridge", "AntigravityAdminBridge"):
-                    subprocess.run(["schtasks", "/delete", "/tn", tn, "/f"], capture_output=True, check=False, creationflags=0x08000000)
-            except Exception:
-                pass
+            if sys.platform == "win32":
+                try:
+                    for tn in ("AdminBridge", "AntigravityAdminBridge"):
+                        subprocess.run(["schtasks", "/delete", "/tn", tn, "/f"], capture_output=True, check=False, creationflags=0x08000000)
+                except Exception:
+                    pass
 
             self._log_audit(
                 "RESET_PRIVILEGES_DESTROYED",
@@ -701,14 +734,7 @@ class HOTPAuth:
     # VALIDAÇÃO CEGA COM ISOLAMENTO DE MEMÓRIA E FAIL-SAFE
     # -------------------------------------------------------------------------
     def verify_and_advance(self, provided_otp: Optional[str], caller_info: Optional[dict] = None) -> Tuple[bool, str, int]:
-        """Validação cega atômica do token HOTP:
-
-        - O computador NUNCA calcula nem expõe o OTP para a interface.
-        - Memória desencriptada no milissegundo exato e sobrescrita com zeros.
-        - Comparação em tempo constante (hmac.compare_digest).
-        - Contador avança obrigatoriamente tanto em SUCESSO quanto em ERRO (+1).
-        - Fail-Safe: 3 falhas em 5 minutos desativam a tarefa elevada e encerram o utilitário.
-        """
+        """Validação cega atômica do token HOTP com higiene estrita de memória e Fail-Safe."""
         with AtomicLock():
             cfg = self._load_config_raw()
 
@@ -719,7 +745,6 @@ class HOTPAuth:
             digits = cfg.get("digits", DEFAULT_DIGITS)
             look_ahead = cfg.get("look_ahead_window", DEFAULT_LOOK_AHEAD_WINDOW)
 
-            # Verifica se já está em estado de lockdown fail-safe
             if cfg.get("lockdown", False):
                 self._log_audit(
                     "LOCKDOWN_BLOCKED",
@@ -732,7 +757,6 @@ class HOTPAuth:
                 )
                 return False, "FAIL_SAFE_LOCKDOWN: O utilitário foi desativado por excesso de falhas. Exige UAC manual.", current_counter
 
-            # Valida origem do processo chamador
             valid_caller, caller_msg = verify_caller_origin(caller_info)
             if not valid_caller:
                 new_counter = current_counter + 1
@@ -749,7 +773,6 @@ class HOTPAuth:
                 )
                 return False, f"Origem da requisição não autorizada: {caller_msg}", new_counter
 
-            # Validação do formato do código fornecido
             if not provided_otp or not str(provided_otp).strip().isdigit() or len(str(provided_otp).strip()) not in (6, 8):
                 new_counter = current_counter + 1
                 cfg["counter"] = new_counter
@@ -758,14 +781,12 @@ class HOTPAuth:
 
             provided_otp = str(provided_otp).strip()
 
-            # Desencripta a chave estritamente no milissegundo da validação
             secret_ba = None
             match_counter = None
             try:
                 secret_raw = base64.b64decode(cfg["secret_dpapi"])
                 secret_ba = dpapi_unprotect(secret_raw)
 
-                # Compara candidatos na janela de look-ahead usando tempo constante
                 for test_counter in range(current_counter, current_counter + look_ahead + 1):
                     expected = self._compute_hotp_internal(secret_ba, test_counter, digits)
                     if hmac.compare_digest(expected, provided_otp):
@@ -777,19 +798,17 @@ class HOTPAuth:
                 self._record_failure_and_check_lockdown(cfg, current_counter, new_counter, provided_otp, caller_info, f"Erro ao acessar chave DPAPI: {e}")
                 return False, f"Erro ao acessar chave de hardware: {e}", new_counter
             finally:
-                # Higiene estrita de memória: sobrescreve buffers com zeros e invoca gc.collect()
                 if secret_ba is not None:
                     wipe_buffer(secret_ba)
                     del secret_ba
                 gc.collect()
 
             if match_counter is not None:
-                # SUCESSO!
                 new_counter = match_counter + 1
                 cfg["counter"] = new_counter
                 cfg["last_success_counter"] = match_counter
                 cfg["last_used_at"] = datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S")
-                cfg["failures"] = []  # Limpa falhas anteriores
+                cfg["failures"] = []
                 self._save_config_raw(cfg)
 
                 self._log_audit(
@@ -803,7 +822,6 @@ class HOTPAuth:
                 )
                 return True, "Autenticação HOTP aprovada.", new_counter
             else:
-                # ERRO: Avança contador obrigatoriamente
                 new_counter = current_counter + 1
                 cfg["counter"] = new_counter
                 is_lockdown = self._record_failure_and_check_lockdown(
@@ -833,12 +851,12 @@ class HOTPAuth:
             cfg["lockdown_at"] = datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S")
             self._save_config_raw(cfg)
 
-            # Aciona desativação/remoção imediata da tarefa agendada
-            try:
-                for tn in ("AdminBridge", "AntigravityAdminBridge"):
-                    subprocess.run(["schtasks", "/delete", "/tn", tn, "/f"], capture_output=True, check=False, creationflags=0x08000000)
-            except Exception:
-                pass
+            if sys.platform == "win32":
+                try:
+                    for tn in ("AdminBridge", "AntigravityAdminBridge"):
+                        subprocess.run(["schtasks", "/delete", "/tn", tn, "/f"], capture_output=True, check=False, creationflags=0x08000000)
+                except Exception:
+                    pass
 
             self._log_audit(
                 "FAIL_SAFE_LOCKDOWN",
@@ -867,18 +885,12 @@ class HOTPAuth:
     # CONSULTA PASSIVA DE METADADOS SEM AVANÇO (REGRA 1 & 8)
     # -------------------------------------------------------------------------
     def get_counter_status(self) -> dict:
-        """Consulta metadados passivos (contador, estado, falhas).
-
-        Pode ser executado com leitura direta ou via snapshot público.
-        O computador NUNCA calcula nem retorna tokens nesta função.
-        """
-        # Se puder ler o arquivo config direto (ex: como SYSTEM), usa read_passive_metadata
+        """Consulta metadados passivos (contador, estado, falhas). O computador NUNCA calcula tokens aqui."""
         try:
             return read_passive_metadata(self.config_file)
         except Exception:
             pass
 
-        # Fallback: lê do snapshot público queue/status.json
         if STATUS_FILE.exists():
             try:
                 with open(STATUS_FILE, "r", encoding="utf-8") as f:
@@ -905,33 +917,31 @@ class HOTPAuth:
         caller_info: Optional[dict] = None,
         lifetime_seconds: int = DEFAULT_PREAUTH_LIFETIME
     ) -> Tuple[bool, str, dict]:
-        """Consome o OTP imediatamente no início da interação, avança o contador (+1)
-
-        e gera um ticket de autorização temporário válido por até 45 minutos.
-        Garante que o código não expire enquanto o assistente pesquisa e monta os scripts.
-        """
-        caller = caller_info or {"pid": os.getpid(), "user": os.getenv("USERNAME", "unknown")}
+        """Consome o OTP imediatamente, avança o contador (+1) e gera ticket temporário válido por até 45 minutos."""
+        caller = caller_info or {"pid": os.getpid(), "user": os.getenv("USERNAME") or os.getenv("USER") or "unknown"}
         is_valid, auth_msg, used_counter = self.verify_and_advance(otp, caller)
         if not is_valid:
             return False, auth_msg, {}
 
-        # Deriva a contra-senha de confirmacao mutua
         mutual_code = ""
+        sec_ba = None
         try:
             cfg = self._load_config_raw()
             sec_raw = base64.b64decode(cfg["secret_dpapi"])
             sec_ba = dpapi_unprotect(sec_raw)
             mutual_code = generate_mutual_confirmation_code(bytes(sec_ba), otp)
-            wipe_buffer(sec_ba)
         except Exception:
             pass
+        finally:
+            if sec_ba is not None:
+                wipe_buffer(sec_ba)
 
         token = secrets.token_hex(24)
         token_hash = hashlib.sha256(token.encode("ascii")).hexdigest()
         ticket_data = {
             "token_hash": token_hash,
             "mutual_confirmation_code": mutual_code,
-            "caller_user": caller.get("user", os.getenv("USERNAME", "unknown")),
+            "caller_user": caller.get("user", os.getenv("USERNAME") or os.getenv("USER") or "unknown"),
             "caller_pid": caller.get("pid", 0),
             "counter_used": used_counter - 1,
             "created_at": time.time(),
@@ -969,7 +979,7 @@ class HOTPAuth:
         token: Optional[str] = None,
         caller_user: Optional[str] = None
     ) -> Tuple[bool, str]:
-        """Valida o ticket de pre-autorizacao para execucao dentro da janela de ate 45 minutos."""
+        """Valida o ticket de pré-autorização para execução dentro da janela de até 45 minutos."""
         with AtomicLock():
             if not self.ticket_file.exists():
                 return False, "Nenhum ticket de pre-autorizacao ativo encontrado."
@@ -985,7 +995,6 @@ class HOTPAuth:
                 self.ticket_file.unlink(missing_ok=True)
                 return False, "Ticket de pre-autorizacao expirado por limite de 45 minutos."
 
-            # Exige estritamente o token Bearer secreto
             if not token or not str(token).strip():
                 return False, "Token secreto de pre-autorizacao e estritamente obrigatorio."
 
@@ -993,12 +1002,10 @@ class HOTPAuth:
             if not hmac.compare_digest(expected_hash, ticket.get("token_hash", "")):
                 return False, "Token de pre-autorizacao fornecido e incorreto."
 
-            # Valida usuario chamador para amarrar sessao ao usuario legitimo
             expected_user = ticket.get("caller_user")
             if expected_user and caller_user and str(expected_user).lower() != str(caller_user).lower():
                 return False, f"Ticket de pre-autorizacao pertence a '{expected_user}', nao a '{caller_user}'."
 
-            # Incrementa contador de comandos executados sob a sessao
             cmds = ticket.get("commands_executed", 0) + 1
             ticket["commands_executed"] = cmds
             ticket["last_used_at"] = now
@@ -1043,12 +1050,9 @@ class HOTPAuth:
         provided_otp: str,
         allow_lookahead: bool = False,
         max_lookahead: int = 10,
-        max_lookback: Optional[int] = None
+        max_lookback: Optional[int] = 50
     ) -> dict:
-        """
-        Modo de diagnóstico e teste de sincronia HOTP RFC 4226.
-        Aplica a máquina de estados estrita em duas fases no próprio processo.
-        """
+        """Modo de diagnóstico e sincronia HOTP RFC 4226 protegido contra lockdown bypass e força bruta."""
         clean_otp = str(provided_otp).strip()
         if not clean_otp.isdigit() or len(clean_otp) != DEFAULT_DIGITS:
             return {
@@ -1065,16 +1069,22 @@ class HOTPAuth:
                     "error": "O utilitário ainda não está provisionado."
                 }
 
-            current_counter = cfg.get("counter", 0)
+            if cfg.get("lockdown", False):
+                return {
+                    "success": False,
+                    "error": "FAIL_SAFE_LOCKDOWN: O utilitário está em lockdown de segurança."
+                }
 
-            # Recupera segredo em memória de forma segura
+            current_counter = cfg.get("counter", 0)
+            lower_bound = 0 if max_lookback is None else max(0, current_counter - int(max_lookback))
+
             secret_dpapi_b64 = cfg.get("secret_dpapi")
             secret_enc = base64.b64decode(secret_dpapi_b64)
             secret_ba = dpapi_unprotect(secret_enc)
 
             try:
-                # 1. Fase 1: Busca sequencial de tras para frente - de current_counter ate 0
-                for c in range(current_counter, -1, -1):
+                # 1. Fase 1: Busca sequencial de trás para frente dentro do limite seguro
+                for c in range(current_counter, lower_bound - 1, -1):
                     code = self._compute_hotp_internal(secret_ba, c, DEFAULT_DIGITS)
                     if hmac.compare_digest(clean_otp, code):
                         if c == current_counter:
@@ -1117,7 +1127,6 @@ class HOTPAuth:
                             }
 
                 if not allow_lookahead:
-                    # Nao pesquisa a frente sem autorizacao previa do usuario. Contador permanece intacto.
                     return {
                         "success": False,
                         "matched_counter": None,
@@ -1131,12 +1140,12 @@ class HOTPAuth:
                         "message": "Codigo nao coincide com a posicao atual. Confirmacao necessaria para buscar a frente."
                     }
 
-                # 2. Fase 2: Busca sequencial para frente sob autorizacao expressa - ate 10 posicoes
-                max_c = current_counter + 10
+                # 2. Fase 2: Busca sequencial para frente sob autorização expressa - até 10 posições
+                step_limit = min(int(max_lookahead), 10)
+                max_c = current_counter + step_limit
                 for c in range(current_counter + 1, max_c + 1):
                     code = self._compute_hotp_internal(secret_ba, c, DEFAULT_DIGITS)
                     if hmac.compare_digest(clean_otp, code):
-                        # Interrompe imediatamente sem calcular seguintes
                         new_c = c + 1
                         cfg["counter"] = new_c
                         self._save_config_raw(cfg)
@@ -1162,17 +1171,16 @@ class HOTPAuth:
                             "message": f"Seu autenticador esta no OTP #{c}. O contador do computador pulou para #{new_c} e este sera o proximo aceito."
                         }
 
-                # 3. Esgotamento das 10 posicoes acima sem correspondencia: o contador salta exatamente 10 posicoes
+                # 3. Esgotamento das 10 posições acima sem correspondência: salta 10 posições e contabiliza falha
                 exhausted_c = current_counter + 10
                 cfg["counter"] = exhausted_c
-                self._save_config_raw(cfg)
-                self._log_audit(
-                    "SYNC_EXHAUSTED_JUMP",
+                self._record_failure_and_check_lockdown(
+                    cfg,
                     current_counter,
                     exhausted_c,
-                    False,
-                    f"10 posicoes acima testadas sem correspondencia. Contador saltou 10 posicoes para {exhausted_c}.",
-                    clean_otp
+                    clean_otp,
+                    None,
+                    "10 posicoes acima testadas sem correspondencia em diagnose_otp_sync"
                 )
                 return {
                     "success": False,
