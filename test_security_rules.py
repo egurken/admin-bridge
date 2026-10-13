@@ -140,14 +140,24 @@ def test_all_security_rules():
         assert "token" in data_pre
         assert data_pre["expires_in"] == 2700
 
-        # 2. Consome o ticket com sucesso
+        # 2. Consome o ticket com sucesso na janela de 45 minutos
         ok_consume, msg_consume = auth.consume_preauth_ticket(data_pre["token"], caller.get("user"))
         assert ok_consume, f"Falha ao consumir ticket: {msg_consume}"
 
-        # 3. Tentativa de reuso do mesmo ticket deve falhar (uso estritamente único)
+        # 3. Multi-execucao permitida dentro da janela de 45 minutos com mesmo token e usuario
         ok_reuse, _ = auth.consume_preauth_ticket(data_pre["token"], caller.get("user"))
-        assert not ok_reuse
-        print("  -> PASSOU: Pré-autorização e consumo atômico de ticket funcionam com sucesso!")
+        assert ok_reuse, "Falha ao reutilizar ticket valido dentro dos 45 minutos"
+
+        # 4. Tentativa de reuso com token errado ou usuario divergente deve falhar
+        ok_bad_user, _ = auth.consume_preauth_ticket(data_pre["token"], "hacker_user")
+        assert not ok_bad_user
+
+        # 5. Revogacao imediata encerra a janela de 45 minutos
+        ok_rev, _ = auth.revoke_preauth_ticket()
+        assert ok_rev
+        ok_after_rev, _ = auth.consume_preauth_ticket(data_pre["token"], caller.get("user"))
+        assert not ok_after_rev
+        print("  -> PASSOU: Modo Auth de 45 minutos com multi-execucao e revogacao imediata validado com sucesso!")
 
         # -------------------------------------------------------------
         # TESTE 10: Sincronização Inteligente com Avanço Ativo e Salto do Contador

@@ -177,6 +177,9 @@ def main():
     p_uninst = subparsers.add_parser("uninstall", help="Desinstala o utilitário completamente")
     p_uninst.add_argument("--force", action="store_true", help="Força desinstalação sem confirmação")
 
+    # Subcomando: harden
+    subparsers.add_parser("harden", help="Aplica blindagem estrita de permissões NTFS nativas na pasta config e arquivos")
+
     # Subcomando: preauth
     p_preauth = subparsers.add_parser("preauth", help="Consome OTP e gera ticket de pré-autorização válido por até 45 minutos")
     p_preauth.add_argument("--otp", required=True, help="Código OTP de 6 dígitos")
@@ -281,6 +284,15 @@ def main():
             cmd = [sys.executable, str(BASE_DIR / "app.py"), "uninstall"]
         if getattr(args, "force", False):
             cmd.append("--force")
+        res = subprocess.run(cmd)
+        sys.exit(res.returncode)
+
+    elif args.command == "harden":
+        exe_path = get_bridge_exe()
+        if exe_path.exists():
+            cmd = [str(exe_path), "harden"]
+        else:
+            cmd = [sys.executable, str(BASE_DIR / "app.py"), "harden"]
         res = subprocess.run(cmd)
         sys.exit(res.returncode)
 

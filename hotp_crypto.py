@@ -3,6 +3,7 @@ import ctypes
 import hashlib
 import hmac
 import json
+import logging
 import msvcrt
 import os
 import re
@@ -12,13 +13,17 @@ import sys
 import threading
 import time
 from ctypes import wintypes
+from datetime import datetime
 from pathlib import Path
 from typing import Optional, Tuple
 
 BASE_DIR = Path("C:/Utilitario")
 CONFIG_DIR = BASE_DIR / "config"
 QUEUE_DIR = BASE_DIR / "queue"
+LOGS_DIR = BASE_DIR / "logs"
 LOCK_FILE = QUEUE_DIR / "hotp.lock"
+LEDGER_FILE = LOGS_DIR / "ledger.jsonl"
+LEDGER_ANCHOR_FILE = LOGS_DIR / "ledger.anchor"
 
 # DPAPI Structures & Functions
 class DATA_BLOB(ctypes.Structure):
@@ -34,7 +39,7 @@ DPAPI_ENTROPY = b"AntigravityBridge_TPM_DPAPI_Entropy_2026"
 DPAPI_MAC_ENTROPY = b"AntigravityConfigIntegrityV2"
 CRYPTPROTECT_UI_FORBIDDEN = 0x1
 CRYPTPROTECT_LOCAL_MACHINE = 0x4
-DPAPI_FLAGS = CRYPTPROTECT_UI_FORBIDDEN | CRYPTPROTECT_LOCAL_MACHINE  # 0x5
+DPAPI_FLAGS = CRYPTPROTECT_LOCAL_MACHINE | CRYPTPROTECT_UI_FORBIDDEN  # 0x5 - Escopo de maquina seguro com entropia restrita e ACL NTFS estrita
 
 
 def wipe_buffer(buf):
@@ -453,10 +458,14 @@ def create_detached_signature_file(config_file: Path, cfg: dict) -> Path:
                 ctypes.windll.kernel32.SetFileAttributesW(str(sig_file), 0x80)
             except Exception:
                 pass
-        tmp_sig = sig_file.with_suffix(".sig.tmp")
-        with open(tmp_sig, "w", encoding="utf-8") as f:
-            json.dump(sig_payload, f, indent=2, ensure_ascii=False)
-        tmp_sig.replace(sig_file)
+        try:
+            tmp_sig = sig_file.with_suffix(".sig.tmp")
+            with open(tmp_sig, "w", encoding="utf-8") as f:
+                json.dump(sig_payload, f, indent=2, ensure_ascii=False)
+            tmp_sig.replace(sig_file)
+        except (PermissionError, OSError):
+            with open(sig_file, "w", encoding="utf-8") as f:
+                json.dump(sig_payload, f, indent=2, ensure_ascii=False)
     except Exception as e:
         logging.warning(f"Aviso ao gerar assinatura desanexada: {e}")
     return sig_file
@@ -502,6 +511,7 @@ def create_owner_anchor(password: str, base_dir: Path = BASE_DIR) -> dict:
         with open(anchor_file, "w", encoding="utf-8") as af:
             json.dump(anchor_data, af, indent=2, ensure_ascii=False)
         subprocess.run(["attrib", "+r", str(anchor_file)], capture_output=True, check=False, creationflags=0x08000000)
+        subprocess.run(["cmd.exe", "/c", f'icacls "{anchor_file}" /inheritance:r /grant:r "*S-1-5-18:(F)" "*S-1-5-32-544:(F)" /c /q'], capture_output=True, check=False, creationflags=0x08000000)
         return anchor_data
     finally:
         wipe_buffer(derived_ba)
@@ -588,25 +598,41 @@ def harden_process_dacl() -> bool:
         return False
 
 
-def apply_isolated_bridge_ntfs_acls(base_dir: Path = BASE_DIR):
-    """Aplica permissoes ACL granulares e blindadas sem ocultar pastas:
-    - Posse exclusiva definida para SYSTEM
-    - Pastas visiveis normalmente no Windows Explorer, sem atributos ocultos
-    - config: Acesso total EXCLUSIVO a SYSTEM. Bloqueio estrito a usuarios comuns e leitura a Admins.
-    - hotp_config.json: Bloqueio estrito de heranca, somente leitura a Admins e atributo attrib +r.
-    - scripts: Acesso total EXCLUSIVO a SYSTEM e leitura restrita a Administradores.
+def check_config_acl_isolation(base_dir: Path = BASE_DIR) -> bool:
+    """Verifica se a pasta config e arquivos sensiveis estao estritamente isolados contra usuarios comuns."""
+    forbidden_principals = ["usuários", "usuarios", "users", "autenticados", "authenticated", "s-1-5-32-545", "s-1-5-11"]
+    for rel_path in ("config/hotp_config.json", "config/hotp_config.json.sig", "config/owner_anchor.json", "scripts"):
+        target = base_dir / rel_path
+        if not target.exists():
+            continue
+        try:
+            p = subprocess.run(["icacls", str(target)], capture_output=True, text=True, check=False, creationflags=0x08000000)
+            out = p.stdout.lower()
+            for f in forbidden_principals:
+                if f in out:
+                    return False
+        except Exception:
+            return False
+    return True
+
+
+def apply_isolated_bridge_ntfs_acls(base_dir: Path = BASE_DIR) -> bool:
+    """Aplica permissoes ACL granulares e blindadas sem depender de scripts externos:
+    - Posse exclusiva definida para SYSTEM / Administradores
+    - config: Acesso total EXCLUSIVO a SYSTEM e Administradores. Bloqueio estrito a usuarios comuns.
+    - hotp_config.json: Bloqueio estrito de heranca e acesso exclusivo a SYSTEM / Administradores.
+    - scripts: Acesso total EXCLUSIVO a SYSTEM e Administradores.
     - queue: SYSTEM [F], Admins [M] e Users [M] para envio de comandos.
-    - logs: SYSTEM [F] e Admins [R].
+    - logs: SYSTEM [F] e Admins [M].
     - AdminBridge.exe: Unico executavel com permissao de execucao para usuarios.
     """
     config_dir = base_dir / "config"
     scripts_dir = base_dir / "scripts"
     queue_dir = base_dir / "queue"
     logs_dir = base_dir / "logs"
-    config_file = config_dir / "hotp_config.json"
     exe_file = base_dir / "AdminBridge.exe"
 
-    # Garante que as pastas fiquem visiveis normalmente, sem atributos ocultos
+    # 1. Garante que as pastas fiquem visiveis normalmente, sem atributos ocultos
     for d in (config_dir, scripts_dir, queue_dir, logs_dir):
         if d.exists():
             try:
@@ -614,56 +640,60 @@ def apply_isolated_bridge_ntfs_acls(base_dir: Path = BASE_DIR):
             except Exception:
                 pass
 
-    # Define a posse explicitamente para SYSTEM
+    # 2. Assume posse recursiva de C:\Utilitario\config para SYSTEM e Administradores
     try:
-        if base_dir.exists():
-            subprocess.run(["cmd.exe", "/c", f'icacls "{base_dir}" /setowner "*S-1-5-18" /t /c /q'], capture_output=True, check=False, creationflags=0x08000000)
+        if config_dir.exists():
+            subprocess.run(["takeown", "/f", str(config_dir), "/r", "/d", "y"], capture_output=True, check=False, creationflags=0x08000000)
     except Exception:
         pass
 
-    # Permissao no executavel principal: unico arquivo executavel para o usuario
+    # 3. Blindagem estrita de config - EXCLUSIVO SYSTEM e Administradores total [Zero acesso a usuarios comuns]
+    try:
+        if config_dir.exists():
+            cfg_str = str(config_dir)
+            # Remove heranca recursivamente e concede acesso exclusivo a SYSTEM e Administradores
+            subprocess.run(["cmd.exe", "/c", f'icacls "{cfg_str}" /inheritance:r /grant:r "*S-1-5-18:(OI)(CI)(F)" "*S-1-5-32-544:(OI)(CI)(F)" /t /c /q'], capture_output=True, check=False, creationflags=0x08000000)
+            subprocess.run(["cmd.exe", "/c", f'icacls "{cfg_str}\\*" /inheritance:r /grant:r "*S-1-5-18:(F)" "*S-1-5-32-544:(F)" /c /q'], capture_output=True, check=False, creationflags=0x08000000)
+            for specific_file in ("hotp_config.json", "hotp_config.json.sig", "owner_anchor.json"):
+                sp = config_dir / specific_file
+                if sp.exists():
+                    subprocess.run(["cmd.exe", "/c", f'icacls "{sp}" /inheritance:r /grant:r "*S-1-5-18:(F)" "*S-1-5-32-544:(F)" /c /q'], capture_output=True, check=False, creationflags=0x08000000)
+    except Exception:
+        pass
+
+    # 4. Blindagem estrita de scripts - somente SYSTEM e Administradores
+    try:
+        if scripts_dir.exists():
+            sc_str = str(scripts_dir)
+            subprocess.run(["cmd.exe", "/c", f'icacls "{sc_str}" /inheritance:r /grant:r "*S-1-5-18:(OI)(CI)(F)" "*S-1-5-32-544:(OI)(CI)(F)" /t /c /q'], capture_output=True, check=False, creationflags=0x08000000)
+    except Exception:
+        pass
+
+    # 5. Canal de logs
+    try:
+        if logs_dir.exists():
+            l_str = str(logs_dir)
+            subprocess.run(["cmd.exe", "/c", f'icacls "{l_str}" /inheritance:r /grant:r "*S-1-5-18:(OI)(CI)(F)" "*S-1-5-32-544:(OI)(CI)(F)" /t /c /q'], capture_output=True, check=False, creationflags=0x08000000)
+    except Exception:
+        pass
+
+    # 6. Canal de fila para envio de solicitacoes pelo usuario
+    try:
+        if queue_dir.exists():
+            q_str = str(queue_dir)
+            subprocess.run(["cmd.exe", "/c", f'icacls "{q_str}" /inheritance:r /grant:r "*S-1-5-18:(OI)(CI)(F)" "*S-1-5-32-544:(OI)(CI)(M)" "*S-1-5-32-545:(OI)(CI)(M)" /c /q'], capture_output=True, check=False, creationflags=0x08000000)
+    except Exception:
+        pass
+
+    # 7. Permissao no executavel principal: unico arquivo executavel para o usuario
     try:
         if exe_file.exists():
-            cmd_exe = f'icacls "{exe_file}" /grant "*S-1-5-18:(F)" "*S-1-5-32-544:(RX)" "*S-1-5-32-545:(RX)"'
+            cmd_exe = f'icacls "{exe_file}" /grant "*S-1-5-18:(F)" "*S-1-5-32-544:(RX)" "*S-1-5-32-545:(RX)" /c /q'
             subprocess.run(["cmd.exe", "/c", cmd_exe], capture_output=True, check=False, creationflags=0x08000000)
     except Exception:
         pass
 
-    # 1. Blindagem estrita de config - SYSTEM e Administradores total, Usuarios somente leitura
-    try:
-        if config_dir.exists():
-            cfg_str = str(config_dir)
-            cmd_cfg = f'icacls "{cfg_str}" /inheritance:r /grant:r "*S-1-5-18:(OI)(CI)(F)" "*S-1-5-32-544:(OI)(CI)(F)" "*S-1-5-32-545:(OI)(CI)(R)"'
-            subprocess.run(["cmd.exe", "/c", cmd_cfg], capture_output=True, check=False, creationflags=0x08000000)
-    except Exception:
-        pass
-
-    # 2. Blindagem estrita de scripts - somente SYSTEM e Administradores
-    try:
-        if scripts_dir.exists():
-            sc_str = str(scripts_dir)
-            cmd_sc = f'icacls "{sc_str}" /inheritance:r /grant:r "*S-1-5-18:(OI)(CI)(F)" "*S-1-5-32-544:(OI)(CI)(F)"'
-            subprocess.run(["cmd.exe", "/c", cmd_sc], capture_output=True, check=False, creationflags=0x08000000)
-    except Exception:
-        pass
-
-    # 3. Canal de logs
-    try:
-        if logs_dir.exists():
-            l_str = str(logs_dir)
-            cmd_l = f'icacls "{l_str}" /inheritance:r /grant:r "*S-1-5-18:(OI)(CI)(F)" "*S-1-5-32-544:(OI)(CI)(F)"'
-            subprocess.run(["cmd.exe", "/c", cmd_l], capture_output=True, check=False, creationflags=0x08000000)
-    except Exception:
-        pass
-
-    # 4. Canal de fila para envio de solicitacoes pelo usuario
-    try:
-        if queue_dir.exists():
-            q_str = str(queue_dir)
-            cmd_q = f'icacls "{q_str}" /inheritance:r /grant:r "*S-1-5-18:(OI)(CI)(F)" "*S-1-5-32-544:(OI)(CI)(M)" "*S-1-5-32-545:(OI)(CI)(M)"'
-            subprocess.run(["cmd.exe", "/c", cmd_q], capture_output=True, check=False, creationflags=0x08000000)
-    except Exception:
-        pass
+    return check_config_acl_isolation(base_dir)
 
 
 def check_forensic_integrity(config_file: Path) -> Tuple[bool, str]:
@@ -846,3 +876,85 @@ def verify_caller_origin(caller_data: Optional[dict]) -> Tuple[bool, str]:
         return False, f"Executável de origem não autorizado: {exe}"
 
     return True, "Origem validada com sucesso."
+
+
+def append_ledger_block(action: str, counter: int, code_hash: str, caller_info: Optional[dict] = None, status: str = "SUCCESS", details: str = "") -> dict:
+    """Registra um bloco encadeado por hash criptografico [estilo blockchain] no log imutavel de auditoria."""
+    try:
+        LOGS_DIR.mkdir(parents=True, exist_ok=True)
+        prev_hash = "0" * 64
+        index = 0
+        if LEDGER_FILE.exists() and LEDGER_FILE.stat().st_size > 0:
+            try:
+                with open(LEDGER_FILE, "r", encoding="utf-8") as lf:
+                    lines = [ln.strip() for ln in lf if ln.strip()]
+                    if lines:
+                        last_block = json.loads(lines[-1])
+                        prev_hash = last_block.get("block_hash", "0" * 64)
+                        index = last_block.get("index", 0) + 1
+            except Exception:
+                pass
+
+        timestamp = datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S UTC")
+        caller_str = f"PID:{caller_info.get('pid', '?')}|User:{caller_info.get('user', '?')}" if caller_info else "N/A"
+
+        # Formato de payload canônico para cálculo de hash do bloco
+        block_payload = f"{index}|{prev_hash}|{timestamp}|{counter}|{action}|{code_hash}|{status}|{caller_str}".encode("utf-8")
+        block_hash = hashlib.sha256(block_payload).hexdigest()
+
+        block = {
+            "index": index,
+            "prev_hash": prev_hash,
+            "timestamp": timestamp,
+            "counter": counter,
+            "action": action,
+            "code_hash": code_hash,
+            "status": status,
+            "caller": caller_str,
+            "details": details,
+            "block_hash": block_hash
+        }
+
+        with open(LEDGER_FILE, "a", encoding="utf-8") as lf:
+            lf.write(json.dumps(block, ensure_ascii=False) + "\n")
+
+        with open(LEDGER_ANCHOR_FILE, "w", encoding="utf-8") as af:
+            json.dump({"last_index": index, "last_hash": block_hash, "updated_at": timestamp}, af, indent=2)
+
+        return block
+    except Exception:
+        return {}
+
+
+def verify_ledger_integrity() -> Tuple[bool, str]:
+    """Verifica a integridade matematica estrita da cadeia de blocos de auditoria."""
+    if not LEDGER_FILE.exists() or LEDGER_FILE.stat().st_size == 0:
+        return True, "Ledger vazio ou ainda nao iniciado."
+    try:
+        prev_hash = "0" * 64
+        with open(LEDGER_FILE, "r", encoding="utf-8") as lf:
+            for line_no, ln in enumerate(lf, start=1):
+                raw = ln.strip()
+                if not raw:
+                    continue
+                block = json.loads(raw)
+                expected_prev = block.get("prev_hash")
+                if expected_prev != prev_hash:
+                    return False, f"Quebra de encadeamento no bloco #{block.get('index')}: hash anterior nao confere."
+
+                idx = block.get("index", 0)
+                ts = block.get("timestamp", "")
+                ctr = block.get("counter", 0)
+                act = block.get("action", "")
+                chash = block.get("code_hash", "")
+                st = block.get("status", "")
+                caller_str = block.get("caller", "")
+                payload = f"{idx}|{expected_prev}|{ts}|{ctr}|{act}|{chash}|{st}|{caller_str}".encode("utf-8")
+                calc_hash = hashlib.sha256(payload).hexdigest()
+                if calc_hash != block.get("block_hash"):
+                    return False, f"Adulteracao detectada no bloco #{idx}: hash recalculado diverge."
+                prev_hash = calc_hash
+        return True, "Cadeia de blocos integra e verificada com sucesso."
+    except Exception as e:
+        return False, f"Falha na verificacao do ledger: {e}"
+

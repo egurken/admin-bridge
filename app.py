@@ -35,7 +35,8 @@ from hotp_auth import HOTPAuth, SecurityError, PREAUTH_TICKET_FILE
 from hotp_crypto import (
     wipe_buffer, apply_isolated_bridge_ntfs_acls, apply_system_only_ntfs_acls, restore_ntfs_acls_for_removal,
     verify_caller_origin, generate_physical_challenge, read_passive_metadata, check_forensic_integrity,
-    configure_anti_dump_mitigations, harden_process_dacl
+    configure_anti_dump_mitigations, harden_process_dacl, append_ledger_block, verify_ledger_integrity,
+    check_config_acl_isolation
 )
 from app_icon import get_app_icon
 
@@ -199,13 +200,10 @@ def ensure_environment_installed():
         except Exception as e:
             logging.warning(f"Aviso ao copiar executavel para C:\\Utilitario: {e}")
 
-    # Aplica permissoes restritas exclusivas para SYSTEM se for Administrador e nao aplicadas anteriormente
-    marker = BASE_DIR / ".acls_applied"
-    if is_admin() and not marker.exists():
+    # Aplica permissoes restritas exclusivas para SYSTEM/Admin sempre que for Administrador
+    if is_admin():
         try:
             apply_isolated_bridge_ntfs_acls(BASE_DIR)
-            with open(marker, "w") as f:
-                f.write("ok")
         except Exception:
             pass
 
@@ -1008,6 +1006,26 @@ class ResetWizardDialog(QDialog):
             QMessageBox.critical(self, "Erro na Reinicialização", f"Falha na reinicialização: {e}")
 
 
+class SHELLEXECUTEINFO(ctypes.Structure):
+    _fields_ = [
+        ("cbSize", wintypes.DWORD),
+        ("fMask", wintypes.ULONG),
+        ("hwnd", wintypes.HWND),
+        ("lpVerb", wintypes.LPCWSTR),
+        ("lpFile", wintypes.LPCWSTR),
+        ("lpParameters", wintypes.LPCWSTR),
+        ("lpDirectory", wintypes.LPCWSTR),
+        ("nShow", ctypes.c_int),
+        ("hInstApp", wintypes.HINSTANCE),
+        ("lpIDList", ctypes.c_void_p),
+        ("lpClass", wintypes.LPCWSTR),
+        ("hkeyClass", wintypes.HKEY),
+        ("dwHotKey", wintypes.DWORD),
+        ("hIcon", wintypes.HANDLE),
+        ("hProcess", wintypes.HANDLE),
+    ]
+
+
 # -----------------------------------------------------------------------------
 # THREAD DE EXECUÇÃO DE COMANDOS
 # -----------------------------------------------------------------------------
@@ -1417,6 +1435,11 @@ class AdminBridgeWindow(QMainWindow):
         self.timer_heartbeat.start(3000)
         self.write_heartbeat()
 
+        # Timer de atualizacao automatica periodica do dashboard
+        self.timer_dashboard = QTimer(self)
+        self.timer_dashboard.timeout.connect(self.refresh_dashboard)
+        self.timer_dashboard.start(2500)
+
         # Atualiza métricas iniciais
         self.refresh_dashboard()
 
@@ -1604,6 +1627,10 @@ class AdminBridgeWindow(QMainWindow):
         act_status = QAction("📋 Status Detalhado do Contador", self)
         act_status.triggered.connect(self.show_counter_status_dialog)
         self.settings_menu.addAction(act_status)
+
+        act_revoke_auth = QAction("⏹️ Encerrar Modo Auth [45 min]", self)
+        act_revoke_auth.triggered.connect(self.revoke_auth_session)
+        self.settings_menu.addAction(act_revoke_auth)
 
         self.settings_menu.addSeparator()
 
@@ -1870,7 +1897,12 @@ class AdminBridgeWindow(QMainWindow):
         self.lbl_status_val.setText(status_text)
         self.lbl_fails_val.setText(f"{fails} / {max_fails} Falhas")
 
-        if "adulteração" in status_text.lower() or status_data.get("tampered"):
+        if status_data.get("auth_mode_active"):
+            mins = status_data.get("auth_expires_in", 0) // 60
+            self.lbl_status_val.setText(f"Modo Auth Ativo [{mins}m]")
+            self.lbl_status_val.setStyleSheet("color: #89b4fa;")
+            self.btn_repair.hide()
+        elif "adulteração" in status_text.lower() or status_data.get("tampered"):
             self.lbl_status_val.setText("Bloqueado por adulteração")
             self.lbl_status_val.setStyleSheet("color: #f38ba8;")
             self.btn_repair.show()
@@ -2190,6 +2222,19 @@ class AdminBridgeWindow(QMainWindow):
             self.refresh_dashboard()
         else:
             QMessageBox.critical(self, "Falha no Reparo", msg)
+
+    def revoke_auth_session(self):
+        ok, msg = self.hotp_auth.revoke_preauth_ticket()
+        if ok:
+            QMessageBox.information(
+                self,
+                "Modo Auth Encerrado",
+                "O Modo Auth de 45 minutos foi encerrado com sucesso.\n"
+                "Novas solicitações voltarão a exigir confirmação manual ou novo OTP."
+            )
+        else:
+            QMessageBox.warning(self, "Modo Auth", f"Falha ao revogar: {msg}")
+        self.refresh_dashboard()
 
     def open_reset_dialog(self):
         if not is_admin():
@@ -2606,6 +2651,24 @@ def run_cli_client(args, hotp_auth: HOTPAuth):
             print("[ERRO]: Falha ao concluir desinstalação.", file=sys.stderr)
             sys.exit(1)
 
+    elif args.subcommand == "harden":
+        if not is_admin():
+            try:
+                request_elevation_with_args(["harden"])
+                return
+            except Exception as e:
+                print(f"[ERRO] Permissão de Administrador necessária: {e}", file=sys.stderr)
+                sys.exit(1)
+        print("[*] Aplicando isolamento e blindagem NTFS nativa em C:\\Utilitario...")
+        ok = apply_isolated_bridge_ntfs_acls(BASE_DIR)
+        if ok:
+            print("[SUCESSO] Blindagem NTFS aplicada com sucesso!")
+            print("Pasta C:\\Utilitario\\config e chave HOTP estritamente restritas a SYSTEM e Administradores.")
+            sys.exit(0)
+        else:
+            print("[AVISO] Blindagem aplicada, mas a verificação de isolamento acusou pendências.", file=sys.stderr)
+            sys.exit(1)
+
     elif args.subcommand == "setup":
         run_cli_setup(args, hotp_auth)
         sys.exit(0)
@@ -2870,6 +2933,9 @@ def main():
     p_reset.add_argument("--password", help="Palavra-passe de recuperação")
     p_reset.add_argument("--challenge", help="Código de presença física")
 
+    # Comando harden
+    subparsers.add_parser("harden", help="Aplica blindagem estrita de permissões NTFS na pasta config e arquivos")
+
     # Comando uninstall
     p_uninst = subparsers.add_parser("uninstall", help="Desinstala o utilitário completamente")
     p_uninst.add_argument("--force", action="store_true", help="Força desinstalação sem confirmação")
@@ -2893,7 +2959,7 @@ def main():
 
     # Se um subcomando CLI foi invocado
     if args.subcommand:
-        if args.subcommand in ("setup", "reset", "uninstall") and not is_admin():
+        if args.subcommand in ("setup", "reset", "uninstall", "harden") and not is_admin():
             try:
                 request_elevation_with_args(sys.argv[1:])
                 return

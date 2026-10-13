@@ -15,8 +15,10 @@ from typing import Optional, Tuple
 
 from hotp_crypto import (
     AtomicLock,
+    append_ledger_block,
     apply_isolated_bridge_ntfs_acls,
     apply_system_only_ntfs_acls,
+    check_config_acl_isolation,
     check_integrity_mac,
     compute_integrity_mac,
     create_detached_signature_file,
@@ -31,6 +33,7 @@ from hotp_crypto import (
     restore_ntfs_acls_for_removal,
     verify_caller_origin,
     verify_integrity_mac,
+    verify_ledger_integrity,
     verify_owner_anchor,
     verify_owner_password,
     verify_recovery_password,
@@ -176,7 +179,7 @@ class HOTPAuth:
         self._update_public_status(config_data)
 
     def _update_public_status(self, cfg: dict):
-        """Atualiza o arquivo público queue/status.json sem vazar nenhuma chave ou senha."""
+        """Atualiza o arquivo publico queue/status.json sem vazar nenhuma chave ou senha."""
         now = time.time()
         failures = [t for t in cfg.get("failures", []) if (now - t) <= FAIL_SAFE_WINDOW_SECONDS]
         lockdown = cfg.get("lockdown", False)
@@ -184,9 +187,23 @@ class HOTPAuth:
 
         status_text = "Ativo"
         if lockdown:
-            status_text = "Bloqueado (Lockdown)"
+            status_text = "Bloqueado [Lockdown]"
         elif not provisioned:
             status_text = "Aguardando Provisionamento"
+
+        # Verifica se o Modo Auth de 45 minutos esta ativo
+        auth_mode_active = False
+        auth_expires_in = 0
+        if self.ticket_file.exists():
+            try:
+                with open(self.ticket_file, "r", encoding="utf-8") as tf:
+                    tdata = json.load(tf)
+                exp = tdata.get("expires_at", 0)
+                if now < exp:
+                    auth_mode_active = True
+                    auth_expires_in = int(exp - now)
+            except Exception:
+                pass
 
         status_payload = {
             "counter": cfg.get("counter", 0),
@@ -195,6 +212,8 @@ class HOTPAuth:
             "recent_failures": len(failures),
             "max_failures": FAIL_SAFE_MAX_FAILURES,
             "status_text": status_text,
+            "auth_mode_active": auth_mode_active,
+            "auth_expires_in": auth_expires_in,
             "last_used_at": cfg.get("last_used_at"),
             "created_at": cfg.get("created_at"),
             "updated_at": datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S")
@@ -218,10 +237,9 @@ class HOTPAuth:
         otp_provided: str = "",
         caller_info: Optional[dict] = None
     ):
-        """Registra logs estruturados de auditoria de todas as operações no fuso horário local do usuário."""
+        """Registra logs estruturados de auditoria e blocos encadeados no ledger imutavel."""
         timestamp = datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S")
         status_str = "SUCCESS" if success else "FAIL"
-        # Mantém estritamente apenas os 2 primeiros dígitos visíveis
         clean_otp = str(otp_provided).strip()
         masked_otp = (clean_otp[:2] + "****") if len(clean_otp) >= 2 else "******"
 
@@ -240,6 +258,13 @@ class HOTPAuth:
         try:
             with open(AUTH_LOG_FILE, "a", encoding="utf-8") as f:
                 f.write(entry)
+        except Exception:
+            pass
+
+        # Registra no ledger criptografico imutavel [estilo blockchain]
+        try:
+            code_hash = hashlib.sha256(details.encode("utf-8")).hexdigest()[:16]
+            append_ledger_block(action, counter_after, code_hash, caller_info, status_str, details)
         except Exception:
             pass
 
@@ -462,6 +487,11 @@ class HOTPAuth:
                 "last_owner_password_verified_at": time.time(),
             }
             self._save_config_raw(new_config)
+
+            try:
+                apply_isolated_bridge_ntfs_acls(self.config_dir.parent)
+            except Exception:
+                pass
 
             self._log_audit(
                 "PROVISION",
@@ -939,7 +969,7 @@ class HOTPAuth:
         token: Optional[str] = None,
         caller_user: Optional[str] = None
     ) -> Tuple[bool, str]:
-        """Valida e consome atomicamente o ticket de pre-autorizacao para execucao de comando."""
+        """Valida o ticket de pre-autorizacao para execucao dentro da janela de ate 45 minutos."""
         with AtomicLock():
             if not self.ticket_file.exists():
                 return False, "Nenhum ticket de pre-autorizacao ativo encontrado."
@@ -963,20 +993,50 @@ class HOTPAuth:
             if not hmac.compare_digest(expected_hash, ticket.get("token_hash", "")):
                 return False, "Token de pre-autorizacao fornecido e incorreto."
 
-            # Consumo estritamente unico
+            # Valida usuario chamador para amarrar sessao ao usuario legitimo
+            expected_user = ticket.get("caller_user")
+            if expected_user and caller_user and str(expected_user).lower() != str(caller_user).lower():
+                return False, f"Ticket de pre-autorizacao pertence a '{expected_user}', nao a '{caller_user}'."
+
+            # Incrementa contador de comandos executados sob a sessao
+            cmds = ticket.get("commands_executed", 0) + 1
+            ticket["commands_executed"] = cmds
+            ticket["last_used_at"] = now
             try:
-                self.ticket_file.unlink(missing_ok=True)
+                tmp_t = self.ticket_file.with_suffix(".tmp")
+                with open(tmp_t, "w", encoding="utf-8") as f:
+                    json.dump(ticket, f, indent=2)
+                tmp_t.replace(self.ticket_file)
             except Exception:
                 pass
 
             self._log_audit(
-                "PREAUTH_TICKET_CONSUMED",
+                "PREAUTH_TICKET_USED",
                 ticket.get("counter_used", 0),
-                ticket.get("counter_used", 0) + 1,
+                ticket.get("counter_used", 0),
                 True,
-                "Ticket de pre-autorizacao validado e consumido com sucesso para execucao imediata."
+                f"Comando executado via Modo Auth [Uso #{cmds}]. Valido ate {int((ticket.get('expires_at', 0) - now) // 60)}m restantes."
             )
-            return True, "Ticket de pre-autorizacao validado e consumido com sucesso."
+            return True, "Ticket de pre-autorizacao validado com sucesso."
+
+    def revoke_preauth_ticket(self) -> Tuple[bool, str]:
+        """Revoga e encerra imediatamente o Modo Auth ativo [fecha a porta de 45 minutos]."""
+        with AtomicLock():
+            if not self.ticket_file.exists():
+                return True, "Nenhum Modo Auth ativo para revogar."
+            try:
+                self.ticket_file.unlink(missing_ok=True)
+                self._update_public_status(self.get_counter_status())
+                self._log_audit(
+                    "PREAUTH_TICKET_REVOKED",
+                    0,
+                    0,
+                    True,
+                    "Modo Auth de 45 minutos revogado e encerrado imediatamente pelo usuario."
+                )
+                return True, "Modo Auth encerrado com sucesso."
+            except Exception as e:
+                return False, f"Falha ao revogar Modo Auth: {e}"
 
     def diagnose_otp_sync(
         self,

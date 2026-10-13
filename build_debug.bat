@@ -45,8 +45,14 @@ if %ERRORLEVEL% EQU 0 (
         copy /y "%~dp0dist\AdminBridge_Debug.exe" "!DESK_DIR!\AdminBridge_Debug.exe" >nul
         echo Executavel AdminBridge_Debug.exe copiado com sucesso para a Area de Trabalho!
     )
+    echo.
+    echo Compilacao DEBUG finalizada com sucesso!
+    pause
 ) else (
     echo.
     echo [ERRO] Falha ao compilar versao debug com PyInstaller.
+    pause
     exit /b 1
 )
+pause
+

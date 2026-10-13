@@ -60,8 +60,14 @@ if %ERRORLEVEL% EQU 0 (
         powershell -NoProfile -Command "$ws = New-Object -ComObject WScript.Shell; $s = $ws.CreateShortcut('!DESK_DIR!\Admin Bridge.lnk'); $s.TargetPath = '!DESK_DIR!\AdminBridge.exe'; $s.WorkingDirectory = 'C:\Utilitario'; $s.IconLocation = 'C:\Utilitario\icon.ico,0'; $s.Description = 'Admin Bridge • Central de Gestao e Autorizacao'; $s.Save()" >nul 2>nul
         echo Executavel AdminBridge.exe e atalhos atualizados na Area de Trabalho!
     )
+    echo.
+    echo Compilacao finalizada com sucesso!
+    pause
 ) else (
     echo.
     echo [ERRO] Falha ao compilar com PyInstaller.
+    pause
     exit /b 1
 )
+pause
+
