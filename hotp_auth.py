@@ -62,11 +62,13 @@ class HOTPAuth:
     # -------------------------------------------------------------------------
     def _load_config_raw(self) -> dict:
         """Carrega a configuração bruta e valida a assinatura de integridade HMAC/DPAPI."""
-        if not self.config_file.exists():
-            return {}
-
-        with open(self.config_file, "r", encoding="utf-8") as f:
-            cfg = json.load(f)
+        try:
+            if not self.config_file.exists():
+                return {}
+            with open(self.config_file, "r", encoding="utf-8") as f:
+                cfg = json.load(f)
+        except (PermissionError, OSError):
+            raise
 
         if not cfg:
             return {}
@@ -194,17 +196,40 @@ class HOTPAuth:
         """Verifica se a chave já foi provisionada e o flag está em 1."""
         try:
             cfg = self._load_config_raw()
-            return cfg.get("provisioned_flag", 0) == 1
+            if cfg:
+                return cfg.get("provisioned_flag", 0) == 1
         except Exception:
-            return False
+            pass
+
+        # Fallback para snapshot público de status se o processo for de usuário
+        if STATUS_FILE.exists():
+            try:
+                with open(STATUS_FILE, "r", encoding="utf-8") as f:
+                    pub = json.load(f)
+                    return pub.get("provisioned_flag", 0) == 1
+            except Exception:
+                pass
+
+        return False
 
     def is_lockdown(self) -> bool:
         """Verifica se o sistema está em estado de lockdown de segurança."""
         try:
             cfg = self._load_config_raw()
-            return cfg.get("lockdown", False) is True
+            if cfg:
+                return cfg.get("lockdown", False) is True
         except Exception:
-            return True
+            pass
+
+        if STATUS_FILE.exists():
+            try:
+                with open(STATUS_FILE, "r", encoding="utf-8") as f:
+                    pub = json.load(f)
+                    return pub.get("lockdown", False) is True
+            except Exception:
+                pass
+
+        return False
 
     def provision(self, recovery_password: str, force: bool = False, caller_info: Optional[dict] = None) -> dict:
         """Gera a chave secreta inicial em memória, protege com DPAPI e trava o flag em 1.
@@ -213,12 +238,14 @@ class HOTPAuth:
         """
         with AtomicLock():
             cfg = {}
-            if self.config_file.exists():
-                try:
+            try:
+                if self.config_file.exists():
                     cfg = self._load_config_raw()
-                except SecurityError:
-                    if not force:
-                        raise
+            except SecurityError:
+                if not force:
+                    raise
+            except (PermissionError, OSError):
+                pass
 
             if cfg.get("provisioned_flag", 0) == 1 and not force:
                 self._log_audit(
@@ -548,12 +575,11 @@ class HOTPAuth:
         Pode ser executado com leitura direta ou via snapshot público.
         O computador NUNCA calcula nem retorna tokens nesta função.
         """
-        # Se puder ler o arquivo config direto, usa read_passive_metadata
-        if self.config_file.exists():
-            try:
-                return read_passive_metadata(self.config_file)
-            except Exception:
-                pass
+        # Se puder ler o arquivo config direto (ex: como SYSTEM), usa read_passive_metadata
+        try:
+            return read_passive_metadata(self.config_file)
+        except Exception:
+            pass
 
         # Fallback: lê do snapshot público queue/status.json
         if STATUS_FILE.exists():

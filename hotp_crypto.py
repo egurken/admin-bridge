@@ -16,7 +16,8 @@ from typing import Optional, Tuple
 
 BASE_DIR = Path("C:/Utilitario")
 CONFIG_DIR = BASE_DIR / "config"
-LOCK_FILE = CONFIG_DIR / "hotp.lock"
+QUEUE_DIR = BASE_DIR / "queue"
+LOCK_FILE = QUEUE_DIR / "hotp.lock"
 
 # DPAPI Structures & Functions
 class DATA_BLOB(ctypes.Structure):
@@ -172,20 +173,22 @@ def read_passive_metadata(config_path: Path) -> dict:
 
     Verifica a assinatura de integridade antes de retornar os dados.
     """
-    if not config_path.exists():
-        return {
-            "counter": 0,
-            "provisioned_flag": 0,
-            "lockdown": False,
-            "recent_failures": 0,
-            "max_failures": 3,
-            "status_text": "Aguardando Provisionamento",
-            "tampered": False
-        }
-
     try:
+        if not config_path.exists():
+            return {
+                "counter": 0,
+                "provisioned_flag": 0,
+                "lockdown": False,
+                "recent_failures": 0,
+                "max_failures": 3,
+                "status_text": "Aguardando Provisionamento",
+                "tampered": False
+            }
         with open(config_path, "r", encoding="utf-8") as f:
             cfg = json.load(f)
+    except PermissionError:
+        # Quando restrito a SYSTEM, processos de usuário recebem Acesso Negado
+        raise
     except Exception:
         return {
             "counter": 0,
@@ -251,14 +254,17 @@ def apply_system_only_ntfs_acls(target_path: Path):
     Desativa totalmente a herança (/inheritance:r) e NÃO concede permissão para
     Administradores nem para usuários comuns.
     """
-    if not target_path.exists():
-        return
+    try:
+        if not target_path.exists():
+            return
+    except (PermissionError, OSError):
+        pass
 
-    is_dir = target_path.is_dir()
-    perm_system = "*S-1-5-18:(OI)(CI)(F)" if is_dir else "*S-1-5-18:(F)"
+    target_str = str(target_path)
+    perm_system = "*S-1-5-18:(OI)(CI)(F)"
 
     # Desativa herança e concede acesso total EXCLUSIVAMENTE a SYSTEM
-    cmd = f'icacls "{target_path}" /inheritance:r /grant:r {perm_system}'
+    cmd = f'icacls "{target_str}" /inheritance:r /grant:r {perm_system}'
     try:
         subprocess.run(
             ["cmd.exe", "/c", cmd],
@@ -269,18 +275,17 @@ def apply_system_only_ntfs_acls(target_path: Path):
     except Exception:
         pass
 
-    if is_dir:
-        # Aplica aos arquivos internos também
-        cmd_files = f'icacls "{target_path}\\*" /inheritance:r /grant:r *S-1-5-18:(F)'
-        try:
-            subprocess.run(
-                ["cmd.exe", "/c", cmd_files],
-                capture_output=True,
-                check=False,
-                creationflags=0x08000000
-            )
-        except Exception:
-            pass
+    # Aplica aos arquivos internos também
+    cmd_files = f'icacls "{target_str}\\*" /inheritance:r /grant:r *S-1-5-18:(F)'
+    try:
+        subprocess.run(
+            ["cmd.exe", "/c", cmd_files],
+            capture_output=True,
+            check=False,
+            creationflags=0x08000000
+        )
+    except Exception:
+        pass
 
 
 def restore_ntfs_acls_for_removal(target_path: Path):
@@ -318,7 +323,7 @@ class AtomicLock:
         self.timeout_ms = timeout_ms
 
     def __enter__(self):
-        CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+        QUEUE_DIR.mkdir(parents=True, exist_ok=True)
         if not hasattr(_lock_local, "depth"):
             _lock_local.depth = 0
             _lock_local.mutex_handle = None

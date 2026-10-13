@@ -2,7 +2,7 @@
 setlocal enabledelayedexpansion
 
 echo ========================================================
-echo Compilando AntigravityBridge do repositorio Git
+echo Compilando AntigravityBridge no repositorio Git
 echo Repositorio: %~dp0
 echo ========================================================
 
@@ -16,26 +16,15 @@ if %ERRORLEVEL% NEQ 0 (
 )
 
 echo.
-echo [2/2] Gerando executavel standalone (Onefile com UAC Admin)...
-if exist "C:\Utilitario\AntigravityBridge.exe" (
-    del /f /q "C:\Utilitario\AntigravityBridge.exe" 2>nul
-    if exist "C:\Utilitario\AntigravityBridge.exe" (
-        move /y "C:\Utilitario\AntigravityBridge.exe" "C:\Utilitario\AntigravityBridge_%RANDOM%.old" >nul 2>&1
-    )
-)
-
-if exist "%~dp0icon.ico" (
-    copy /y "%~dp0icon.ico" "C:\Utilitario\icon.ico" >nul 2>&1
-)
-
+echo [2/2] Gerando executavel standalone (Onefile)...
 python -m PyInstaller ^
     --noconsole ^
     --onefile ^
     --icon="%~dp0icon.ico" ^
     --name="AntigravityBridge" ^
-    --distpath="C:\Utilitario" ^
-    --workpath="C:\Utilitario\build" ^
-    --specpath="C:\Utilitario" ^
+    --distpath="%~dp0dist" ^
+    --workpath="%~dp0build" ^
+    --specpath="%~dp0" ^
     --exclude-module=torch ^
     --exclude-module=torchvision ^
     --exclude-module=cv2 ^
@@ -46,9 +35,22 @@ python -m PyInstaller ^
 if %ERRORLEVEL% EQU 0 (
     echo.
     echo ========================================================
-    echo Sucesso! Executavel atualizado em:
-    echo C:\Utilitario\AntigravityBridge.exe
+    echo Sucesso! Executavel gerado em:
+    echo %~dp0dist\AntigravityBridge.exe
     echo ========================================================
+
+    set "DESK_DIR="
+    if exist "%USERPROFILE%\OneDrive\Desktop" (
+        set "DESK_DIR=%USERPROFILE%\OneDrive\Desktop"
+    ) else if exist "%USERPROFILE%\Desktop" (
+        set "DESK_DIR=%USERPROFILE%\Desktop"
+    )
+
+    if defined DESK_DIR (
+        echo Copiando para a Area de Trabalho: !DESK_DIR!\AntigravityBridge.exe
+        copy /y "%~dp0dist\AntigravityBridge.exe" "!DESK_DIR!\AntigravityBridge.exe" >nul
+        echo Executavel copiado para a Area de Trabalho com sucesso!
+    )
 ) else (
     echo.
     echo [ERRO] Falha ao compilar com PyInstaller.

@@ -1,39 +1,12 @@
-# Byte-compiled / optimized files
+dist/
+build/
+*.spec
 __pycache__/
 *.py[cod]
 *$py.class
-
-# PyInstaller / Build outputs
-build/
-dist/
-*.spec
-*.exe
-
-# Dados sensíveis de configuração local (DPAPI / Hardware Key)
-config/
-*.lock
-hotp_config.json
-
-# Logs de execução e auditoria de segurança
-logs/
 *.log
-*.err
-*.exit
-
-# Filas de comunicação IPC (transientes)
-queue/
-
-# Scripts temporários gerados em tempo de execução
-scripts/
-*.bat.err
-*.ps1.err
-
-# Imagens temporárias de pareamento (higiene estrita)
-qrcode_*.png
-QR_Code_*.png
-
-# Arquivos de IDE e Sistema
-.vscode/
-.idea/
-Thumbs.db
-Desktop.ini
+*.tmp
+*.old
+.coverage
+htmlcov/
+.pytest_cache/

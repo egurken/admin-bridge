@@ -19,6 +19,7 @@ from typing import Optional, Tuple
 import qrcode
 from PyQt6.QtCore import Qt, QTimer, QThread, pyqtSignal
 from PyQt6.QtGui import QFont, QIcon, QColor, QPalette, QCursor, QAction, QPixmap
+from PyQt6.QtNetwork import QLocalServer, QLocalSocket
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QLabel, QPushButton, QPlainTextEdit, QFrame, QSystemTrayIcon,
@@ -32,6 +33,7 @@ from hotp_crypto import (
     verify_caller_origin, generate_physical_challenge, read_passive_metadata
 )
 
+LOCAL_SERVER_NAME = "AntigravityBridge_GUI_SingleInstance"
 BASE_DIR = Path("C:/Utilitario")
 CONFIG_DIR = BASE_DIR / "config"
 QUEUE_DIR = BASE_DIR / "queue"
@@ -125,10 +127,79 @@ def request_elevation():
         raise PermissionError("Elevação de privilégios UAC foi recusada pelo usuário.")
 
 
+def request_elevation_with_args(extra_args: list):
+    """Dispara elevação de privilégios nativa via prompt UAC com argumentos específicos."""
+    executable = sys.executable
+    args = " ".join([f'"{a}"' for a in extra_args])
+    ret = ctypes.windll.shell32.ShellExecuteW(
+        None,
+        "runas",
+        executable,
+        args,
+        str(Path(executable).parent),
+        1
+    )
+    if ret > 32:
+        sys.exit(0)
+    else:
+        raise PermissionError("Elevação de privilégios UAC foi recusada pelo usuário.")
+
+
+def get_desktop_dir() -> Optional[Path]:
+    """Obtém o diretório real da Área de Trabalho do usuário (suportando redirecionamentos do OneDrive)."""
+    try:
+        buf = ctypes.create_unicode_buffer(wintypes.MAX_PATH)
+        if ctypes.windll.shell32.SHGetFolderPathW(None, 0, None, 0, buf) == 0 and buf.value:
+            p = Path(buf.value)
+            if p.exists():
+                return p
+    except Exception:
+        pass
+    userprofile = os.environ.get("USERPROFILE")
+    if userprofile:
+        p = Path(userprofile) / "Desktop"
+        if p.exists():
+            return p
+    return None
+
+
+def create_desktop_shortcut():
+    """Garante a existência do atalho da Central de Gestão na Área de Trabalho do usuário."""
+    try:
+        desktop = get_desktop_dir()
+        if not desktop:
+            return
+        lnk_path = desktop / "Antigravity Bridge.lnk"
+        if lnk_path.exists():
+            return
+        target = (BASE_DIR / "AntigravityBridge.exe").resolve()
+        icon_path = (BASE_DIR / "icon.ico").resolve()
+        ps_cmd = (
+            f'$ws = New-Object -ComObject WScript.Shell; '
+            f'$s = $ws.CreateShortcut("{lnk_path}"); '
+            f'$s.TargetPath = "{target}"; '
+            f'$s.WorkingDirectory = "{BASE_DIR}"; '
+            f'$s.IconLocation = "{icon_path},0"; '
+            f'$s.Description = "Antigravity Admin Bridge & Central de Gestao"; '
+            f'$s.Save()'
+        )
+        subprocess.run(
+            ["powershell.exe", "-NoProfile", "-Command", ps_cmd],
+            capture_output=True,
+            check=False,
+            creationflags=0x08000000
+        )
+    except Exception:
+        pass
+
+
 def ensure_environment_installed():
     """Garante a estrutura de diretórios e extração dos componentes essenciais."""
     BASE_DIR.mkdir(parents=True, exist_ok=True)
-    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    try:
+        CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        pass
     LOGS_DIR.mkdir(parents=True, exist_ok=True)
     QUEUE_DIR.mkdir(parents=True, exist_ok=True)
     REQUESTS_DIR.mkdir(parents=True, exist_ok=True)
@@ -148,8 +219,11 @@ def ensure_environment_installed():
         except Exception as e:
             logging.warning(f"Aviso ao copiar executável para C:\\Utilitario: {e}")
 
-    # Aplica permissões restritas exclusivas para SYSTEM no diretório de configuração
-    apply_system_only_ntfs_acls(CONFIG_DIR)
+    # Aplica permissões restritas exclusivas para SYSTEM se for Administrador
+    if is_admin():
+        apply_system_only_ntfs_acls(CONFIG_DIR)
+
+    create_desktop_shortcut()
 
 
 def register_scheduled_task() -> bool:
@@ -1125,6 +1199,12 @@ class AdminBridgeWindow(QMainWindow):
         self.setWindowState(self.windowState() & ~Qt.WindowState.WindowMinimized | Qt.WindowState.WindowActive)
         self.raise_()
         self.activateWindow()
+        try:
+            hwnd = int(self.winId())
+            ctypes.windll.user32.ShowWindow(hwnd, 9)  # SW_RESTORE
+            ctypes.windll.user32.SetForegroundWindow(hwnd)
+        except Exception:
+            pass
         self.refresh_dashboard()
 
     def closeEvent(self, event):
@@ -1401,11 +1481,25 @@ class AdminBridgeWindow(QMainWindow):
         self.btn_approve.setEnabled(False)
 
     def open_reset_dialog(self):
+        if not is_admin():
+            try:
+                request_elevation_with_args(["reset"])
+                return
+            except Exception as e:
+                QMessageBox.critical(self, "Permissão Necessária", f"Privilégios de Administrador são necessários: {e}")
+                return
         dlg = ResetWizardDialog(self.hotp_auth, self)
         dlg.exec()
         self.refresh_dashboard()
 
     def open_uninstall_dialog(self):
+        if not is_admin():
+            try:
+                request_elevation_with_args(["uninstall"])
+                return
+            except Exception as e:
+                QMessageBox.critical(self, "Permissão Necessária", f"Privilégios de Administrador são necessários: {e}")
+                return
         res = QMessageBox.question(
             self,
             "Desinstalar Utilitário",
@@ -1477,6 +1571,19 @@ def run_daemon_loop(hotp_auth: HOTPAuth):
             req_files = list(REQUESTS_DIR.glob("*.json"))
             if req_files:
                 target = req_files[0]
+                # Verifica se a solicitação possui OTP antes de retirar da fila
+                try:
+                    with open(target, "r", encoding="utf-8") as f:
+                        peek_data = json.load(f)
+                except Exception:
+                    time.sleep(0.5)
+                    continue
+
+                if not peek_data.get("otp"):
+                    # Sem OTP: é solicitação manual que requer confirmação UAC na tela do usuário
+                    time.sleep(1.0)
+                    continue
+
                 req_id = target.stem
                 proc_file = PROCESSING_DIR / f"{req_id}.json"
                 try:
@@ -1485,13 +1592,7 @@ def run_daemon_loop(hotp_auth: HOTPAuth):
                     time.sleep(0.5)
                     continue
 
-                try:
-                    with open(proc_file, "r", encoding="utf-8") as f:
-                        data = json.load(f)
-                except Exception:
-                    proc_file.unlink(missing_ok=True)
-                    time.sleep(0.5)
-                    continue
+                data = peek_data
 
                 provided_otp = data.get("otp")
                 caller_info = data.get("caller")
@@ -1816,6 +1917,7 @@ def main():
     )
     parser.add_argument("--daemon", action="store_true", help="Executa o daemon em segundo plano (modo serviço)")
     parser.add_argument("--gui", action="store_true", help="Abre a janela da Central de Gestão diretamente na tela")
+    parser.add_argument("--minimized", action="store_true", help="Inicia minimizado na bandeja do sistema")
 
     subparsers = parser.add_subparsers(dest="subcommand", help="Comandos disponíveis")
 
@@ -1852,7 +1954,7 @@ def main():
 
     # Se um subcomando CLI foi invocado
     if args.subcommand:
-        if args.subcommand in ("reset", "uninstall") and not is_admin():
+        if args.subcommand in ("setup", "reset", "uninstall") and not is_admin():
             try:
                 request_elevation()
                 return
@@ -1871,21 +1973,54 @@ def main():
     app = QApplication(sys.argv)
     app.setQuitOnLastWindowClosed(False)
 
+    # Verificação de Instância Única (Single Instance) via QLocalSocket
+    local_socket = QLocalSocket()
+    local_socket.connectToServer(LOCAL_SERVER_NAME)
+    if local_socket.waitForConnected(500):
+        # Outra instância já está ativa: solicita foco e encerra o novo processo
+        local_socket.write(b"SHOW\n")
+        local_socket.waitForBytesWritten(1000)
+        local_socket.disconnectFromServer()
+        sys.exit(0)
+
+    # Inicia escuta local para instâncias futuras
+    QLocalServer.removeServer(LOCAL_SERVER_NAME)
+    ipc_server = QLocalServer(app)
+    ipc_server.listen(LOCAL_SERVER_NAME)
+
     # Verifica se já está provisionado
     if not hotp_auth.is_provisioned():
-        # Primeira execução: abre o assistente interativo na tela
+        # Primeira execução: se não for admin, eleva para conseguir salvar chave e permissões SYSTEM
+        if not is_admin():
+            try:
+                request_elevation()
+                return
+            except Exception:
+                pass
         wizard = SetupWizardDialog(hotp_auth)
         if wizard.exec() != QDialog.DialogCode.Accepted:
             sys.exit(0)
 
     window = AdminBridgeWindow(hotp_auth)
 
-    # Se o usuário passou explicitamente --gui, abre a janela diretamente.
-    # Caso contrário, inicializa minimizado na bandeja do sistema ao lado do relógio (Requisito 2).
-    if args.gui:
-        window.show_window()
-    else:
+    def handle_ipc_activation():
+        while ipc_server.hasPendingConnections():
+            client = ipc_server.nextPendingConnection()
+            if client:
+                if client.waitForReadyRead(1000):
+                    msg = bytes(client.readAll()).decode("utf-8", errors="ignore")
+                    if "SHOW" in msg:
+                        window.show_window()
+                client.disconnectFromServer()
+
+    ipc_server.newConnection.connect(handle_ipc_activation)
+
+    # Por padrão, abre a janela diretamente na tela do usuário.
+    # Se --minimized for passado explicitamente, oculta na bandeja.
+    if args.minimized:
         window.hide()
+    else:
+        window.show_window()
 
     sys.exit(app.exec())
 
