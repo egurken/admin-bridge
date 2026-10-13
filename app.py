@@ -54,11 +54,19 @@ CONFIG_FILE = CONFIG_DIR / "hotp_config.json"
 AUTH_LOG_FILE = LOGS_DIR / "auth.log"
 
 LOGS_DIR.mkdir(parents=True, exist_ok=True)
-logging.basicConfig(
-    filename=str(LOGS_DIR / "app.log"),
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s"
-)
+root_logger = logging.getLogger()
+root_logger.setLevel(logging.INFO)
+file_handler = logging.FileHandler(str(LOGS_DIR / "app.log"), encoding="utf-8")
+file_handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
+root_logger.addHandler(file_handler)
+
+if sys.stdout is not None:
+    try:
+        console_handler = logging.StreamHandler(sys.stdout)
+        console_handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
+        root_logger.addHandler(console_handler)
+    except Exception:
+        pass
 
 
 def is_admin() -> bool:
@@ -140,11 +148,13 @@ def create_desktop_shortcut():
         icon_path = (BASE_DIR / "icon.ico").resolve()
 
         for d in desktops_to_create:
+            lnk_path = d / "Admin Bridge.lnk"
+            if lnk_path.exists():
+                continue
             # Remove atalhos antigos com nomes legados
             for old_lnk in ["Antigravity Bridge.lnk", "Antigravity Admin Bridge.lnk", "Configurar Antigravity Bridge.lnk"]:
                 (d / old_lnk).unlink(missing_ok=True)
 
-            lnk_path = d / "Admin Bridge.lnk"
             ps_cmd = (
                 f'$ws = New-Object -ComObject WScript.Shell; '
                 f'$s = $ws.CreateShortcut("{lnk_path}"); '
@@ -189,9 +199,15 @@ def ensure_environment_installed():
         except Exception as e:
             logging.warning(f"Aviso ao copiar executavel para C:\\Utilitario: {e}")
 
-    # Aplica permissoes restritas exclusivas para SYSTEM se for Administrador
-    if is_admin():
-        apply_isolated_bridge_ntfs_acls(BASE_DIR)
+    # Aplica permissoes restritas exclusivas para SYSTEM se for Administrador e nao aplicadas anteriormente
+    marker = BASE_DIR / ".acls_applied"
+    if is_admin() and not marker.exists():
+        try:
+            apply_isolated_bridge_ntfs_acls(BASE_DIR)
+            with open(marker, "w") as f:
+                f.write("ok")
+        except Exception:
+            pass
 
     create_desktop_shortcut()
 
@@ -2166,10 +2182,11 @@ class AdminBridgeWindow(QMainWindow):
             QMessageBox.information(
                 self,
                 "Reparo Concluído",
-                "As pastas e arquivos foram restaurados com sucesso.\nO assistente será iniciado agora para um novo pareamento."
+                f"{msg}\nO painel foi atualizado."
             )
-            wizard = SetupWizardDialog(self.hotp_auth, self)
-            wizard.exec()
+            if not self.hotp_auth.is_provisioned():
+                wizard = SetupWizardDialog(self.hotp_auth, self)
+                wizard.exec()
             self.refresh_dashboard()
         else:
             QMessageBox.critical(self, "Falha no Reparo", msg)
@@ -2878,10 +2895,7 @@ def main():
     if args.subcommand:
         if args.subcommand in ("setup", "reset", "uninstall") and not is_admin():
             try:
-                cli_args = [args.subcommand]
-                if getattr(args, "force", False):
-                    cli_args.append("--force")
-                request_elevation_with_args(cli_args)
+                request_elevation_with_args(sys.argv[1:])
                 return
             except Exception as e:
                 print(f"[ERRO] Permissão de Administrador necessária: {e}", file=sys.stderr)

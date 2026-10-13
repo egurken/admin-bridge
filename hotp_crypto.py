@@ -178,8 +178,23 @@ def _canonical_payload(cfg: dict) -> bytes:
     return "|".join(fields).encode("utf-8")
 
 
+_static_mesh_cache = {}
+_usn_cache = {}
+
+
 def get_file_usn(file_path: Path) -> str:
-    """Obtem o USN [Update Sequence Number] do registro NTFS usando fsutil."""
+    """Obtem o USN [Update Sequence Number] do registro NTFS usando fsutil com cache inteligente."""
+    try:
+        stat_res = file_path.stat()
+        mtime_ns = int(stat_res.st_mtime_ns)
+        size = int(stat_res.st_size)
+        cache_key = (str(file_path), mtime_ns, size)
+        if cache_key in _usn_cache:
+            return _usn_cache[cache_key]
+    except Exception:
+        return "0x0"
+
+    usn_val = None
     try:
         p = subprocess.run(
             ["fsutil", "usn", "readdata", str(file_path)],
@@ -191,21 +206,44 @@ def get_file_usn(file_path: Path) -> str:
         if p.returncode == 0:
             m = re.search(r"Usn\s*:\s*(0x[0-9a-fA-F]+)", p.stdout, re.IGNORECASE)
             if m:
-                return m.group(1).lower()
+                usn_val = m.group(1).lower()
     except Exception:
         pass
-    try:
-        stat_res = file_path.stat()
-        return hex(int(stat_res.st_mtime_ns))
-    except Exception:
-        return "0x0"
+
+    if not usn_val:
+        usn_val = hex(mtime_ns)
+
+    _usn_cache[cache_key] = usn_val
+    return usn_val
 
 
 def get_static_mesh_hash(base_dir: Path = BASE_DIR) -> str:
-    """Calcula a ancora estatica unindo o executavel e a tarefa agendada."""
+    """Calcula a ancora estatica unindo o executavel e a tarefa agendada com cache em memoria."""
+    exe_file = base_dir / "AdminBridge.exe"
+    exe_mtime = 0
+    exe_size = 0
+    if exe_file.exists():
+        try:
+            st = exe_file.stat()
+            exe_mtime = int(st.st_mtime_ns)
+            exe_size = int(st.st_size)
+        except Exception:
+            pass
+
+    task_xml = Path("C:/Windows/System32/Tasks/AdminBridge")
+    task_mtime = 0
+    try:
+        if task_xml.exists():
+            task_mtime = int(task_xml.stat().st_mtime_ns)
+    except Exception:
+        pass
+
+    cache_key = (str(base_dir), exe_mtime, exe_size, task_mtime)
+    if cache_key in _static_mesh_cache:
+        return _static_mesh_cache[cache_key]
+
     components = []
     # 1. Executavel principal
-    exe_file = base_dir / "AdminBridge.exe"
     if exe_file.exists():
         try:
             with open(exe_file, "rb") as ef:
@@ -216,7 +254,6 @@ def get_static_mesh_hash(base_dir: Path = BASE_DIR) -> str:
         components.append("exe_not_installed")
 
     # 2. XML da Tarefa Agendada no Windows
-    task_xml = Path("C:/Windows/System32/Tasks/AdminBridge")
     try:
         if task_xml.exists():
             with open(task_xml, "rb") as tf:
@@ -232,7 +269,9 @@ def get_static_mesh_hash(base_dir: Path = BASE_DIR) -> str:
     components.append(hashlib.sha256(DPAPI_ENTROPY).hexdigest())
 
     combined = "|".join(components).encode("utf-8")
-    return hashlib.sha256(combined).hexdigest()
+    result = hashlib.sha256(combined).hexdigest()
+    _static_mesh_cache[cache_key] = result
+    return result
 
 
 def compute_integrity_mac(cfg: dict) -> str:
@@ -410,14 +449,16 @@ def create_detached_signature_file(config_file: Path, cfg: dict) -> Path:
             "signer": "AdminBridge DPAPI Machine Seal"
         }
         if sig_file.exists():
-            subprocess.run(["attrib", "-r", str(sig_file)], capture_output=True, check=False, creationflags=0x08000000)
-        with open(sig_file, "w", encoding="utf-8") as f:
+            try:
+                ctypes.windll.kernel32.SetFileAttributesW(str(sig_file), 0x80)
+            except Exception:
+                pass
+        tmp_sig = sig_file.with_suffix(".sig.tmp")
+        with open(tmp_sig, "w", encoding="utf-8") as f:
             json.dump(sig_payload, f, indent=2, ensure_ascii=False)
-        if config_file.parent == CONFIG_DIR:
-            subprocess.run(["icacls", str(sig_file), "/inheritance:r", "/grant:r", "*S-1-5-18:(F)", "*S-1-5-32-544:(R)", "*S-1-5-32-545:(R)"], capture_output=True, check=False, creationflags=0x08000000)
-            subprocess.run(["attrib", "+r", str(sig_file)], capture_output=True, check=False, creationflags=0x08000000)
-    except Exception:
-        pass
+        tmp_sig.replace(sig_file)
+    except Exception as e:
+        logging.warning(f"Aviso ao gerar assinatura desanexada: {e}")
     return sig_file
 
 
@@ -588,16 +629,12 @@ def apply_isolated_bridge_ntfs_acls(base_dir: Path = BASE_DIR):
     except Exception:
         pass
 
-    # 1. Blindagem estrita de config - somente SYSTEM total e Admins leitura
+    # 1. Blindagem estrita de config - SYSTEM e Administradores total, Usuarios somente leitura
     try:
         if config_dir.exists():
             cfg_str = str(config_dir)
-            cmd_cfg = f'icacls "{cfg_str}" /inheritance:r /grant:r "*S-1-5-18:(OI)(CI)(F)" "*S-1-5-32-544:(OI)(CI)(R)"'
+            cmd_cfg = f'icacls "{cfg_str}" /inheritance:r /grant:r "*S-1-5-18:(OI)(CI)(F)" "*S-1-5-32-544:(OI)(CI)(F)" "*S-1-5-32-545:(OI)(CI)(R)"'
             subprocess.run(["cmd.exe", "/c", cmd_cfg], capture_output=True, check=False, creationflags=0x08000000)
-            if config_file.exists():
-                cmd_cf = f'icacls "{config_file}" /inheritance:r /grant:r "*S-1-5-18:(F)" "*S-1-5-32-544:(R)"'
-                subprocess.run(["cmd.exe", "/c", cmd_cf], capture_output=True, check=False, creationflags=0x08000000)
-                subprocess.run(["attrib", "+r", str(config_file)], capture_output=True, check=False, creationflags=0x08000000)
     except Exception:
         pass
 
@@ -605,7 +642,7 @@ def apply_isolated_bridge_ntfs_acls(base_dir: Path = BASE_DIR):
     try:
         if scripts_dir.exists():
             sc_str = str(scripts_dir)
-            cmd_sc = f'icacls "{sc_str}" /inheritance:r /grant:r "*S-1-5-18:(OI)(CI)(F)" "*S-1-5-32-544:(OI)(CI)(R)"'
+            cmd_sc = f'icacls "{sc_str}" /inheritance:r /grant:r "*S-1-5-18:(OI)(CI)(F)" "*S-1-5-32-544:(OI)(CI)(F)"'
             subprocess.run(["cmd.exe", "/c", cmd_sc], capture_output=True, check=False, creationflags=0x08000000)
     except Exception:
         pass
@@ -614,7 +651,7 @@ def apply_isolated_bridge_ntfs_acls(base_dir: Path = BASE_DIR):
     try:
         if logs_dir.exists():
             l_str = str(logs_dir)
-            cmd_l = f'icacls "{l_str}" /inheritance:r /grant:r "*S-1-5-18:(OI)(CI)(F)" "*S-1-5-32-544:(OI)(CI)(R)"'
+            cmd_l = f'icacls "{l_str}" /inheritance:r /grant:r "*S-1-5-18:(OI)(CI)(F)" "*S-1-5-32-544:(OI)(CI)(F)"'
             subprocess.run(["cmd.exe", "/c", cmd_l], capture_output=True, check=False, creationflags=0x08000000)
     except Exception:
         pass

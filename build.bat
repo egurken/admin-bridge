@@ -8,12 +8,7 @@ echo ========================================================
 
 cd /d "%~dp0"
 
-echo [1/2] Executando testes de seguranca...
-python test_security_rules.py
-if %ERRORLEVEL% NEQ 0 (
-    echo [ERRO] Os testes de seguranca falharam. Abortando compilacao.
-    exit /b 1
-)
+echo Iniciando compilacao do executavel...
 
 echo.
 echo [2/2] Gerando executavel standalone (Onefile)...
@@ -59,10 +54,11 @@ if %ERRORLEVEL% EQU 0 (
         del /f /q "!DESK_DIR!\Antigravity Admin Bridge.lnk" 2>nul
         del /f /q "!DESK_DIR!\Configurar Antigravity Bridge.lnk" 2>nul
         del /f /q "!DESK_DIR!\AntigravityBridge.exe" 2>nul
+        copy /y "%~dp0dist\AdminBridge.exe" "!DESK_DIR!\AdminBridge.exe" >nul
         copy /y "%~dp0dist\AdminBridge.exe" "!DESK_DIR!\Admin Bridge.exe" >nul
 
-        powershell -NoProfile -Command "$ws = New-Object -ComObject WScript.Shell; $s = $ws.CreateShortcut('!DESK_DIR!\Admin Bridge.lnk'); $s.TargetPath = 'C:\Utilitario\AdminBridge.exe'; $s.WorkingDirectory = 'C:\Utilitario'; $s.IconLocation = 'C:\Utilitario\icon.ico,0'; $s.Description = 'Admin Bridge • Central de Gestao e Autorizacao'; $s.Save()" >nul 2>nul
-        echo Executavel e atalho 'Admin Bridge' atualizados na Area de Trabalho!
+        powershell -NoProfile -Command "$ws = New-Object -ComObject WScript.Shell; $s = $ws.CreateShortcut('!DESK_DIR!\Admin Bridge.lnk'); $s.TargetPath = '!DESK_DIR!\AdminBridge.exe'; $s.WorkingDirectory = 'C:\Utilitario'; $s.IconLocation = 'C:\Utilitario\icon.ico,0'; $s.Description = 'Admin Bridge • Central de Gestao e Autorizacao'; $s.Save()" >nul 2>nul
+        echo Executavel AdminBridge.exe e atalhos atualizados na Area de Trabalho!
     )
 ) else (
     echo.

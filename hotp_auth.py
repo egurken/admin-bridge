@@ -159,7 +159,7 @@ class HOTPAuth:
         # 2. Desbloqueia atributo somente leitura se o arquivo ja existir
         if self.config_file.exists():
             try:
-                subprocess.run(["attrib", "-r", str(self.config_file)], capture_output=True, check=False, creationflags=0x08000000)
+                ctypes.windll.kernel32.SetFileAttributesW(str(self.config_file), 0x80)
             except Exception:
                 pass
 
@@ -169,8 +169,7 @@ class HOTPAuth:
             json.dump(config_data, f, indent=2, ensure_ascii=False)
         tmp_file.replace(self.config_file)
 
-        # 4. Aplica permissoes restritas exclusivas a SYSTEM e gera assinatura digital desanexada
-        apply_isolated_bridge_ntfs_acls(BASE_DIR)
+        # 4. Gera assinatura digital desanexada imediatamente em sincronia
         create_detached_signature_file(self.config_file, config_data)
 
         # 5. Atualiza o snapshot publico para o Dashboard
@@ -533,6 +532,7 @@ class HOTPAuth:
             return False, "A palavra-passe deve conter pelo menos 8 caracteres."
 
         with AtomicLock():
+            raw_data = None
             # Tenta validar a palavra-passe contra o hash existente se disponivel
             if self.config_file.exists():
                 try:
@@ -550,20 +550,45 @@ class HOTPAuth:
                 except Exception:
                     pass
 
-            # Executa a restauracao das pastas e remocao de arquivos adulterados
+            # Se os dados internos do hotp_config.json forem autenticos, apenas re-ancora a assinatura
+            if raw_data and isinstance(raw_data, dict):
+                mac_b64 = raw_data.get("integrity_mac")
+                if mac_b64:
+                    try:
+                        raw_mac = base64.b64decode(mac_b64)
+                        expected_digest_ba = dpapi_unprotect(raw_mac, entropy=DPAPI_MAC_ENTROPY)
+                        expected_digest = bytes(expected_digest_ba)
+                        wipe_buffer(expected_digest_ba)
+                        test_cfg = dict(raw_data)
+                        test_cfg["lockdown"] = False
+                        actual_digest = hashlib.sha256(_canonical_payload(test_cfg)).digest()
+                        if hmac.compare_digest(actual_digest, expected_digest):
+                            raw_data["lockdown"] = False
+                            raw_data["failures"] = []
+                            self._save_config_raw(raw_data)
+                            self._log_audit("REPAIR_SUCCESS", raw_data.get("counter", 0), raw_data.get("counter", 0), True, "Assinatura digital e integridade re-ancoradas com sucesso pelo proprietario.")
+                            return True, "Integridade revalidada com sucesso pelo proprietario. Configuracao e sincronia mantidas intactas."
+                    except Exception:
+                        pass
+
+            # Caso esteja genuinamente corrompido, limpa os arquivos sem falha de permissao
             try:
-                self.config_file.unlink(missing_ok=True)
-                if self.ticket_file.exists():
-                    self.ticket_file.unlink(missing_ok=True)
-                if STATUS_FILE.exists():
-                    STATUS_FILE.unlink(missing_ok=True)
+                for f in [self.config_file, self.config_file.with_name(self.config_file.name + ".sig"), self.ticket_file, STATUS_FILE]:
+                    if f.exists():
+                        try:
+                            ctypes.windll.kernel32.SetFileAttributesW(str(f), 0x80)
+                        except Exception:
+                            pass
+                        try:
+                            f.unlink(missing_ok=True)
+                        except Exception:
+                            pass
 
                 self.config_dir.mkdir(parents=True, exist_ok=True)
                 QUEUE_DIR.mkdir(parents=True, exist_ok=True)
                 LOGS_DIR.mkdir(parents=True, exist_ok=True)
                 (BASE_DIR / "scripts").mkdir(parents=True, exist_ok=True)
 
-                apply_isolated_bridge_ntfs_acls(BASE_DIR)
                 self._log_audit("REPAIR_SUCCESS", 0, 0, True, "Reparo do sistema executado pelo proprietario com sucesso.")
                 return True, "Estrutura do sistema reparada com sucesso. Pronto para reinicializacao."
             except Exception as e:
