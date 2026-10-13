@@ -32,6 +32,7 @@ from hotp_crypto import (
     wipe_buffer, apply_system_only_ntfs_acls, restore_ntfs_acls_for_removal,
     verify_caller_origin, generate_physical_challenge, read_passive_metadata
 )
+from app_icon import get_app_icon
 
 LOCAL_SERVER_NAME = "AntigravityBridge_GUI_SingleInstance"
 BASE_DIR = Path("C:/Utilitario")
@@ -871,12 +872,11 @@ class AdminBridgeWindow(QMainWindow):
         self.exec_thread = None
 
         self.setWindowTitle("Antigravity Admin Bridge • Central de Gestão")
-        self.resize(780, 680)
-        self.setMinimumSize(680, 560)
+        self.resize(760, 600)
+        self.setMinimumSize(660, 480)
 
-        icon_path = str(BASE_DIR / "icon.ico")
-        if os.path.exists(icon_path):
-            self.setWindowIcon(QIcon(icon_path))
+        app_icon = get_app_icon()
+        self.setWindowIcon(app_icon)
 
         self.init_ui()
         self.init_tray()
@@ -974,6 +974,26 @@ class AdminBridgeWindow(QMainWindow):
                 background-color: #f38ba8;
                 color: #11111b;
             }
+            QPushButton#btnIconAction {
+                background-color: #181825;
+                color: #cdd6f4;
+                border: 1px solid #313244;
+                border-radius: 6px;
+                font-size: 15px;
+                padding: 4px;
+                min-width: 32px;
+                max-width: 32px;
+                min-height: 32px;
+                max-height: 32px;
+            }
+            QPushButton#btnIconAction:hover {
+                background-color: #313244;
+                border-color: #89b4fa;
+            }
+            QPushButton#btnIconAction::menu-indicator {
+                image: none;
+                width: 0px;
+            }
             QTableWidget {
                 background-color: #181825;
                 color: #cdd6f4;
@@ -996,8 +1016,86 @@ class AdminBridgeWindow(QMainWindow):
         """)
 
         main_layout = QVBoxLayout(central_widget)
-        main_layout.setContentsMargins(20, 20, 20, 20)
-        main_layout.setSpacing(14)
+        main_layout.setContentsMargins(18, 16, 18, 16)
+        main_layout.setSpacing(12)
+
+        # -------------------------------------------------------------
+        # BARRA DE TÍTULO SUPERIOR & AÇÕES (🔄 e ⚙️)
+        # -------------------------------------------------------------
+        top_bar = QHBoxLayout()
+        top_bar.setContentsMargins(0, 0, 0, 2)
+
+        title_layout = QVBoxLayout()
+        title_layout.setSpacing(1)
+        lbl_app_title = QLabel("Antigravity Admin Bridge")
+        lbl_app_title.setStyleSheet("font-size: 16px; font-weight: bold; color: #cdd6f4;")
+        lbl_app_sub = QLabel("Central de Gestão e Autorização Elevada HOTP")
+        lbl_app_sub.setStyleSheet("font-size: 11px; color: #a6adc8;")
+        title_layout.addWidget(lbl_app_title)
+        title_layout.addWidget(lbl_app_sub)
+        top_bar.addLayout(title_layout)
+
+        top_bar.addStretch()
+
+        # Botão Recarregar (apenas a setinha 🔄)
+        self.btn_refresh = QPushButton("🔄")
+        self.btn_refresh.setObjectName("btnIconAction")
+        self.btn_refresh.setToolTip("Recarregar Histórico e Métricas")
+        self.btn_refresh.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+        self.btn_refresh.clicked.connect(self.refresh_dashboard)
+        top_bar.addWidget(self.btn_refresh)
+
+        # Botão Engrenagem (⚙️ com menu suspenso para Reset, Desinstalação e Status)
+        self.btn_settings = QPushButton("⚙️")
+        self.btn_settings.setObjectName("btnIconAction")
+        self.btn_settings.setToolTip("Opções e Configurações")
+        self.btn_settings.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+
+        self.settings_menu = QMenu(self)
+        self.settings_menu.setStyleSheet("""
+            QMenu {
+                background-color: #1e1e2e;
+                color: #cdd6f4;
+                border: 1px solid #313244;
+                border-radius: 6px;
+                padding: 4px;
+                font-family: 'Segoe UI', system-ui, sans-serif;
+                font-size: 12px;
+            }
+            QMenu::item {
+                padding: 6px 16px;
+                border-radius: 4px;
+            }
+            QMenu::item:selected {
+                background-color: #313244;
+                color: #89b4fa;
+            }
+        """)
+
+        act_status = QAction("📋 Status Detalhado do Contador", self)
+        act_status.triggered.connect(self.show_counter_status_dialog)
+        self.settings_menu.addAction(act_status)
+
+        self.settings_menu.addSeparator()
+
+        act_reset = QAction("🔄 Resetar HOTP (Revogar Privilégios)...", self)
+        act_reset.triggered.connect(self.open_reset_dialog)
+        self.settings_menu.addAction(act_reset)
+
+        act_uninstall = QAction("🗑️ Desinstalar Utilitário...", self)
+        act_uninstall.triggered.connect(self.open_uninstall_dialog)
+        self.settings_menu.addAction(act_uninstall)
+
+        self.settings_menu.addSeparator()
+
+        act_quit = QAction("❌ Encerrar Utilitário", self)
+        act_quit.triggered.connect(self.quit_app)
+        self.settings_menu.addAction(act_quit)
+
+        self.btn_settings.setMenu(self.settings_menu)
+        top_bar.addWidget(self.btn_settings)
+
+        main_layout.addLayout(top_bar)
 
         # -------------------------------------------------------------
         # CABEÇALHO & PAINEL SUPERIOR DE MÉTRICAS (REQUISITO 2a)
@@ -1052,17 +1150,18 @@ class AdminBridgeWindow(QMainWindow):
         self.card_pending = QFrame()
         self.card_pending.setProperty("class", "card")
         pending_layout = QVBoxLayout(self.card_pending)
-        pending_layout.setSpacing(10)
+        pending_layout.setContentsMargins(14, 12, 14, 12)
+        pending_layout.setSpacing(8)
 
         header_pending = QHBoxLayout()
         self.lbl_req_title = QLabel("Aguardando solicitações...")
-        self.lbl_req_title.setStyleSheet("font-size: 15px; font-weight: bold; color: #89b4fa;")
+        self.lbl_req_title.setStyleSheet("font-size: 14px; font-weight: bold; color: #89b4fa;")
         header_pending.addWidget(self.lbl_req_title)
 
         header_pending.addStretch()
 
         self.lbl_badge = QLabel("INATIVO")
-        self.lbl_badge.setStyleSheet("background-color: #313244; color: #cdd6f4; padding: 4px 10px; border-radius: 4px; font-size: 11px; font-weight: bold;")
+        self.lbl_badge.setStyleSheet("background-color: #313244; color: #a6adc8; padding: 3px 8px; border-radius: 4px; font-size: 11px; font-weight: bold;")
         header_pending.addWidget(self.lbl_badge)
         pending_layout.addLayout(header_pending)
 
@@ -1073,35 +1172,40 @@ class AdminBridgeWindow(QMainWindow):
         self.code_viewer = QPlainTextEdit()
         self.code_viewer.setObjectName("codeViewer")
         self.code_viewer.setReadOnly(True)
-        self.code_viewer.setFixedHeight(120)
+        self.code_viewer.setFixedHeight(110)
         self.code_viewer.setPlaceholderText("Nenhum comando pendente de aprovação.")
+        self.code_viewer.hide()
         pending_layout.addWidget(self.code_viewer)
 
-        btn_box = QHBoxLayout()
+        self.btn_box_widget = QWidget()
+        btn_box = QHBoxLayout(self.btn_box_widget)
+        btn_box.setContentsMargins(0, 4, 0, 0)
         btn_box.setSpacing(10)
 
-        self.btn_reject = QPushButton("Rejeitar Solicitação")
+        self.btn_reject = QPushButton("✖ Rejeitar Solicitação")
         self.btn_reject.setObjectName("btnReject")
         self.btn_reject.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
         self.btn_reject.clicked.connect(self.reject_request)
         self.btn_reject.setEnabled(False)
         btn_box.addWidget(self.btn_reject)
 
-        self.btn_approve = QPushButton("Aprovar & Executar via UAC")
+        self.btn_approve = QPushButton("✔ Aprovar & Executar via UAC")
         self.btn_approve.setObjectName("btnApprove")
         self.btn_approve.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
         self.btn_approve.clicked.connect(self.approve_request)
         self.btn_approve.setEnabled(False)
         btn_box.addWidget(self.btn_approve)
 
-        pending_layout.addLayout(btn_box)
+        self.btn_box_widget.hide()
+        pending_layout.addWidget(self.btn_box_widget)
+
         main_layout.addWidget(self.card_pending)
 
         # -------------------------------------------------------------
         # TABELA DE HISTÓRICO RECENTE (REQUISITO 2b)
         # -------------------------------------------------------------
-        lbl_hist_title = QLabel("📋 Histórico Recente de Requisições & Auditoria")
-        lbl_hist_title.setStyleSheet("font-size: 13px; font-weight: bold; color: #a6adc8; margin-top: 6px;")
+        lbl_hist_title = QLabel("📜 Histórico Recente de Requisições & Auditoria")
+        lbl_hist_title.setStyleSheet("font-size: 13px; font-weight: bold; color: #a6adc8; margin-top: 4px;")
         main_layout.addWidget(lbl_hist_title)
 
         self.table_history = QTableWidget()
@@ -1115,75 +1219,57 @@ class AdminBridgeWindow(QMainWindow):
         self.table_history.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         main_layout.addWidget(self.table_history, stretch=1)
 
-        # -------------------------------------------------------------
-        # PAINEL DE AÇÕES (REQUISITO 2c)
-        # -------------------------------------------------------------
-        action_layout = QHBoxLayout()
-        action_layout.setSpacing(10)
-
-        self.btn_reset_key = QPushButton("🔄 Resetar HOTP (Revogar Privilégios)")
-        self.btn_reset_key.setObjectName("btnDanger")
-        self.btn_reset_key.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
-        self.btn_reset_key.clicked.connect(self.open_reset_dialog)
-        action_layout.addWidget(self.btn_reset_key)
-
-        self.btn_uninstall = QPushButton("🗑️ Desinstalar Utilitário")
-        self.btn_uninstall.setObjectName("btnDanger")
-        self.btn_uninstall.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
-        self.btn_uninstall.clicked.connect(self.open_uninstall_dialog)
-        action_layout.addWidget(self.btn_uninstall)
-
-        action_layout.addStretch()
-
-        self.btn_refresh = QPushButton("🔃 Recarregar Histórico")
-        self.btn_refresh.setObjectName("btnAction")
-        self.btn_refresh.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
-        self.btn_refresh.clicked.connect(self.refresh_dashboard)
-        action_layout.addWidget(self.btn_refresh)
-
-        self.btn_minimize = QPushButton("Minimizar para a Bandeja")
-        self.btn_minimize.setObjectName("btnAction")
-        self.btn_minimize.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
-        self.btn_minimize.clicked.connect(self.hide)
-        action_layout.addWidget(self.btn_minimize)
-
-        main_layout.addLayout(action_layout)
-
     def init_tray(self):
         self.tray_icon = QSystemTrayIcon(self)
         self.tray_icon.setToolTip("Antigravity Admin Bridge")
-
-        icon_path = str(BASE_DIR / "icon.ico")
-        if os.path.exists(icon_path):
-            self.tray_icon.setIcon(QIcon(icon_path))
+        app_icon = get_app_icon()
+        self.tray_icon.setIcon(app_icon)
 
         tray_menu = QMenu()
+        tray_menu.setStyleSheet("""
+            QMenu {
+                background-color: #1e1e2e;
+                color: #cdd6f4;
+                border: 1px solid #313244;
+                border-radius: 6px;
+                padding: 4px;
+                font-family: 'Segoe UI', system-ui, sans-serif;
+                font-size: 12px;
+            }
+            QMenu::item {
+                padding: 6px 14px;
+                border-radius: 4px;
+            }
+            QMenu::item:selected {
+                background-color: #313244;
+                color: #89b4fa;
+            }
+        """)
         open_action = QAction("Abrir Central de Gestão", self)
         open_action.triggered.connect(self.show_window)
         tray_menu.addAction(open_action)
 
-        status_action = QAction("Status do Contador", self)
+        status_action = QAction("📋 Status do Contador", self)
         status_action.triggered.connect(self.show_counter_status_dialog)
         tray_menu.addAction(status_action)
 
         tray_menu.addSeparator()
 
-        reset_action = QAction("Resetar HOTP (Revogar Privilégios)", self)
+        reset_action = QAction("🔄 Resetar HOTP (Revogar Privilégios)...", self)
         reset_action.triggered.connect(self.open_reset_dialog)
         tray_menu.addAction(reset_action)
 
-        uninstall_action = QAction("Desinstalar Utilitário", self)
+        uninstall_action = QAction("🗑️ Desinstalar Utilitário...", self)
         uninstall_action.triggered.connect(self.open_uninstall_dialog)
         tray_menu.addAction(uninstall_action)
 
         tray_menu.addSeparator()
 
-        quit_action = QAction("Sair", self)
+        quit_action = QAction("❌ Encerrar Utilitário", self)
         quit_action.triggered.connect(self.quit_app)
         tray_menu.addAction(quit_action)
 
         self.tray_icon.setContextMenu(tray_menu)
-        # Clique com botão esquerdo abre a janela da Central de Gestão
         self.tray_icon.activated.connect(self.on_tray_activated)
         self.tray_icon.show()
 
@@ -1369,6 +1455,8 @@ class AdminBridgeWindow(QMainWindow):
         self.lbl_badge.setStyleSheet("background-color: #f9e2af; color: #11111b; padding: 4px 10px; border-radius: 4px;")
 
         self.code_viewer.setPlainText(code)
+        self.code_viewer.show()
+        self.btn_box_widget.show()
         self.btn_reject.setEnabled(True)
         self.btn_approve.setEnabled(True)
 
@@ -1397,8 +1485,8 @@ class AdminBridgeWindow(QMainWindow):
         self.lbl_badge.setStyleSheet("background-color: #a6e3a1; color: #11111b; padding: 4px 10px; border-radius: 4px;")
 
         self.code_viewer.setPlainText(code)
-        self.btn_reject.setEnabled(False)
-        self.btn_approve.setEnabled(False)
+        self.code_viewer.show()
+        self.btn_box_widget.hide()
 
         self.exec_thread = ExecutionThread(self.current_request, int(self.winId()), force_uac=False)
         self.exec_thread.finished_signal.connect(self.on_execution_finished)
@@ -1466,6 +1554,8 @@ class AdminBridgeWindow(QMainWindow):
             self.lbl_badge.setStyleSheet("background-color: #f38ba8; color: #11111b; padding: 4px 10px; border-radius: 4px;")
             self.code_viewer.setPlainText(f"=== SAÍDA DA EXECUÇÃO (CÓDIGO {exit_code}) ===\n\n{output_data}")
 
+        self.code_viewer.show()
+        self.btn_box_widget.hide()
         self.refresh_dashboard()
         QTimer.singleShot(2500, self.reset_ui)
 
@@ -1475,8 +1565,10 @@ class AdminBridgeWindow(QMainWindow):
         self.lbl_req_title.setText("Aguardando solicitações...")
         self.lbl_req_sub.setText("O assistente Antigravity enviará solicitações aqui quando precisar executar comandos.")
         self.lbl_badge.setText("INATIVO")
-        self.lbl_badge.setStyleSheet("background-color: #313244; color: #cdd6f4; padding: 4px 10px; border-radius: 4px;")
+        self.lbl_badge.setStyleSheet("background-color: #313244; color: #a6adc8; padding: 3px 8px; border-radius: 4px; font-size: 11px; font-weight: bold;")
         self.code_viewer.clear()
+        self.code_viewer.hide()
+        self.btn_box_widget.hide()
         self.btn_reject.setEnabled(False)
         self.btn_approve.setEnabled(False)
 
@@ -1970,8 +2062,16 @@ def main():
         return
 
     # Inicia a Interface Gráfica PyQt6 (System Tray & Dashboard)
+    try:
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("antigravity.adminbridge.gui.2.0")
+    except Exception:
+        pass
+
     app = QApplication(sys.argv)
     app.setQuitOnLastWindowClosed(False)
+    app_icon = get_app_icon()
+    if not app_icon.isNull():
+        app.setWindowIcon(app_icon)
 
     # Verificação de Instância Única (Single Instance) via QLocalSocket
     local_socket = QLocalSocket()

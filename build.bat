@@ -20,11 +20,12 @@ echo [2/2] Gerando executavel standalone (Onefile)...
 python -m PyInstaller ^
     --noconsole ^
     --onefile ^
-    --icon="%~dp0icon.ico" ^
+    --icon="icon.ico" ^
+    --add-data="icon.ico;." ^
     --name="AntigravityBridge" ^
-    --distpath="%~dp0dist" ^
-    --workpath="%~dp0build" ^
-    --specpath="%~dp0" ^
+    --distpath="dist" ^
+    --workpath="build" ^
+    --specpath="." ^
     --exclude-module=torch ^
     --exclude-module=torchvision ^
     --exclude-module=cv2 ^
@@ -48,6 +49,10 @@ if %ERRORLEVEL% EQU 0 (
 
     if defined DESK_DIR (
         echo Copiando para a Area de Trabalho: !DESK_DIR!\AntigravityBridge.exe
+        if exist "!DESK_DIR!\AntigravityBridge.exe" (
+            del /f /q "!DESK_DIR!\AntigravityBridge.old.exe" 2>nul
+            move /y "!DESK_DIR!\AntigravityBridge.exe" "!DESK_DIR!\AntigravityBridge.old.exe" >nul 2>nul
+        )
         copy /y "%~dp0dist\AntigravityBridge.exe" "!DESK_DIR!\AntigravityBridge.exe" >nul
         echo Executavel copiado para a Area de Trabalho com sucesso!
     )
