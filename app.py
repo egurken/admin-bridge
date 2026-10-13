@@ -2191,10 +2191,10 @@ def run_cli_client(args, hotp_auth: HOTPAuth):
         print("=" * 60)
         print(f"  Contador Atual:           {st.get('counter', 0)}")
         print(f"  Estado do Serviço:        {st.get('status_text', 'Ativo')}")
-        print(f"  Provisionado:             {'SIM (Flag=1)' if st.get('provisioned_flag') == 1 else 'NÃO (Flag=0)'}")
+        print(f"  Provisionado:             {'SIM - Flag=1' if st.get('provisioned_flag') == 1 else 'NÃO - Flag=0'}")
         print(f"  Lockdown Fail-Safe:       {'ATIVADO' if st.get('lockdown') else 'NORMAL'}")
-        print(f"  Falhas Recentes (5m):     {st.get('recent_failures', 0)} / 3")
-        print(f"  Integridade do Estado:    {'Íntegro' if not st.get('tampered') else 'VIOLADO (Adulterado)'}")
+        print(f"  Falhas Recentes em 5 min: {st.get('recent_failures', 0)} / 3")
+        print(f"  Integridade do Estado:    {'Íntegro' if not st.get('tampered') else 'VIOLADO - Adulterado'}")
         print(f"  Último Uso:               {st.get('last_used_at') or 'Nenhum'}")
         print("=" * 60)
         sys.exit(0)
@@ -2204,14 +2204,14 @@ def run_cli_client(args, hotp_auth: HOTPAuth):
         lookback = getattr(args, "lookback", None)
         res = hotp_auth.diagnose_otp_sync(args.otp, max_lookahead=min(lookahead, 10), max_lookback=lookback)
         print("=" * 65)
-        print("          DIAGNÓSTICO DE SINCRONIA HOTP (PASSIVO)")
+        print("          DIAGNÓSTICO E SINCRONIZAÇÃO HOTP")
         print("=" * 65)
         if res.get("success"):
             st_badge = res.get("status_label", res.get("status", "").upper())
             print(f"  Diagnóstico:        {st_badge}")
             print(f"  Contador no PC:     #{res.get('current_counter')}")
             print(f"  Contador no App:    #{res.get('matched_counter')}")
-            print(f"  Próximo OTP:        #{res.get('next_counter')}")
+            print(f"  Próximo Contador:   #{res.get('next_counter')}")
             print("-" * 65)
             if res.get("summary"):
                 print(f"  Resumo:             {res.get('summary')}")
@@ -2223,6 +2223,8 @@ def run_cli_client(args, hotp_auth: HOTPAuth):
             print(f"  Status:             {res.get('status_label', 'NÃO ENCONTRADO')}")
             if res.get("current_counter") is not None:
                 print(f"  Contador no PC:     #{res.get('current_counter')}")
+            if res.get("next_counter") is not None:
+                print(f"  Próximo Contador:   #{res.get('next_counter')}")
             print("-" * 65)
             if res.get("summary"):
                 print(f"  Resumo:             {res.get('summary')}")
@@ -2231,7 +2233,8 @@ def run_cli_client(args, hotp_auth: HOTPAuth):
             print("-" * 65)
             print(f"  {res.get('message', res.get('error'))}")
         print("=" * 65)
-        print("  [INFO]: O contador não foi avançado. Verificação 100% segura.")
+        if res.get("next_counter") is not None:
+            print(f"  [INFO]: Contador atualizado no sistema para #{res.get('next_counter')}.")
         print("=" * 65)
         sys.exit(0 if res.get("success") else 1)
 
@@ -2289,7 +2292,7 @@ def run_cli_client(args, hotp_auth: HOTPAuth):
     elif args.subcommand == "uninstall":
         force = getattr(args, "force", False)
         if not force:
-            ans = safe_input("Tem certeza que deseja desinstalar completamente o utilitário? (s/N): ").strip().lower()
+            ans = safe_input("Tem certeza que deseja desinstalar completamente o utilitário? [s/N]: ").strip().lower()
             if ans not in ("s", "sim", "y", "yes"):
                 print("Operação cancelada.")
                 sys.exit(0)
@@ -2330,12 +2333,14 @@ def run_cli_client(args, hotp_auth: HOTPAuth):
         RESPONSES_DIR.mkdir(parents=True, exist_ok=True)
 
         req_id = str(uuid.uuid4())
+        code_hash = hashlib.sha256(args.code.encode("utf-8")).hexdigest()
         payload = {
             "id": req_id,
             "title": args.title or "Comando CLI",
             "description": args.description or "Execução via terminal",
             "script_type": args.type or "cmd",
             "code": args.code,
+            "code_hash": code_hash,
             "otp": args.otp,
             "preauth_token": getattr(args, "preauth_token", None),
             "timeout": args.timeout or 120,
