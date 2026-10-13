@@ -83,12 +83,58 @@ def main():
     parser = argparse.ArgumentParser(description="Central de Status e Gerenciamento HOTP (RFC 4226)")
     parser.add_argument("--status", action="store_true", help="Consulta os metadados do contador sem avançá-lo")
     parser.add_argument("--reset", action="store_true", help="Executa a revogação de privilégios e reset da chave")
+    parser.add_argument("--provision", action="store_true", help="Executa o aprovisionamento inicial 100% via terminal")
+    parser.add_argument("--password", help="Palavra-passe de recuperação")
     args = parser.parse_args()
 
     auth = HOTPAuth()
 
     if args.reset:
         interactive_reset(auth)
+        sys.exit(0)
+
+    if args.provision:
+        if auth.is_provisioned():
+            print("[AVISO] Utilitário já provisionado. Use --reset para redefinir.")
+            sys.exit(1)
+
+        pw = args.password
+        if not pw:
+            try:
+                pw = getpass.getpass("Defina a Palavra-passe de Recuperação (mínimo 8 caracteres): ").strip()
+                pw_conf = getpass.getpass("Confirme a Palavra-passe: ").strip()
+            except Exception:
+                pw = input("Defina a Palavra-passe de Recuperação (mínimo 8 caracteres): ").strip()
+                pw_conf = input("Confirme a Palavra-passe: ").strip()
+            if pw != pw_conf:
+                print("[ERRO] As senhas digitadas não coincidem.", file=sys.stderr)
+                sys.exit(1)
+
+        if len(pw) < 8:
+            print("[ERRO] A senha deve ter no mínimo 8 caracteres.", file=sys.stderr)
+            sys.exit(1)
+
+        import qrcode
+        try:
+            sys.stdout.reconfigure(encoding="utf-8")
+        except Exception:
+            pass
+
+        caller = get_current_caller_info()
+        res = auth.provision(pw, caller_info=caller)
+        print("\n" + "=" * 65)
+        print("          PROVISIONAMENTO HOTP VIA TERMINAL CONCLUÍDO")
+        print("=" * 65)
+        print("  ESCANEE O QR CODE COM O CELULAR:")
+        print("-" * 65 + "\n")
+        qr = qrcode.QRCode(box_size=1, border=1)
+        qr.add_data(res["uri"])
+        qr.make(fit=True)
+        qr.print_ascii(out=sys.stdout, invert=True)
+        print("\n" + "-" * 65)
+        print(f"  Chave Secreta: {res['secret_base32']}")
+        print(f"  URI OTPAUTH:   {res['uri']}")
+        print("=" * 65)
         sys.exit(0)
 
     print_status(auth)

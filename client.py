@@ -142,6 +142,17 @@ def main():
     # Subcomando: start
     subparsers.add_parser("start", help="Inicia o utilitário em segundo plano")
 
+    # Subcomando: setup
+    p_setup = subparsers.add_parser("setup", help="Executa o provisionamento inicial via terminal sem abrir janelas")
+    p_setup.add_argument("--password", help="Palavra-passe de recuperação")
+
+    # Subcomando: reset
+    subparsers.add_parser("reset", help="Executa o reset e revogação de privilégios via terminal")
+
+    # Subcomando: uninstall
+    p_uninst = subparsers.add_parser("uninstall", help="Desinstala o utilitário completamente")
+    p_uninst.add_argument("--force", action="store_true", help="Força desinstalação sem confirmação")
+
     # Subcomando: run
     run_parser = subparsers.add_parser("run", help="Envia um script para execução elevada")
     run_parser.add_argument("--title", required=True, help="Título da tarefa")
@@ -201,6 +212,27 @@ def main():
         else:
             print("[ERRO] Falha ao iniciar a Central automaticamente.", file=sys.stderr)
             sys.exit(1)
+
+    elif args.command == "setup":
+        exe_path = BASE_DIR / "AntigravityBridge.exe"
+        cmd = [str(exe_path), "setup"]
+        if getattr(args, "password", None):
+            cmd.extend(["--password", args.password])
+        res = subprocess.run(cmd)
+        sys.exit(res.returncode)
+
+    elif args.command == "reset":
+        exe_path = BASE_DIR / "AntigravityBridge.exe"
+        res = subprocess.run([str(exe_path), "reset"])
+        sys.exit(res.returncode)
+
+    elif args.command == "uninstall":
+        exe_path = BASE_DIR / "AntigravityBridge.exe"
+        cmd = [str(exe_path), "uninstall"]
+        if getattr(args, "force", False):
+            cmd.append("--force")
+        res = subprocess.run(cmd)
+        sys.exit(res.returncode)
 
     elif args.command == "run":
         result = submit_request(

@@ -145,7 +145,26 @@ Ao acionar o botão **"Desinstalar Utilitário"** (ou via CLI com `AntigravityBr
 
 O executável standalone `AntigravityBridge.exe` funciona integralmente via terminal de comandos:
 
-### 1. Consultar Status do Serviço e Contador
+### 1. Provisionamento Inicial 100% via Linha de Comando (Zero Janelas Gráficas)
+Para configurar a chave secreta, registrar a tarefa do Windows e parear com o celular sem abrir nenhuma janela:
+```powershell
+# Modo interativo (solicita e confirma a senha de recuperação no próprio terminal):
+C:\Utilitario\AntigravityBridge.exe setup
+
+# Ou especificando a senha diretamente por parâmetro:
+C:\Utilitario\AntigravityBridge.exe setup --password "MinhaSenhaForte@2026"
+```
+*O utilitário irá:*
+1. Gerar a chave criptográfica em memória RAM e protegê-la com DPAPI.
+2. Renderizar o **QR Code diretamente no terminal em caracteres ASCII/UTF-8 em blocos**, pronto para leitura imediata com a câmera do celular no **Aegis**, **2FAS** ou **Google Authenticator**.
+3. Exibir a chave secreta Base32 e a URI `otpauth://` para inserção manual.
+4. Aplicar permissões restritas exclusivas para `SYSTEM` em `C:\Utilitario\config`.
+5. Registrar a tarefa elevada do Windows (`/ru "SYSTEM" /rl HIGHEST`).
+6. Concluir a operação sem abrir **nenhuma janela gráfica**.
+
+---
+
+### 2. Consultar Status do Serviço e Contador
 ```powershell
 C:\Utilitario\AntigravityBridge.exe status
 ```
@@ -154,22 +173,22 @@ C:\Utilitario\AntigravityBridge.exe status
 ============================================================
          STATUS DO ANTIGRAVITY ADMIN BRIDGE
 ============================================================
-  Contador Atual:           4
+  Contador Atual:           0
   Estado do Serviço:        Ativo
   Provisionado:             SIM (Flag=1)
   Lockdown Fail-Safe:       NORMAL
   Falhas Recentes (5m):     0 / 3
   Integridade do Estado:    Íntegro
-  Último Uso:               2026-10-11T02:33:55+00:00
+  Último Uso:               Nenhum
 ============================================================
 ```
 
-### 2. Consultar Histórico Recente de Execuções
+### 3. Consultar Histórico Recente de Execuções
 ```powershell
 C:\Utilitario\AntigravityBridge.exe history
 ```
 
-### 3. Enviar Comando para Execução Elevada
+### 4. Enviar Comando para Execução Elevada
 ```powershell
 C:\Utilitario\AntigravityBridge.exe run `
   --title "Verificação do Sistema" `

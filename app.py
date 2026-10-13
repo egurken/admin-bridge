@@ -1662,6 +1662,10 @@ def run_cli_client(args, hotp_auth: HOTPAuth):
             print("[ERRO]: Falha ao concluir desinstalação.", file=sys.stderr)
             sys.exit(1)
 
+    elif args.subcommand == "setup":
+        run_cli_setup(args, hotp_auth)
+        sys.exit(0)
+
     elif args.subcommand == "run":
         # Envia requisição para a fila
         REQUESTS_DIR.mkdir(parents=True, exist_ok=True)
@@ -1710,6 +1714,95 @@ def run_cli_client(args, hotp_auth: HOTPAuth):
         sys.exit(1)
 
 
+def run_cli_setup(args, hotp_auth: HOTPAuth):
+    """Executa o aprovisionamento inicial estritamente via terminal (zero janelas gráficas)."""
+    if sys.platform == "win32":
+        try:
+            sys.stdout.reconfigure(encoding="utf-8")
+            sys.stderr.reconfigure(encoding="utf-8")
+        except Exception:
+            pass
+
+    print("=" * 65)
+    print("      PROVISIONAMENTO INICIAL HOTP (MODO LINHA DE COMANDO)")
+    print("=" * 65)
+
+    if hotp_auth.is_provisioned() and not getattr(args, "force", False):
+        print("\n[AVISO]: O utilitário já está provisionado (Flag=1).")
+        print("Para redefinir a chave, utilize o comando: AntigravityBridge.exe reset\n")
+        sys.exit(1)
+
+    pw = getattr(args, "password", None)
+    if not pw:
+        import getpass
+        try:
+            pw = getpass.getpass("Defina a Palavra-passe de Recuperação (mínimo 8 caracteres): ").strip()
+            pw_conf = getpass.getpass("Confirme a Palavra-passe de Recuperação: ").strip()
+        except Exception:
+            pw = input("Defina a Palavra-passe de Recuperação (mínimo 8 caracteres): ").strip()
+            pw_conf = input("Confirme a Palavra-passe de Recuperação: ").strip()
+
+        if pw != pw_conf:
+            print("\n[ERRO]: As senhas digitadas não coincidem. Operação cancelada.", file=sys.stderr)
+            sys.exit(1)
+
+    if len(pw) < 8:
+        print("\n[ERRO]: A palavra-passe deve conter pelo menos 8 caracteres.", file=sys.stderr)
+        sys.exit(1)
+
+    caller_info = {
+        "pid": os.getpid(),
+        "exe": sys.executable,
+        "script": "CLI_setup",
+        "user": os.getenv("USERNAME", "unknown")
+    }
+
+    try:
+        res = hotp_auth.provision(pw, force=getattr(args, "force", False), caller_info=caller_info)
+    except Exception as e:
+        print(f"\n[ERRO CRÍTICO NO PROVISIONAMENTO]: {e}", file=sys.stderr)
+        sys.exit(1)
+
+    uri = res.get("uri", "")
+    secret_b32 = res.get("secret_base32", "")
+
+    print("\n" + "=" * 65)
+    print("  CHAVE GERADA COM SUCESSO EM MEMÓRIA RAM & PROTEGIDA VIA DPAPI")
+    print("=" * 65)
+    print(f"  Contador Inicial:  0")
+    print(f"  Flag:              1 (Travado)")
+    print(f"  Dígitos:           6 | Algoritmo: HMAC-SHA1")
+    print("=" * 65)
+    print("  ESCANEE O QR CODE ABAIXO NO SEU CELULAR (Aegis, 2FAS, Google Auth):")
+    print("-" * 65 + "\n")
+
+    try:
+        qr = qrcode.QRCode(box_size=1, border=1)
+        qr.add_data(uri)
+        qr.make(fit=True)
+        qr.print_ascii(out=sys.stdout, invert=True)
+    except Exception as e:
+        print(f"  (Não foi possível renderizar QR em ASCII: {e})")
+
+    print("\n" + "-" * 65)
+    print("  INSERÇÃO MANUAL NO AUTENTICADOR:")
+    print(f"  Chave Secreta (Base32): {secret_b32}")
+    print(f"  URI de Pareamento:      {uri}")
+    print("=" * 65)
+    print("  [IMPORTANTE]: Esta é a ÚNICA vez que este segredo será exibido!")
+    print("  O computador nunca mais salvará nem exibirá esta chave.")
+    print("=" * 65)
+
+    print("\n[*] Registrando serviço no Agendador de Tarefas do Windows (SYSTEM)...")
+    ok_task = register_scheduled_task()
+    if ok_task:
+        print("[*] Tarefa agendada registrada com sucesso (/ru 'SYSTEM' /rl HIGHEST).")
+    else:
+        print("[AVISO] Para registrar a tarefa agendada do sistema, execute este comando em console com privilégios de Administrador.")
+
+    print("\n[SUCESSO] Provisionamento concluído via linha de comando com zero janelas!")
+
+
 # -----------------------------------------------------------------------------
 # PONTO DE ENTRADA PRINCIPAL
 # -----------------------------------------------------------------------------
@@ -1725,6 +1818,11 @@ def main():
     parser.add_argument("--gui", action="store_true", help="Abre a janela da Central de Gestão diretamente na tela")
 
     subparsers = parser.add_subparsers(dest="subcommand", help="Comandos disponíveis")
+
+    # Comando setup (100% terminal, zero janelas)
+    p_setup = subparsers.add_parser("setup", help="Executa o provisionamento inicial via terminal sem abrir janelas")
+    p_setup.add_argument("--password", help="Palavra-passe de recuperação (mínimo 8 caracteres)")
+    p_setup.add_argument("--force", action="store_true", help="Força novo provisionamento se permitido")
 
     # Comando status
     subparsers.add_parser("status", help="Consulta o status atual do serviço e contador")
