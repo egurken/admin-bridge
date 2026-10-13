@@ -26,7 +26,7 @@ The bridge utility runs silently in the background (via `pythonw` without any bl
 Use this workflow whenever the user provides an OTP in chat before or during a task:
 1. **Immediate Pre-Authorization** (first action upon receiving the OTP):
    ```powershell
-   & "C:\Utilitario\AntigravityBridge.exe" preauth --otp "123456"
+   & "C:\Utilitario\AdminBridge.exe" preauth --otp "123456"
    # Or via client:
    python C:\Utilitario\client.py preauth --otp "123456"
    ```
@@ -36,7 +36,7 @@ Use this workflow whenever the user provides an OTP in chat before or during a t
 
 2. **Subsequent Execution** (within the 45-minute window):
    ```powershell
-   & "C:\Utilitario\AntigravityBridge.exe" run --title "Titulo da Tarefa" --description "Descricao" --type cmd --code "ipconfig /flushdns"
+   & "C:\Utilitario\AdminBridge.exe" run --title "Titulo da Tarefa" --description "Descricao" --type cmd --code "ipconfig /flushdns"
    # Or via client:
    python C:\Utilitario\client.py run --title "Titulo da Tarefa" --description "Descricao" --type cmd --code "ipconfig /flushdns"
    ```
@@ -48,7 +48,7 @@ Use this workflow whenever the user provides an OTP in chat before or during a t
 ### Workflow B: Legacy 1-Step Immediate Execution
 If the command and script are already prepared when the OTP is received:
 ```powershell
-& "C:\Utilitario\AntigravityBridge.exe" run --title "Titulo da Tarefa" --description "Descricao" --type cmd --code "ipconfig /flushdns" --otp "123456"
+& "C:\Utilitario\AdminBridge.exe" run --title "Titulo da Tarefa" --description "Descricao" --type cmd --code "ipconfig /flushdns" --otp "123456"
 # Or via client:
 python C:\Utilitario\client.py run --title "Titulo da Tarefa" --description "Descricao" --type cmd --code "ipconfig /flushdns" --otp "123456"
 ```
@@ -58,7 +58,7 @@ python C:\Utilitario\client.py run --title "Titulo da Tarefa" --description "Des
 ### Workflow C: Interactive UAC Fallback (Without OTP)
 If no OTP or pre-auth ticket is present:
 ```powershell
-& "C:\Utilitario\AntigravityBridge.exe" run --title "Titulo da Tarefa" --description "Descricao" --type cmd --code "ipconfig /flushdns"
+& "C:\Utilitario\AdminBridge.exe" run --title "Titulo da Tarefa" --description "Descricao" --type cmd --code "ipconfig /flushdns"
 ```
 The central UI opens a prompt on the desktop requesting physical confirmation via Windows UAC.
 
@@ -75,7 +75,7 @@ The central UI opens a prompt on the desktop requesting physical confirmation vi
 5. **Flag Lifecycle**: Reset unlocks flag to 0 -> generates new key -> relocks flag to 1.
 6. **Strict Counter Advancement**: The counter advances on **EVERY** validation attempt (both SUCCESS and FAIL).
 7. **Atomic Operations**: Thread-safe and process-safe validation using Windows Named Mutex and file locks.
-8. **Position Query Without Advance**: `& "C:\Utilitario\AntigravityBridge.exe" status` checks counter and service state without advancing OTP.
+8. **Position Query Without Advance**: `& "C:\Utilitario\AdminBridge.exe" status` checks counter and service state without advancing OTP.
 9. **Origin Verification & ACL Isolation**:
    - `C:\Utilitario\config\` is restricted strictly to `SYSTEM` and `Administrators`. Standard users cannot read configuration files directly.
    - `C:\Utilitario\queue\` and `logs\` allow execution submission from any machine user.

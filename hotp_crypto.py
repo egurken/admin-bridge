@@ -267,26 +267,36 @@ def verify_recovery_password(password: str, expected_hash_b64: str, salt_b64: st
 
 def apply_isolated_bridge_ntfs_acls(base_dir: Path = BASE_DIR):
     """Aplica permissões ACL granulares e blindadas:
-
-    - config: Acesso total EXCLUSIVO a SYSTEM (*S-1-5-18) e Administradores (*S-1-5-32-544). Bloqueio total a Users.
-    - queue: SYSTEM/Admins (F) e Users (*S-1-5-32-545) com Modificar (M) para envio e leitura de comandos na fila.
+    - config: Acesso total EXCLUSIVO a SYSTEM (*S-1-5-18). Bloqueio total a Users e Administradores sem takeown.
+    - scripts: Acesso total EXCLUSIVO a SYSTEM (*S-1-5-18) e Administradores (*S-1-5-32-544). Bloqueio total a Users.
+    - queue: SYSTEM/Admins (F) e Users (*S-1-5-32-545) com Modificar (M) para envio de comandos.
     - logs: SYSTEM/Admins (F) e Users com Modificar (M).
     """
     config_dir = base_dir / "config"
+    scripts_dir = base_dir / "scripts"
     queue_dir = base_dir / "queue"
     logs_dir = base_dir / "logs"
 
-    # 1. Blindagem estrita de config (somente SYSTEM e Administradores)
+    # 1. Blindagem estrita de config - somente SYSTEM
     try:
         if config_dir.exists():
             cfg_str = str(config_dir)
-            cmd_cfg = f'icacls "{cfg_str}" /inheritance:r /grant:r *S-1-5-18:(OI)(CI)(F) *S-1-5-32-544:(OI)(CI)(F)'
+            cmd_cfg = f'icacls "{cfg_str}" /inheritance:r /grant:r *S-1-5-18:(OI)(CI)(F)'
             subprocess.run(["cmd.exe", "/c", cmd_cfg], capture_output=True, check=False, creationflags=0x08000000)
-            subprocess.run(["cmd.exe", "/c", f'icacls "{cfg_str}\\*" /grant:r *S-1-5-18:(F) *S-1-5-32-544:(F)'], capture_output=True, check=False, creationflags=0x08000000)
+            subprocess.run(["cmd.exe", "/c", f'icacls "{cfg_str}\\*" /grant:r *S-1-5-18:(F)'], capture_output=True, check=False, creationflags=0x08000000)
     except Exception:
         pass
 
-    # 2. Canal público da fila (queue) e logs para qualquer usuário da máquina
+    # 2. Blindagem estrita de scripts - somente SYSTEM e Administradores
+    try:
+        if scripts_dir.exists():
+            sc_str = str(scripts_dir)
+            cmd_sc = f'icacls "{sc_str}" /inheritance:r /grant:r *S-1-5-18:(OI)(CI)(F) *S-1-5-32-544:(OI)(CI)(F)'
+            subprocess.run(["cmd.exe", "/c", cmd_sc], capture_output=True, check=False, creationflags=0x08000000)
+    except Exception:
+        pass
+
+    # 3. Canal de fila e logs para envio de solicitacoes
     for d in (queue_dir, logs_dir):
         try:
             if d.exists():
@@ -295,6 +305,45 @@ def apply_isolated_bridge_ntfs_acls(base_dir: Path = BASE_DIR):
                 subprocess.run(["cmd.exe", "/c", cmd_d], capture_output=True, check=False, creationflags=0x08000000)
         except Exception:
             pass
+
+
+def check_forensic_integrity(config_file: Path) -> Tuple[bool, str]:
+    """Verifica se a posse ou integridade do arquivo foi violada durante a inatividade."""
+    if not config_file.exists():
+        return True, "Configuracao ainda nao existe."
+
+    try:
+        ps_cmd = f"(Get-Acl -LiteralPath '{config_file}').Owner"
+        res = subprocess.run(
+            ["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", ps_cmd],
+            capture_output=True,
+            text=True,
+            check=False,
+            creationflags=0x08000000
+        )
+        owner = res.stdout.strip()
+        if owner and not ("SISTEMA" in owner.upper() or "SYSTEM" in owner.upper() or "S-1-5-18" in owner):
+            return False, f"Alerta forense: Posse do arquivo de configuracao alterada para {owner} durante a inatividade."
+
+        canary_file = config_file.parent / "canary.bin"
+        if canary_file.exists():
+            try:
+                with open(canary_file, "rb") as cf:
+                    cdata = cf.read()
+                if len(cdata) != 32:
+                    return False, "Alerta forense: Arquivo canario adulterado na pasta de configuracao."
+            except Exception as e:
+                return False, f"Alerta forense: Falha ao verificar canario: {e}"
+        else:
+            try:
+                with open(canary_file, "wb") as cf:
+                    cf.write(secrets.token_bytes(32))
+            except Exception:
+                pass
+
+        return True, "Integridade forense confirmada."
+    except Exception as e:
+        return True, f"Verificacao forense ignorada por erro de ambiente: {e}"
 
 
 def apply_system_only_ntfs_acls(target_path: Path):
@@ -429,7 +478,7 @@ def verify_caller_origin(caller_data: Optional[dict]) -> Tuple[bool, str]:
 
     is_valid_exe = (
         "python" in exe
-        or "antigravity" in exe
+        or "adminbridge" in exe
         or "powershell" in exe
         or "c:\\utilitario" in exe
     )

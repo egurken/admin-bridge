@@ -39,7 +39,7 @@ LOGS_DIR = BASE_DIR / "logs"
 CONFIG_FILE = CONFIG_DIR / "hotp_config.json"
 STATUS_FILE = QUEUE_DIR / "status.json"
 AUTH_LOG_FILE = LOGS_DIR / "auth.log"
-PREAUTH_TICKET_FILE = QUEUE_DIR / "preauth_ticket.json"
+PREAUTH_TICKET_FILE = CONFIG_DIR / "preauth_ticket.json"
 
 DEFAULT_DIGITS = 6
 DEFAULT_LOOK_AHEAD_WINDOW = 5
@@ -57,10 +57,15 @@ class HOTPAuth:
     """Módulo de autenticação HOTP (RFC 4226) blind-validation, isolamento de memória e integridade."""
 
     def __init__(self, config_file: Path = CONFIG_FILE):
-        self.config_file = config_file
-        CONFIG_DIR.mkdir(parents=True, exist_ok=True)
-        QUEUE_DIR.mkdir(parents=True, exist_ok=True)
-        LOGS_DIR.mkdir(parents=True, exist_ok=True)
+        self.config_file = Path(config_file)
+        self.config_dir = self.config_file.parent
+        self.ticket_file = self.config_dir / "preauth_ticket.json"
+        try:
+            self.config_dir.mkdir(parents=True, exist_ok=True)
+            QUEUE_DIR.mkdir(parents=True, exist_ok=True)
+            LOGS_DIR.mkdir(parents=True, exist_ok=True)
+        except Exception:
+            pass
 
     # -------------------------------------------------------------------------
     # OPERAÇÕES DE ARQUIVO E INTEGRIDADE (DPAPI MAC)
@@ -342,8 +347,8 @@ class HOTPAuth:
             pw_hash_dpapi = dpapi_protect(pw_hash_b64.encode("ascii"))
             pw_hash_dpapi_b64 = base64.b64encode(pw_hash_dpapi).decode("ascii")
 
-            # 4. Gera a URI para o autenticador do celular (com counter=0)
-            uri = f"otpauth://hotp/AntigravityBridge:Admin?secret={secret_b32}&counter=0&digits={DEFAULT_DIGITS}"
+            # 4. Gera a URI para o autenticador do celular com counter=0
+            uri = f"otpauth://hotp/AdminBridge:Admin?secret={secret_b32}&counter=0&digits={DEFAULT_DIGITS}&issuer=AdminBridge"
 
             # 5. Salva configuração protegida com flag = 1 e counter = 0
             new_config = {
@@ -432,12 +437,8 @@ class HOTPAuth:
 
             # Remove a tarefa agendada do Windows
             try:
-                subprocess.run(
-                    ["schtasks", "/delete", "/tn", "AntigravityAdminBridge", "/f"],
-                    capture_output=True,
-                    check=False,
-                    creationflags=0x08000000
-                )
+                for tn in ("AdminBridge", "AntigravityAdminBridge"):
+                    subprocess.run(["schtasks", "/delete", "/tn", tn, "/f"], capture_output=True, check=False, creationflags=0x08000000)
             except Exception:
                 pass
 
@@ -593,12 +594,8 @@ class HOTPAuth:
 
             # Aciona desativação/remoção imediata da tarefa agendada
             try:
-                subprocess.run(
-                    ["schtasks", "/delete", "/tn", "AntigravityAdminBridge", "/f"],
-                    capture_output=True,
-                    check=False,
-                    creationflags=0x08000000
-                )
+                for tn in ("AdminBridge", "AntigravityAdminBridge"):
+                    subprocess.run(["schtasks", "/delete", "/tn", tn, "/f"], capture_output=True, check=False, creationflags=0x08000000)
             except Exception:
                 pass
 
@@ -691,23 +688,23 @@ class HOTPAuth:
         }
 
         with AtomicLock():
-            QUEUE_DIR.mkdir(parents=True, exist_ok=True)
-            tmp_t = PREAUTH_TICKET_FILE.with_suffix(".tmp")
+            self.config_dir.mkdir(parents=True, exist_ok=True)
+            tmp_t = self.ticket_file.with_suffix(".tmp")
             with open(tmp_t, "w", encoding="utf-8") as f:
                 json.dump(ticket_data, f, indent=2)
-            tmp_t.replace(PREAUTH_TICKET_FILE)
+            tmp_t.replace(self.ticket_file)
 
         self._log_audit(
             "PREAUTH_TICKET_CREATED",
             used_counter - 1,
             used_counter,
             True,
-            f"Ticket de pré-autorização gerado com sucesso (validade: {lifetime_seconds // 60}m).",
+            f"Ticket de pre-autorizacao gerado com sucesso para validade de {lifetime_seconds // 60} minutos.",
             otp,
             caller
         )
 
-        return True, f"Pré-autorização confirmada com sucesso! Válida por até {lifetime_seconds // 60} minutos.", {
+        return True, f"Pre-autorizacao confirmada com sucesso! Valida por ate {lifetime_seconds // 60} minutos.", {
             "token": token,
             "expires_in": lifetime_seconds,
             "counter": used_counter - 1
@@ -718,38 +715,33 @@ class HOTPAuth:
         token: Optional[str] = None,
         caller_user: Optional[str] = None
     ) -> Tuple[bool, str]:
-        """Valida e consome atomicamente o ticket de pré-autorização para execução de comando."""
+        """Valida e consome atomicamente o ticket de pre-autorizacao para execucao de comando."""
         with AtomicLock():
-            if not PREAUTH_TICKET_FILE.exists():
-                return False, "Nenhum ticket de pré-autorização ativo encontrado."
+            if not self.ticket_file.exists():
+                return False, "Nenhum ticket de pre-autorizacao ativo encontrado."
 
             try:
-                with open(PREAUTH_TICKET_FILE, "r", encoding="utf-8") as f:
+                with open(self.ticket_file, "r", encoding="utf-8") as f:
                     ticket = json.load(f)
             except Exception as e:
-                return False, f"Falha ao ler ticket de pré-autorização: {e}"
+                return False, f"Falha ao ler ticket de pre-autorizacao: {e}"
 
             now = time.time()
             if now > ticket.get("expires_at", 0):
-                PREAUTH_TICKET_FILE.unlink(missing_ok=True)
-                return False, "Ticket de pré-autorização expirado (tempo limite de 45 minutos excedido)."
+                self.ticket_file.unlink(missing_ok=True)
+                return False, "Ticket de pre-autorizacao expirado por limite de 45 minutos."
 
-            # Validação por token explícito
-            if token:
-                expected_hash = hashlib.sha256(token.strip().encode("ascii")).hexdigest()
-                if not hmac.compare_digest(expected_hash, ticket.get("token_hash", "")):
-                    return False, "Token de pré-autorização fornecido é inválido."
-            else:
-                # Validação por usuário chamador do Windows
-                t_user = ticket.get("caller_user")
-                c_user = caller_user or os.getenv("USERNAME", "unknown")
-                if t_user and c_user and t_user != "unknown" and c_user != "unknown":
-                    if t_user.lower() != c_user.lower():
-                        return False, f"O ticket de pré-autorização pertence a outro usuário ({t_user} != {c_user})."
+            # Exige estritamente o token Bearer secreto
+            if not token or not str(token).strip():
+                return False, "Token secreto de pre-autorizacao e estritamente obrigatorio."
 
-            # Consumo estritamente único
+            expected_hash = hashlib.sha256(token.strip().encode("ascii")).hexdigest()
+            if not hmac.compare_digest(expected_hash, ticket.get("token_hash", "")):
+                return False, "Token de pre-autorizacao fornecido e incorreto."
+
+            # Consumo estritamente unico
             try:
-                PREAUTH_TICKET_FILE.unlink(missing_ok=True)
+                self.ticket_file.unlink(missing_ok=True)
             except Exception:
                 pass
 
@@ -758,9 +750,9 @@ class HOTPAuth:
                 ticket.get("counter_used", 0),
                 ticket.get("counter_used", 0) + 1,
                 True,
-                "Ticket de pré-autorização validado e consumido com sucesso para execução imediata."
+                "Ticket de pre-autorizacao validado e consumido com sucesso para execucao imediata."
             )
-            return True, "Ticket de pré-autorização validado e consumido com sucesso."
+            return True, "Ticket de pre-autorizacao validado e consumido com sucesso."
 
     def _diagnose_via_daemon_queue(
         self,
@@ -857,90 +849,103 @@ class HOTPAuth:
             secret_ba = dpapi_unprotect(secret_enc)
 
             try:
-                # Busca estritamente no máximo 10 posições acima
-                eff_lookahead = min(max_lookahead if max_lookahead is not None else 10, 10)
-                max_c = current_counter + eff_lookahead
+                # 1. Fase 1: Busca sequencial de tras para frente - de current_counter ate 0
+                for c in range(current_counter, -1, -1):
+                    code = self._compute_hotp_internal(secret_ba, c, DEFAULT_DIGITS)
+                    if hmac.compare_digest(clean_otp, code):
+                        if c == current_counter:
+                            new_c = current_counter + 1
+                            cfg["counter"] = new_c
+                            self._save_config_raw(cfg)
+                            self._log_audit(
+                                "SYNC_MATCH_CURRENT",
+                                current_counter,
+                                new_c,
+                                True,
+                                f"Sincronizacao confirmada no indice atual #{c}. Contador avancou para {new_c}.",
+                                clean_otp
+                            )
+                            return {
+                                "success": True,
+                                "matched_counter": c,
+                                "current_counter": current_counter,
+                                "next_counter": new_c,
+                                "diff": 0,
+                                "status": "synchronized",
+                                "status_label": "100% Sincronizado",
+                                "summary": "Seu celular esta perfeitamente sincronizado com o computador.",
+                                "action_instruction": f"O proximo codigo gerado no seu celular OTP #{new_c} sera o aceito para o proximo comando.",
+                                "message": f"Seu autenticador esta no OTP #{c} e esta sincronizado com o computador. O proximo OTP necessario agora e o #{new_c}."
+                            }
+                        else:
+                            diff = c - current_counter
+                            return {
+                                "success": True,
+                                "matched_counter": c,
+                                "current_counter": current_counter,
+                                "next_counter": current_counter,
+                                "diff": diff,
+                                "status": "behind",
+                                "status_label": "Codigo Antigo - Atrasado",
+                                "summary": "Este codigo ja expirou e nao sera aceito.",
+                                "action_instruction": f"O celular gerou o codigo antigo #{c}, mas o computador ja espera o OTP #{current_counter}. Gere novos codigos no aplicativo ate alcancar o computador.",
+                                "message": f"Seu autenticador esta no OTP #{c}, abaixo do contador do computador que esta no #{current_counter}. O proximo OTP necessario no computador continua sendo o #{current_counter}."
+                            }
 
-                # Busca até o índice 0 abaixo (ou respeita limite se especificado)
-                min_c = 0 if max_lookback is None else max(0, current_counter - max_lookback)
-
-                # 1. Verifica primeiro o índice atual exato
-                current_expected = self._compute_hotp_internal(secret_ba, current_counter, DEFAULT_DIGITS)
-                if hmac.compare_digest(clean_otp, current_expected):
-                    next_c = current_counter + 1
-                    return {
-                        "success": True,
-                        "matched_counter": current_counter,
-                        "current_counter": current_counter,
-                        "next_counter": next_c,
-                        "diff": 0,
-                        "status": "synchronized",
-                        "status_label": "Sincronizado",
-                        "summary": "Seu celular está perfeitamente sincronizado com o computador.",
-                        "action_instruction": f"O próximo código gerado no seu celular (OTP #{next_c}) será o esperado para o próximo comando.",
-                        "message": (
-                            f"Seu autenticador está no OTP #{current_counter} e está "
-                            f"sincronizado com o computador. O próximo OTP necessário é o #{next_c}."
-                        )
-                    }
-
-                # 2. Busca estritamente até 10 posições acima (lookahead)
+                # 2. Fase 2: Busca sequencial para frente - estritamente ate 10 posicoes acima
+                max_c = current_counter + 10
                 for c in range(current_counter + 1, max_c + 1):
                     code = self._compute_hotp_internal(secret_ba, c, DEFAULT_DIGITS)
                     if hmac.compare_digest(clean_otp, code):
+                        # Interrompe imediatamente sem calcular seguintes
+                        new_c = c + 1
+                        cfg["counter"] = new_c
+                        self._save_config_raw(cfg)
+                        self._log_audit(
+                            "SYNC_JUMP_AHEAD",
+                            current_counter,
+                            new_c,
+                            True,
+                            f"Sincronizacao identificada a frente no OTP #{c}. Contador saltou para {new_c}.",
+                            clean_otp
+                        )
                         diff = c - current_counter
-                        next_c = c + 1
                         return {
                             "success": True,
                             "matched_counter": c,
                             "current_counter": current_counter,
-                            "next_counter": next_c,
+                            "next_counter": new_c,
                             "diff": diff,
                             "status": "ahead",
-                            "status_label": "Compatível (À Frente)",
-                            "summary": "Seu aplicativo está pronto para uso!",
-                            "action_instruction": f"Seu celular avançou para o OTP #{c}. O próximo código gerado no aplicativo (OTP #{next_c}) será aceito com sucesso.",
-                            "message": (
-                                f"Seu autenticador está no OTP #{c}. "
-                                f"O próximo OTP necessário é o #{next_c}."
-                            )
+                            "status_label": "Compativel - A Frente",
+                            "summary": "Seu aplicativo avancou e o computador sincronizou com o salto!",
+                            "action_instruction": f"Seu celular esta no OTP #{c}. O computador avancou o contador e agora aguarda o OTP #{new_c}.",
+                            "message": f"Seu autenticador esta no OTP #{c}. O contador do computador pulou para #{new_c} e este sera o proximo aceito."
                         }
 
-                # 3. Busca posições anteriores até o zero (lookback)
-                for c in range(current_counter - 1, min_c - 1, -1):
-                    code = self._compute_hotp_internal(secret_ba, c, DEFAULT_DIGITS)
-                    if hmac.compare_digest(clean_otp, code):
-                        diff = c - current_counter
-                        return {
-                            "success": True,
-                            "matched_counter": c,
-                            "current_counter": current_counter,
-                            "next_counter": current_counter,
-                            "diff": diff,
-                            "status": "behind",
-                            "status_label": "Código Antigo (Atrasado)",
-                            "summary": "Este código já expirou e não será aceito.",
-                            "action_instruction": f"O celular gerou o código antigo #{c}, mas o computador já espera o OTP #{current_counter}. Gere novos códigos no aplicativo até ultrapassar o computador.",
-                            "message": (
-                                f"Seu autenticador está no OTP #{c} (abaixo do contador do computador, que está no #{current_counter}). "
-                                f"O próximo OTP necessário no computador é o #{current_counter}."
-                            )
-                        }
-
+                # 3. Esgotamento das 10 posicoes acima sem correspondencia: o contador salta para current_counter + 11
+                exhausted_c = current_counter + 11
+                cfg["counter"] = exhausted_c
+                self._save_config_raw(cfg)
+                self._log_audit(
+                    "SYNC_EXHAUSTED_JUMP",
+                    current_counter,
+                    exhausted_c,
+                    False,
+                    f"10 posicoes acima testadas sem correspondencia. Contador saltou para {exhausted_c}.",
+                    clean_otp
+                )
                 return {
                     "success": False,
                     "matched_counter": None,
                     "current_counter": current_counter,
-                    "next_counter": current_counter,
+                    "next_counter": exhausted_c,
                     "diff": None,
                     "status": "not_found",
-                    "status_label": "Não Encontrado",
-                    "summary": "O código digitado não foi reconhecido.",
-                    "action_instruction": "Verifique se digitou os 6 números corretamente ou se o aplicativo cadastrado pertence a este computador.",
-                    "message": (
-                        f"Código OTP ({clean_otp[:2]}****) não encontrado. Foram testadas até 10 posições acima "
-                        f"(#{current_counter} até #{max_c}) e todas as anteriores até #0 (computador em #{current_counter})."
-                    )
+                    "status_label": "Nao Reconhecido",
+                    "summary": "O codigo digitado nao correspondeu as 10 posicoes testadas.",
+                    "action_instruction": f"Foram testadas 10 posicoes acima do computador #{current_counter} e o contador agora saltou para aguardar o OTP #{exhausted_c}.",
+                    "message": f"Codigo OTP nao encontrado apos testar 10 posicoes acima. O contador do sistema agora saltou para #{exhausted_c}."
                 }
 
             finally:

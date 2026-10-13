@@ -7,6 +7,8 @@ import json
 import logging
 import os
 from pathlib import Path
+import hashlib
+import hmac
 import secrets
 import shutil
 import subprocess
@@ -30,11 +32,11 @@ from PyQt6.QtWidgets import (
 from hotp_auth import HOTPAuth, SecurityError, PREAUTH_TICKET_FILE
 from hotp_crypto import (
     wipe_buffer, apply_isolated_bridge_ntfs_acls, apply_system_only_ntfs_acls, restore_ntfs_acls_for_removal,
-    verify_caller_origin, generate_physical_challenge, read_passive_metadata
+    verify_caller_origin, generate_physical_challenge, read_passive_metadata, check_forensic_integrity
 )
 from app_icon import get_app_icon
 
-LOCAL_SERVER_NAME = f"AntigravityBridge_GUI_{os.getenv('USERNAME', 'default')}"
+LOCAL_SERVER_NAME = f"AdminBridge_GUI_{os.getenv('USERNAME', 'default')}"
 BASE_DIR = Path("C:/Utilitario")
 CONFIG_DIR = BASE_DIR / "config"
 QUEUE_DIR = BASE_DIR / "queue"
@@ -175,9 +177,9 @@ def create_desktop_shortcut():
         if pub_desktop.exists() and pub_desktop not in desktops_to_create:
             desktops_to_create.append(pub_desktop)
 
-        target = (BASE_DIR / "AntigravityBridge.exe").resolve()
+        target = (BASE_DIR / "AdminBridge.exe").resolve()
         if not target.exists():
-            target = (BASE_DIR / "AdminBridge.exe").resolve()
+            target = (BASE_DIR / "AntigravityBridge.exe").resolve()
         icon_path = (BASE_DIR / "icon.ico").resolve()
 
         for d in desktops_to_create:
@@ -223,13 +225,13 @@ def ensure_environment_installed():
         with open(RUNNER_PS1, "w", encoding="utf-8") as f:
             f.write(RUNNER_PS1_SCRIPT)
 
-    target_exe = (BASE_DIR / "AntigravityBridge.exe").resolve()
+    target_exe = (BASE_DIR / "AdminBridge.exe").resolve()
     current_exe = Path(sys.executable).resolve()
     if getattr(sys, "frozen", False) and current_exe != target_exe:
         try:
             shutil.copy2(str(current_exe), str(target_exe))
         except Exception as e:
-            logging.warning(f"Aviso ao copiar executável para C:\\Utilitario: {e}")
+            logging.warning(f"Aviso ao copiar executavel para C:\\Utilitario: {e}")
 
     # Aplica permissões restritas exclusivas para SYSTEM se for Administrador
     if is_admin():
@@ -247,10 +249,10 @@ def ensure_environment_installed():
 
 def register_scheduled_task() -> bool:
     """Registra o executável no Agendador de Tarefas do Windows como SYSTEM com privilégios HIGHEST."""
-    exe_path = str(BASE_DIR / "AntigravityBridge.exe")
+    exe_path = str(BASE_DIR / "AdminBridge.exe")
     cmd = [
         "schtasks", "/create",
-        "/tn", "AntigravityAdminBridge",
+        "/tn", "AdminBridge",
         "/tr", f'"{exe_path}" --daemon',
         "/rl", "HIGHEST",
         "/ru", "SYSTEM",
@@ -260,13 +262,13 @@ def register_scheduled_task() -> bool:
     res = subprocess.run(cmd, capture_output=True, text=True, check=False, creationflags=0x08000000)
     if res.returncode == 0:
         logging.info("Tarefa agendada registrada sob conta SYSTEM com sucesso.")
-        subprocess.run(["schtasks", "/run", "/tn", "AntigravityAdminBridge"], capture_output=True, check=False, creationflags=0x08000000)
+        subprocess.run(["schtasks", "/run", "/tn", "AdminBridge"], capture_output=True, check=False, creationflags=0x08000000)
         return True
     else:
         # Fallback para ONLOGON se ONSTART exigir permissões adicionais
         cmd_fallback = [
             "schtasks", "/create",
-            "/tn", "AntigravityAdminBridge",
+            "/tn", "AdminBridge",
             "/tr", f'"{exe_path}" --daemon',
             "/rl", "HIGHEST",
             "/ru", "SYSTEM",
@@ -279,9 +281,13 @@ def register_scheduled_task() -> bool:
 
 def unregister_scheduled_task() -> bool:
     """Remove a tarefa agendada do Windows."""
-    cmd = ["schtasks", "/delete", "/tn", "AntigravityAdminBridge", "/f"]
-    res = subprocess.run(cmd, capture_output=True, check=False, creationflags=0x08000000)
-    return res.returncode == 0
+    ok = True
+    for tn in ("AdminBridge", "AntigravityAdminBridge"):
+        cmd = ["schtasks", "/delete", "/tn", tn, "/f"]
+        res = subprocess.run(cmd, capture_output=True, check=False, creationflags=0x08000000)
+        if res.returncode == 0:
+            ok = True
+    return ok
 
 
 def perform_full_uninstall(parent_widget=None) -> bool:
@@ -441,7 +447,7 @@ class SetupWizardDialog(QDialog):
         self.hotp_auth = hotp_auth
         self.raw_qr_buffer: Optional[bytearray] = None
 
-        self.setWindowTitle("Antigravity • Provisionamento de Segurança (HOTP)")
+        self.setWindowTitle("Admin Bridge • Provisionamento de Seguranca")
         self.setMinimumSize(480, 580)
         self.setStyleSheet("""
             QDialog {
@@ -508,7 +514,7 @@ class SetupWizardDialog(QDialog):
         lbl_desc.setStyleSheet("font-size: 12px; color: #a6adc8; line-height: 1.4;")
         self.layout.addWidget(lbl_desc)
 
-        lbl_p1 = QLabel("Palavra-passe de Recuperação (mínimo 8 caracteres):")
+        lbl_p1 = QLabel("Palavra-passe de Recuperação - mínimo 8 caracteres:")
         lbl_p1.setStyleSheet("font-weight: 600; font-size: 12px; margin-top: 10px;")
         self.layout.addWidget(lbl_p1)
 
@@ -526,7 +532,7 @@ class SetupWizardDialog(QDialog):
         self.txt_p2.setPlaceholderText("Repita a mesma senha")
         self.layout.addWidget(self.txt_p2)
 
-        self.btn_next = QPushButton("Gerar Pareamento Seguro (QR Code em RAM)")
+        self.btn_next = QPushButton("Gerar Pareamento Seguro - QR Code em RAM")
         self.btn_next.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
         self.btn_next.clicked.connect(self.process_password_and_generate)
         self.layout.addWidget(self.btn_next)
@@ -592,7 +598,7 @@ class SetupWizardDialog(QDialog):
         txt_secret.setStyleSheet("font-family: Consolas, monospace; font-size: 12px; background-color: #181825; color: #f9e2af;")
         self.layout.addWidget(txt_secret)
 
-        lbl_meta = QLabel("Tipo: Baseado em Contador (HOTP) • Contador Inicial: 0 • Dígitos: 6 • SHA-1")
+        lbl_meta = QLabel("Tipo: Baseado em Contador HOTP • Contador Inicial: 0 • Dígitos: 6 • SHA-1")
         lbl_meta.setStyleSheet("font-size: 10px; color: #6c7086;")
         lbl_meta.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.layout.addWidget(lbl_meta)
@@ -638,7 +644,7 @@ class ResetWizardDialog(QDialog):
         self.hotp_auth = hotp_auth
         self.challenge_code = generate_physical_challenge()
 
-        self.setWindowTitle("Antigravity • Revogar Privilégios & Resetar HOTP")
+        self.setWindowTitle("Admin Bridge • Revogar Privilégios e Resetar HOTP")
         self.setMinimumSize(480, 520)
         self.setStyleSheet("""
             QDialog {
@@ -700,7 +706,7 @@ class ResetWizardDialog(QDialog):
         lbl_desc.setStyleSheet("font-size: 12px; color: #a6adc8; line-height: 1.4;")
         self.layout.addWidget(lbl_desc)
 
-        lbl_ch_title = QLabel("Confirmação de Presença Física (digite o código abaixo):")
+        lbl_ch_title = QLabel("Confirmação de Presença Física - digite o código abaixo:")
         lbl_ch_title.setStyleSheet("font-weight: 600; font-size: 12px; color: #fab387; margin-top: 10px;")
         self.layout.addWidget(lbl_ch_title)
 
@@ -713,7 +719,7 @@ class ResetWizardDialog(QDialog):
         self.layout.addWidget(lbl_challenge_box)
 
         self.txt_challenge = QLineEdit()
-        self.txt_challenge.setPlaceholderText("Digite o código exibido acima (ex: PHYS-123456)")
+        self.txt_challenge.setPlaceholderText("Digite o código exibido acima - ex: PHYS-123456")
         self.layout.addWidget(self.txt_challenge)
 
         lbl_curr_pw = QLabel("Palavra-passe de Recuperação:")
@@ -897,13 +903,13 @@ class ExecutionThread(QThread):
 # DIÁLOGO MODERNO DE TESTE E DIAGNÓSTICO DE SINCRONIA HOTP
 # -----------------------------------------------------------------------------
 class SyncTestDialog(QDialog):
-    """Diálogo moderno e amigável para diagnóstico passivo de sincronia do aplicativo autenticador."""
+    """Diálogo moderno e amigável para sincronização inteligente do aplicativo autenticador."""
     def __init__(self, hotp_auth: HOTPAuth, parent=None):
         super().__init__(parent)
         self.hotp_auth = hotp_auth
         self.setWindowTitle("Diagnóstico do Autenticador • Admin Bridge")
-        self.resize(540, 500)
-        self.setMinimumSize(480, 440)
+        self.resize(580, 560)
+        self.setMinimumSize(560, 520)
         self.init_ui()
 
     def init_ui(self):
@@ -968,6 +974,7 @@ class SyncTestDialog(QDialog):
         layout = QVBoxLayout(self)
         layout.setContentsMargins(24, 24, 24, 24)
         layout.setSpacing(14)
+        layout.setSizeConstraint(QLayout.SizeConstraint.SetMinimumSize)
 
         # Cabeçalho
         lbl_title = QLabel("Diagnóstico de Sincronia")
@@ -976,7 +983,7 @@ class SyncTestDialog(QDialog):
 
         lbl_desc = QLabel(
             "Digite o código de 6 dígitos que está aparecendo agora na tela do seu celular "
-            "(Google Authenticator, Aegis, 2FAS, etc.) para verificar se ele está pronto para uso:"
+            "Google Authenticator, Aegis, 2FAS ou compatível para verificar se ele está pronto para uso:"
         )
         lbl_desc.setWordWrap(True)
         lbl_desc.setStyleSheet("font-size: 13px; color: #a6adc8; line-height: 1.4;")
@@ -1018,31 +1025,40 @@ class SyncTestDialog(QDialog):
         res_layout.addWidget(self.lbl_verdict)
 
         # Próximo Passo / Instrução de Ação
-        self.lbl_instruction = QLabel("Esta verificação é segura e passiva: ela não gasta o código nem avança o computador.")
+        self.lbl_instruction = QLabel("Sincronização ativa: o contador do sistema avança automaticamente para alinhar com o seu aplicativo.")
         self.lbl_instruction.setStyleSheet("font-size: 12px; color: #bac2de; line-height: 1.4;")
         self.lbl_instruction.setWordWrap(True)
         res_layout.addWidget(self.lbl_instruction)
 
         # Detalhes do Diagnóstico
         self.frame_details = QFrame()
-        self.frame_details.setStyleSheet("background-color: #11111b; border-radius: 6px; padding: 6px;")
+        self.frame_details.setStyleSheet("background-color: #11111b; border-radius: 6px;")
         det_layout = QGridLayout(self.frame_details)
-        det_layout.setContentsMargins(10, 8, 10, 8)
-        det_layout.setHorizontalSpacing(14)
-        det_layout.setVerticalSpacing(4)
+        det_layout.setContentsMargins(14, 12, 14, 12)
+        det_layout.setHorizontalSpacing(16)
+        det_layout.setVerticalSpacing(8)
 
-        det_layout.addWidget(QLabel("Código Testado:"), 0, 0)
+        lbl_hdr1 = QLabel("Código Testado:")
+        lbl_hdr1.setMinimumHeight(24)
+        det_layout.addWidget(lbl_hdr1, 0, 0)
         self.lbl_det_code = QLabel("-")
+        self.lbl_det_code.setMinimumHeight(24)
         self.lbl_det_code.setStyleSheet("font-weight: bold; font-family: monospace;")
         det_layout.addWidget(self.lbl_det_code, 0, 1)
 
-        det_layout.addWidget(QLabel("Posição no Celular:"), 1, 0)
+        lbl_hdr2 = QLabel("Posição no Celular:")
+        lbl_hdr2.setMinimumHeight(24)
+        det_layout.addWidget(lbl_hdr2, 1, 0)
         self.lbl_det_phone = QLabel("-")
+        self.lbl_det_phone.setMinimumHeight(24)
         self.lbl_det_phone.setStyleSheet("font-weight: bold; font-family: monospace;")
         det_layout.addWidget(self.lbl_det_phone, 1, 1)
 
-        det_layout.addWidget(QLabel("Próximo Código a Usar:"), 2, 0)
+        lbl_hdr3 = QLabel("Próximo Código a Usar:")
+        lbl_hdr3.setMinimumHeight(24)
+        det_layout.addWidget(lbl_hdr3, 2, 0)
         self.lbl_det_next = QLabel("-")
+        self.lbl_det_next.setMinimumHeight(24)
         self.lbl_det_next.setStyleSheet("font-weight: bold; font-family: monospace; color: #89b4fa;")
         det_layout.addWidget(self.lbl_det_next, 2, 1)
 
@@ -1051,8 +1067,8 @@ class SyncTestDialog(QDialog):
 
         layout.addWidget(self.card_result)
 
-        # Rodapé de segurança
-        lbl_security = QLabel("🔒 Verificação passiva: o contador do sistema NÃO é alterado e nenhum comando é executado.")
+        # Rodapé de segurança transparente
+        lbl_security = QLabel("🔒 Sincronização inteligente: o contador avança automaticamente para alinhar com o seu aplicativo.")
         lbl_security.setStyleSheet("font-size: 11px; color: #6c7086;")
         layout.addWidget(lbl_security)
 
@@ -1103,22 +1119,22 @@ class SyncTestDialog(QDialog):
                 self.badge_status.setStyleSheet("background-color: #a6e3a1; color: #11111b; padding: 4px 10px; border-radius: 4px; font-weight: bold; font-size: 11px;")
                 self.lbl_verdict.setText(f"✅ {summary}")
                 self.lbl_instruction.setText(action)
-                self.lbl_det_phone.setText(f"OTP #{matched} (Atual)")
+                self.lbl_det_phone.setText(f"OTP #{matched} - Atual")
                 self.lbl_det_next.setText(f"OTP #{next_c}")
             elif st == "ahead":
-                self.badge_status.setText("COMPATÍVEL (À FRENTE)")
+                self.badge_status.setText("COMPATÍVEL - À FRENTE")
                 self.badge_status.setStyleSheet("background-color: #89b4fa; color: #11111b; padding: 4px 10px; border-radius: 4px; font-weight: bold; font-size: 11px;")
                 self.lbl_verdict.setText(f"ℹ️ {summary}")
                 self.lbl_instruction.setText(action)
-                self.lbl_det_phone.setText(f"OTP #{matched}")
+                self.lbl_det_phone.setText(f"OTP #{matched} - Celular avançado")
                 self.lbl_det_next.setText(f"OTP #{next_c}")
             else:
-                self.badge_status.setText("CÓDIGO ANTIGO (ATRASADO)")
+                self.badge_status.setText("CÓDIGO ANTIGO - ATRASADO")
                 self.badge_status.setStyleSheet("background-color: #fab387; color: #11111b; padding: 4px 10px; border-radius: 4px; font-weight: bold; font-size: 11px;")
                 self.lbl_verdict.setText(f"⚠️ {summary}")
                 self.lbl_instruction.setText(action)
-                self.lbl_det_phone.setText(f"OTP #{matched} (Expirado)")
-                self.lbl_det_next.setText(f"OTP #{next_c} (Aguardando no PC)")
+                self.lbl_det_phone.setText(f"OTP #{matched} - Expirado")
+                self.lbl_det_next.setText(f"OTP #{next_c} - Aguardando no PC")
 
             self.lbl_det_code.setText(otp)
             self.frame_details.show()
@@ -1129,7 +1145,7 @@ class SyncTestDialog(QDialog):
             self.lbl_instruction.setText(res.get("action_instruction", res.get("error", "Verifique se o código foi digitado corretamente.")))
             self.lbl_det_code.setText(otp)
             self.lbl_det_phone.setText("Não localizado")
-            self.lbl_det_next.setText(f"OTP #{res.get('current_counter')}")
+            self.lbl_det_next.setText(f"OTP #{res.get('next_counter', res.get('current_counter'))}")
             self.frame_details.show()
 
 
@@ -1441,7 +1457,7 @@ class AdminBridgeWindow(QMainWindow):
         header_pending.addWidget(self.lbl_badge)
         pending_layout.addLayout(header_pending)
 
-        self.lbl_req_sub = QLabel("O assistente Antigravity enviará solicitações aqui quando precisar executar comandos.")
+        self.lbl_req_sub = QLabel("Aplicações clientes enviarão solicitações aqui quando precisarem executar comandos.")
         self.lbl_req_sub.setStyleSheet("font-size: 12px; color: #a6adc8;")
         pending_layout.addWidget(self.lbl_req_sub)
 
@@ -1478,7 +1494,7 @@ class AdminBridgeWindow(QMainWindow):
         main_layout.addWidget(self.card_pending)
 
         # -------------------------------------------------------------
-        # TABELA DE HISTÓRICO RECENTE (REQUISITO 2b)
+        # TABELA DE HISTÓRICO RECENTE
         # -------------------------------------------------------------
         lbl_hist_title = QLabel("📜 Histórico Recente de Requisições & Auditoria")
         lbl_hist_title.setStyleSheet("font-size: 13px; font-weight: bold; color: #a6adc8; margin-top: 4px;")
@@ -1486,7 +1502,7 @@ class AdminBridgeWindow(QMainWindow):
 
         self.table_history = QTableWidget()
         self.table_history.setColumnCount(4)
-        self.table_history.setHorizontalHeaderLabels(["Data/Hora", "Comando / Operação", "Estado", "OTP (Mascarado)"])
+        self.table_history.setHorizontalHeaderLabels(["Data e Hora", "Comando ou Operação", "Estado", "OTP Mascarado"])
         self.table_history.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
         self.table_history.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
         self.table_history.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
@@ -1497,7 +1513,7 @@ class AdminBridgeWindow(QMainWindow):
 
     def init_tray(self):
         self.tray_icon = QSystemTrayIcon(self)
-        self.tray_icon.setToolTip("Antigravity Admin Bridge")
+        self.tray_icon.setToolTip("Admin Bridge")
         app_icon = get_app_icon()
         self.tray_icon.setIcon(app_icon)
 
@@ -1531,7 +1547,7 @@ class AdminBridgeWindow(QMainWindow):
 
         tray_menu.addSeparator()
 
-        reset_action = QAction("🔄 Resetar HOTP (Revogar Privilégios)...", self)
+        reset_action = QAction("🔄 Resetar HOTP - Revogar Privilégios...", self)
         reset_action.triggered.connect(self.open_reset_dialog)
         tray_menu.addAction(reset_action)
 
@@ -1575,7 +1591,7 @@ class AdminBridgeWindow(QMainWindow):
         self.hide()
         if self.tray_icon.isVisible():
             self.tray_icon.showMessage(
-                "Antigravity Admin Bridge",
+                "Admin Bridge",
                 "A Central continua em execução na bandeja do sistema.",
                 QSystemTrayIcon.MessageIcon.Information,
                 2000
@@ -1709,7 +1725,7 @@ class AdminBridgeWindow(QMainWindow):
                 if is_lockdown:
                     if self.tray_icon.isVisible():
                         self.tray_icon.showMessage(
-                            "Antigravity • LOCKDOWN ATIVADO",
+                            "Admin Bridge • LOCKDOWN ATIVADO",
                             "3 falhas consecutivas detectadas! Tarefa elevada removida.",
                             QSystemTrayIcon.MessageIcon.Critical,
                             6000
@@ -1745,7 +1761,7 @@ class AdminBridgeWindow(QMainWindow):
 
         self.lbl_req_title.setText(title)
         self.lbl_req_sub.setText(f"[Sem OTP] Confirmação manual requerida via UAC • {desc}")
-        self.lbl_badge.setText(f"UAC REQUERIDO ({script_type})")
+        self.lbl_badge.setText(f"UAC REQUERIDO - {script_type}")
         self.lbl_badge.setStyleSheet("background-color: #f9e2af; color: #11111b; padding: 4px 10px; border-radius: 4px;")
 
         self.code_viewer.setPlainText(code)
@@ -1756,7 +1772,7 @@ class AdminBridgeWindow(QMainWindow):
 
         if self.tray_icon.isVisible():
             self.tray_icon.showMessage(
-                "Antigravity • Confirmação UAC",
+                "Admin Bridge • Confirmação UAC",
                 f"{title}\nClique para autorizar via prompt UAC.",
                 QSystemTrayIcon.MessageIcon.Information,
                 5000
@@ -1857,7 +1873,7 @@ class AdminBridgeWindow(QMainWindow):
         self.current_request = None
         self.current_processing_file = None
         self.lbl_req_title.setText("Aguardando solicitações...")
-        self.lbl_req_sub.setText("O assistente Antigravity enviará solicitações aqui quando precisar executar comandos.")
+        self.lbl_req_sub.setText("Aplicações clientes enviarão solicitações aqui quando precisarem executar comandos.")
         self.lbl_badge.setText("INATIVO")
         self.lbl_badge.setStyleSheet("background-color: #313244; color: #a6adc8; padding: 3px 8px; border-radius: 4px; font-size: 11px; font-weight: bold;")
         self.code_viewer.clear()
@@ -1949,7 +1965,13 @@ class AdminBridgeWindow(QMainWindow):
 # -----------------------------------------------------------------------------
 def run_daemon_loop(hotp_auth: HOTPAuth):
     """Executa o loop contínuo de processamento de comandos em segundo plano como SYSTEM."""
-    logging.info("[DAEMON] AntigravityBridge daemon iniciado sob conta de serviço.")
+    logging.info("[DAEMON] Admin Bridge daemon iniciado sob conta de servico.")
+    apply_isolated_bridge_ntfs_acls()
+
+    ok_forensic, forensic_msg = check_forensic_integrity(CONFIG_FILE)
+    if not ok_forensic:
+        logging.critical(f"[FORENSE] {forensic_msg}")
+
     QUEUE_DIR.mkdir(parents=True, exist_ok=True)
     REQUESTS_DIR.mkdir(parents=True, exist_ok=True)
     PROCESSING_DIR.mkdir(parents=True, exist_ok=True)
@@ -2021,7 +2043,7 @@ def run_daemon_loop(hotp_auth: HOTPAuth):
                     is_valid, auth_msg, used_counter = hotp_auth.verify_and_advance(provided_otp, caller_info)
                     auth_approved = is_valid
                 else:
-                    # Valida via Ticket de Pré-Autorização (até 45 minutos)
+                    # Valida via Ticket de Pré-Autorização (até 45 minutos) com token secreto obrigatório
                     ok_ticket, ticket_msg = hotp_auth.consume_preauth_ticket(preauth_token, caller_user)
                     auth_approved = ok_ticket
                     auth_msg = ticket_msg
@@ -2040,9 +2062,27 @@ def run_daemon_loop(hotp_auth: HOTPAuth):
                     proc_file.unlink(missing_ok=True)
                     continue
 
+                # Valida integridade do hash do código para mitigar TOCTOU
+                code = data.get("code", "")
+                expected_code_hash = data.get("code_hash")
+                if expected_code_hash:
+                    actual_code_hash = hashlib.sha256(code.encode("utf-8")).hexdigest()
+                    if not hmac.compare_digest(actual_code_hash, expected_code_hash):
+                        res = {
+                            "id": req_id,
+                            "status": "rejected_auth",
+                            "reason": "Adulteracao detectada: hash do codigo nao coincide.",
+                            "exit_code": 403,
+                            "output": "[ACESSO RECUSADO]: Integridade do script violada.",
+                            "completed_at": datetime.now().astimezone().isoformat()
+                        }
+                        with open(RESPONSES_DIR / f"{req_id}.json", "w", encoding="utf-8") as f:
+                            json.dump(res, f, indent=2, ensure_ascii=False)
+                        proc_file.unlink(missing_ok=True)
+                        continue
+
                 # Executa comando autenticado
                 script_type = data.get("script_type", "bat").lower()
-                code = data.get("code", "")
                 ext = "ps1" if script_type == "ps1" else "bat"
                 sc_path = SCRIPTS_DIR / f"{req_id}.{ext}"
                 lg_path = RESPONSES_DIR / f"{req_id}.log"
@@ -2257,7 +2297,7 @@ def run_cli_client(args, hotp_auth: HOTPAuth):
         print("[*] Removendo tarefas agendadas, filas e restaurando permissões...")
         ok = perform_full_uninstall()
         if ok:
-            print("[SUCESSO]: Antigravity Admin Bridge desinstalado com sucesso.")
+            print("[SUCESSO]: Admin Bridge desinstalado com sucesso.")
             sys.exit(0)
         else:
             print("[ERRO]: Falha ao concluir desinstalação.", file=sys.stderr)
@@ -2343,22 +2383,22 @@ def run_cli_setup(args, hotp_auth: HOTPAuth):
             pass
 
     print("=" * 65)
-    print("      PROVISIONAMENTO INICIAL HOTP (MODO LINHA DE COMANDO)")
+    print("      PROVISIONAMENTO INICIAL HOTP - MODO LINHA DE COMANDO")
     print("=" * 65)
 
     if hotp_auth.is_provisioned() and not getattr(args, "force", False):
-        print("\n[AVISO]: O utilitário já está provisionado (Flag=1).")
-        print("Para redefinir a chave, utilize o comando: AntigravityBridge.exe reset\n")
+        print("\n[AVISO]: O utilitário já está provisionado - Flag=1.")
+        print("Para redefinir a chave, utilize o comando: AdminBridge.exe reset\n")
         sys.exit(1)
 
     pw = getattr(args, "password", None)
     if not pw:
         import getpass
         try:
-            pw = getpass.getpass("Defina a Palavra-passe de Recuperação (mínimo 8 caracteres): ").strip()
+            pw = getpass.getpass("Defina a Palavra-passe de Recuperação - mínimo 8 caracteres: ").strip()
             pw_conf = getpass.getpass("Confirme a Palavra-passe de Recuperação: ").strip()
         except Exception:
-            pw = safe_input("Defina a Palavra-passe de Recuperação (mínimo 8 caracteres): ").strip()
+            pw = safe_input("Defina a Palavra-passe de Recuperação - mínimo 8 caracteres: ").strip()
             pw_conf = safe_input("Confirme a Palavra-passe de Recuperação: ").strip()
 
         if pw != pw_conf:
@@ -2389,10 +2429,10 @@ def run_cli_setup(args, hotp_auth: HOTPAuth):
     print("  CHAVE GERADA COM SUCESSO EM MEMÓRIA RAM & PROTEGIDA VIA DPAPI")
     print("=" * 65)
     print(f"  Contador Inicial:  0")
-    print(f"  Flag:              1 (Travado)")
+    print(f"  Flag:              1 - Travado")
     print(f"  Dígitos:           6 | Algoritmo: HMAC-SHA1")
     print("=" * 65)
-    print("  ESCANEE O QR CODE ABAIXO NO SEU CELULAR (Aegis, 2FAS, Google Auth):")
+    print("  ESCANEE O QR CODE ABAIXO NO SEU CELULAR - Aegis, 2FAS, Google Auth:")
     print("-" * 65 + "\n")
 
     try:
@@ -2401,18 +2441,18 @@ def run_cli_setup(args, hotp_auth: HOTPAuth):
         qr.make(fit=True)
         qr.print_ascii(out=sys.stdout, invert=True)
     except Exception as e:
-        print(f"  (Não foi possível renderizar QR em ASCII: {e})")
+        print(f"  Não foi possível renderizar QR em ASCII: {e}")
 
     print("\n" + "-" * 65)
     print("  INSERÇÃO MANUAL NO AUTENTICADOR:")
-    print(f"  Chave Secreta (Base32): {secret_b32}")
+    print(f"  Chave Secreta - Base32: {secret_b32}")
     print(f"  URI de Pareamento:      {uri}")
     print("=" * 65)
     print("  [IMPORTANTE]: Esta é a ÚNICA vez que este segredo será exibido!")
     print("  O computador nunca mais salvará nem exibirá esta chave.")
     print("=" * 65)
 
-    print("\n[*] Registrando serviço no Agendador de Tarefas do Windows (SYSTEM)...")
+    print("\n[*] Registrando serviço no Agendador de Tarefas do Windows SYSTEM...")
     ok_task = register_scheduled_task()
     if ok_task:
         print("[*] Tarefa agendada registrada com sucesso (/ru 'SYSTEM' /rl HIGHEST).")
@@ -2504,7 +2544,7 @@ def main():
 
     # Inicia a Interface Gráfica PyQt6 (System Tray & Dashboard)
     try:
-        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("antigravity.adminbridge.gui.2.0")
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("adminbridge.gui.2.0")
     except Exception:
         pass
 

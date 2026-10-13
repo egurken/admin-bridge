@@ -17,6 +17,9 @@ STATUS_FILE = QUEUE_DIR / "status.json"
 AUTH_LOG_FILE = BASE_DIR / "logs" / "auth.log"
 
 
+import hashlib
+
+
 def check_heartbeat(max_age_seconds: float = 10.0) -> bool:
     """Verifica se o utilitário desktop está rodando e enviando heartbeat."""
     if not HEARTBEAT_FILE.exists():
@@ -30,6 +33,14 @@ def check_heartbeat(max_age_seconds: float = 10.0) -> bool:
         return False
 
 
+def get_bridge_exe() -> Path:
+    """Retorna o executável preferencial da ponte administrativa."""
+    p = BASE_DIR / "AdminBridge.exe"
+    if p.exists():
+        return p
+    return BASE_DIR / "AntigravityBridge.exe"
+
+
 def ensure_app_running(timeout_wait: float = 12.0) -> bool:
     """Verifica se o utilitário está ativo; se não estiver, tenta iniciá-lo."""
     if check_heartbeat(5.0):
@@ -37,9 +48,14 @@ def ensure_app_running(timeout_wait: float = 12.0) -> bool:
 
     print("[*] Central offline. Tentando iniciar serviço...", file=sys.stderr)
     try:
-        res = subprocess.run(["schtasks", "/run", "/tn", "AntigravityAdminBridge"], capture_output=True, text=True)
-        if res.returncode != 0:
-            exe_path = BASE_DIR / "AntigravityBridge.exe"
+        started_task = False
+        for tn in ("AdminBridge", "AntigravityAdminBridge"):
+            res = subprocess.run(["schtasks", "/run", "/tn", tn], capture_output=True, text=True)
+            if res.returncode == 0:
+                started_task = True
+                break
+        if not started_task:
+            exe_path = get_bridge_exe()
             if exe_path.exists():
                 subprocess.Popen([str(exe_path)], cwd=str(BASE_DIR))
             else:
@@ -67,12 +83,14 @@ def submit_request(title: str, description: str, script_type: str, code: str, ot
         print("[AVISO] Não foi possível confirmar a inicialização da central.", file=sys.stderr)
 
     req_id = str(uuid.uuid4())
+    code_hash = hashlib.sha256(code.encode("utf-8")).hexdigest()
     payload = {
         "id": req_id,
         "title": title,
         "description": description,
         "script_type": script_type,
         "code": code,
+        "code_hash": code_hash,
         "otp": otp,
         "preauth_token": preauth_token,
         "timeout": timeout,
@@ -91,7 +109,7 @@ def submit_request(title: str, description: str, script_type: str, code: str, ot
 
     print(f"[*] Solicitação [{req_id}] enviada.", file=sys.stderr)
     if otp:
-        print(f"[*] Autenticação HOTP anexada ({otp[:2]}****). Aguardando execução...", file=sys.stderr)
+        print(f"[*] Autenticação HOTP anexada - {otp[:2]}****. Aguardando execução...", file=sys.stderr)
     else:
         print("[*] Modo Híbrido: Aguardando aprovação UAC pelo usuário...", file=sys.stderr)
 
@@ -137,10 +155,10 @@ def main():
     # Subcomando: status
     subparsers.add_parser("status", help="Consulta status atual do serviço e contador")
 
-    # Subcomando: sync (diagnóstico passivo de sincronia)
-    p_sync = subparsers.add_parser("sync", help="Diagnóstico e teste de sincronia HOTP sem avançar o contador")
+    # Subcomando: sync
+    p_sync = subparsers.add_parser("sync", help="Diagnóstico e sincronização HOTP com avanço do contador")
     p_sync.add_argument("--otp", required=True, help="Código OTP de 6 dígitos gerado no celular")
-    p_sync.add_argument("--lookahead", type=int, default=10, help="Janela máxima à frente (padrão: 10)")
+    p_sync.add_argument("--lookahead", type=int, default=10, help="Janela máxima à frente - padrão: 10")
 
     # Subcomando: history
     subparsers.add_parser("history", help="Exibe histórico recente de execuções")
@@ -162,7 +180,7 @@ def main():
     # Subcomando: preauth
     p_preauth = subparsers.add_parser("preauth", help="Consome OTP e gera ticket de pré-autorização válido por até 45 minutos")
     p_preauth.add_argument("--otp", required=True, help="Código OTP de 6 dígitos")
-    p_preauth.add_argument("--lifetime", type=int, default=2700, help="Tempo limite em segundos (padrão 2700s = 45 minutos)")
+    p_preauth.add_argument("--lifetime", type=int, default=2700, help="Tempo limite em segundos - padrão 2700s = 45 minutos")
 
     # Subcomando: run
     run_parser = subparsers.add_parser("run", help="Envia um script para execução elevada")
@@ -193,16 +211,14 @@ def main():
         if st_data:
             print(f"  Contador Atual:           {st_data.get('counter', 0)}")
             print(f"  Estado:                   {st_data.get('status_text', 'Ativo')}")
-            print(f"  Provisionado:             {'SIM (Flag=1)' if st_data.get('provisioned_flag') == 1 else 'NÃO'}")
+            print(f"  Provisionado:             {'SIM - Flag=1' if st_data.get('provisioned_flag') == 1 else 'NÃO'}")
             print(f"  Lockdown:                 {'SIM' if st_data.get('lockdown') else 'NÃO'}")
             print(f"  Falhas Recentes:          {st_data.get('recent_failures', 0)} / 3")
         print("=" * 60)
         sys.exit(0 if active else 1)
 
     elif args.command == "sync":
-        exe_path = BASE_DIR / "AntigravityBridge.exe"
-        if not exe_path.exists():
-            exe_path = BASE_DIR / "AdminBridge.exe"
+        exe_path = get_bridge_exe()
         lookahead = getattr(args, "lookahead", 10)
         if exe_path.exists():
             cmd = [str(exe_path), "sync", "--otp", args.otp, "--lookahead", str(lookahead)]
@@ -238,28 +254,38 @@ def main():
             sys.exit(1)
 
     elif args.command == "setup":
-        exe_path = BASE_DIR / "AntigravityBridge.exe"
-        cmd = [str(exe_path), "setup"]
+        exe_path = get_bridge_exe()
+        if exe_path.exists():
+            cmd = [str(exe_path), "setup"]
+        else:
+            cmd = [sys.executable, str(BASE_DIR / "app.py"), "setup"]
         if getattr(args, "password", None):
             cmd.extend(["--password", args.password])
         res = subprocess.run(cmd)
         sys.exit(res.returncode)
 
     elif args.command == "reset":
-        exe_path = BASE_DIR / "AntigravityBridge.exe"
-        res = subprocess.run([str(exe_path), "reset"])
+        exe_path = get_bridge_exe()
+        if exe_path.exists():
+            cmd = [str(exe_path), "reset"]
+        else:
+            cmd = [sys.executable, str(BASE_DIR / "app.py"), "reset"]
+        res = subprocess.run(cmd)
         sys.exit(res.returncode)
 
     elif args.command == "uninstall":
-        exe_path = BASE_DIR / "AntigravityBridge.exe"
-        cmd = [str(exe_path), "uninstall"]
+        exe_path = get_bridge_exe()
+        if exe_path.exists():
+            cmd = [str(exe_path), "uninstall"]
+        else:
+            cmd = [sys.executable, str(BASE_DIR / "app.py"), "uninstall"]
         if getattr(args, "force", False):
             cmd.append("--force")
         res = subprocess.run(cmd)
         sys.exit(res.returncode)
 
     elif args.command == "preauth":
-        exe_path = BASE_DIR / "AntigravityBridge.exe"
+        exe_path = get_bridge_exe()
         if exe_path.exists():
             cmd = [str(exe_path), "preauth", "--otp", args.otp, "--lifetime", str(args.lifetime)]
         else:

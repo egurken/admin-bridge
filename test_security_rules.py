@@ -144,52 +144,62 @@ def test_all_security_rules():
         print("  -> PASSOU: Pré-autorização e consumo atômico de ticket funcionam com sucesso!")
 
         # -------------------------------------------------------------
-        # TESTE 10: Diagnóstico Passivo de Sincronia sem Avançar Contador
+        # TESTE 10: Sincronização Inteligente com Avanço Ativo e Salto do Contador
         # -------------------------------------------------------------
-        print("[*] 10. Testando Diagnóstico Passivo de Sincronia (Sync Probe)...")
-        c_before_sync = auth.get_counter_status()["counter"]
-        secret_ba_test = bytearray(secret_bytes_pre)
-        current_sync_otp = auth._compute_hotp_internal(secret_ba_test, c_before_sync, 6)
-        future_sync_otp_5 = auth._compute_hotp_internal(secret_ba_test, c_before_sync + 5, 6)
-        future_sync_otp_15 = auth._compute_hotp_internal(secret_ba_test, c_before_sync + 15, 6)
-        past_sync_otp_0 = auth._compute_hotp_internal(secret_ba_test, 0, 6)
+        print("[*] 10. Testando Sincronização HOTP com Atualização Estrita do Contador...")
+        # Reprovisiona para iniciar em c=0
+        res_sync = auth.provision("SenhaSync@2026", force=True, caller_info=caller)
+        secret_b32_s = urllib.parse.parse_qs(urllib.parse.urlparse(res_sync["uri"]).query)["secret"][0]
+        secret_ba_s = bytearray(base64.b32decode(secret_b32_s))
 
-        # 1. Código exato do contador atual: deve reportar 'synchronized' e next_counter = c + 1
-        diag_cur = auth.diagnose_otp_sync(current_sync_otp)
-        assert diag_cur["success"]
-        assert diag_cur["status"] == "synchronized"
-        assert diag_cur["matched_counter"] == c_before_sync
-        assert diag_cur["next_counter"] == c_before_sync + 1
-        assert "sincronizado" in diag_cur["message"].lower()
+        assert auth.get_counter_status()["counter"] == 0
 
-        # 2. Código 5 posições à frente: deve reportar 'ahead' e next_counter = c + 5 + 1
-        diag_ahead = auth.diagnose_otp_sync(future_sync_otp_5)
+        # Caso 1: Código coincide no contador atual (0). Contador avança obrigatoriamente para 1 (+1).
+        otp_0 = auth._compute_hotp_internal(secret_ba_s, 0, 6)
+        diag_0 = auth.diagnose_otp_sync(otp_0)
+        assert diag_0["success"]
+        assert diag_0["status"] == "synchronized"
+        assert diag_0["matched_counter"] == 0
+        assert diag_0["next_counter"] == 1
+        assert "(" not in diag_0["message"] and ")" not in diag_0["message"]
+        assert auth.get_counter_status()["counter"] == 1, "Contador em disco deve ter avançado para 1"
+        print("  -> Subteste 10.1 PASSOU: Código no atual (0) avança contador para 1!")
+
+        # Caso 2: Celular está à frente (por exemplo celular na posição 6, computador em 1).
+        # Deve buscar de 2 até 11, encontrar em 6, interromper a busca e pular para 6 + 1 = 7.
+        otp_6 = auth._compute_hotp_internal(secret_ba_s, 6, 6)
+        diag_ahead = auth.diagnose_otp_sync(otp_6)
         assert diag_ahead["success"]
         assert diag_ahead["status"] == "ahead"
-        assert diag_ahead["matched_counter"] == c_before_sync + 5
-        assert diag_ahead["next_counter"] == c_before_sync + 5 + 1
-        assert diag_ahead["diff"] == 5
+        assert diag_ahead["matched_counter"] == 6
+        assert diag_ahead["next_counter"] == 7
+        assert "(" not in diag_ahead["message"] and ")" not in diag_ahead["message"]
+        assert auth.get_counter_status()["counter"] == 7, "Contador em disco deve ter saltado para 7"
+        print("  -> Subteste 10.2 PASSOU: Código à frente (6) pula contador para 7 e interrompe busca!")
 
-        # 3. Código 15 posições à frente (acima do limite estrito de 10): NÃO DEVE ENCONTRAR
-        diag_far = auth.diagnose_otp_sync(future_sync_otp_15)
-        assert not diag_far["success"] or diag_far["status"] == "not_found"
+        # Caso 3: Código do passado (por exemplo posição 2, enquanto computador já está em 7).
+        # A busca sequencial reversa (7 até 0) detecta a posição 2.
+        # Não recua o contador do computador e reporta código expirado.
+        otp_2 = auth._compute_hotp_internal(secret_ba_s, 2, 6)
+        diag_past = auth.diagnose_otp_sync(otp_2)
+        assert diag_past["success"]
+        assert diag_past["status"] == "behind"
+        assert diag_past["matched_counter"] == 2
+        assert diag_past["next_counter"] == 7
+        assert "(" not in diag_past["message"] and ")" not in diag_past["message"]
+        assert auth.get_counter_status()["counter"] == 7, "Contador em disco deve permanecer em 7"
+        print("  -> Subteste 10.3 PASSOU: Código anterior (2) detectado sem recuar o computador!")
 
-        # 4. Código anterior (posição 0): se c_before_sync > 0, deve reportar 'behind'
-        if c_before_sync > 0:
-            diag_past = auth.diagnose_otp_sync(past_sync_otp_0)
-            assert diag_past["success"]
-            assert diag_past["status"] == "behind"
-            assert diag_past["matched_counter"] == 0
-            assert diag_past["next_counter"] == c_before_sync
-
-        # 5. Código inválido / inexistente
-        diag_none = auth.diagnose_otp_sync("000000" if current_sync_otp != "000000" else "999999")
-        assert not diag_none["success"] or diag_none["status"] == "not_found"
-
-        # 6. CRÍTICO: Garantir que o contador NÃO se moveu durante nenhuma das checagens
-        c_after_sync = auth.get_counter_status()["counter"]
-        assert c_before_sync == c_after_sync, f"Contador alterado indevidamente durante probe passivo! ({c_before_sync} != {c_after_sync})"
-        print("  -> PASSOU: Diagnóstico passivo estritamente limitado a 10 acima, busca até 0 e reporta próximo OTP!")
+        # Caso 4: Código não encontrado nas 10 posições à frente (testa 8 a 17 e não acha).
+        # Regra de esgotamento: salta obrigatoriamente para current + 11 (7 + 11 = 18).
+        # "agora o contador vai aguardar o 11" (isto é, posições esgotadas pulam para além da janela)
+        diag_exhausted = auth.diagnose_otp_sync("000000")
+        assert not diag_exhausted["success"]
+        assert diag_exhausted["status"] == "not_found"
+        assert diag_exhausted["next_counter"] == 18
+        assert "(" not in diag_exhausted["message"] and ")" not in diag_exhausted["message"]
+        assert auth.get_counter_status()["counter"] == 18, f"Esperado 18 após esgotamento, obtido {auth.get_counter_status()['counter']}"
+        print("  -> Subteste 10.4 PASSOU: Esgotamento das 10 posições salta contador para current + 11 (18)!")
 
     print("\n=======================================================")
     print("TODOS OS REQUISITOS DE SEGURANÇA FORAM TESTADOS E APROVADOS!")
