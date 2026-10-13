@@ -24,7 +24,7 @@ from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QLabel, QPushButton, QPlainTextEdit, QFrame, QSystemTrayIcon,
     QMenu, QMessageBox, QDialog, QLineEdit, QTableWidget, QTableWidgetItem,
-    QHeaderView, QAbstractItemView, QInputDialog
+    QHeaderView, QAbstractItemView, QInputDialog, QGridLayout
 )
 
 from hotp_auth import HOTPAuth, SecurityError, PREAUTH_TICKET_FILE
@@ -894,6 +894,246 @@ class ExecutionThread(QThread):
 
 
 # -----------------------------------------------------------------------------
+# DIÁLOGO MODERNO DE TESTE E DIAGNÓSTICO DE SINCRONIA HOTP
+# -----------------------------------------------------------------------------
+class SyncTestDialog(QDialog):
+    """Diálogo moderno e amigável para diagnóstico passivo de sincronia do aplicativo autenticador."""
+    def __init__(self, hotp_auth: HOTPAuth, parent=None):
+        super().__init__(parent)
+        self.hotp_auth = hotp_auth
+        self.setWindowTitle("Diagnóstico do Autenticador • Admin Bridge")
+        self.resize(540, 500)
+        self.setMinimumSize(480, 440)
+        self.init_ui()
+
+    def init_ui(self):
+        self.setStyleSheet("""
+            QDialog {
+                background-color: #11111b;
+                color: #cdd6f4;
+                font-family: 'Segoe UI', system-ui, sans-serif;
+            }
+            QLabel {
+                color: #cdd6f4;
+            }
+            QLineEdit {
+                background-color: #181825;
+                border: 2px solid #313244;
+                border-radius: 8px;
+                color: #89b4fa;
+                font-family: 'Consolas', monospace;
+                font-size: 24px;
+                font-weight: bold;
+                padding: 8px 12px;
+                letter-spacing: 4px;
+            }
+            QLineEdit:focus {
+                border: 2px solid #89b4fa;
+            }
+            QPushButton#btnVerify {
+                background-color: #89b4fa;
+                color: #11111b;
+                border: none;
+                border-radius: 8px;
+                font-size: 14px;
+                font-weight: bold;
+                padding: 10px 20px;
+            }
+            QPushButton#btnVerify:hover {
+                background-color: #b4befe;
+            }
+            QPushButton#btnVerify:disabled {
+                background-color: #45475a;
+                color: #a6adc8;
+            }
+            QPushButton#btnClose {
+                background-color: #313244;
+                color: #cdd6f4;
+                border: none;
+                border-radius: 8px;
+                font-size: 13px;
+                font-weight: bold;
+                padding: 8px 20px;
+            }
+            QPushButton#btnClose:hover {
+                background-color: #45475a;
+            }
+            QFrame#cardResult {
+                background-color: #181825;
+                border: 1px solid #313244;
+                border-radius: 8px;
+            }
+        """)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(24, 24, 24, 24)
+        layout.setSpacing(14)
+
+        # Cabeçalho
+        lbl_title = QLabel("Diagnóstico de Sincronia")
+        lbl_title.setStyleSheet("font-size: 20px; font-weight: bold; color: #cdd6f4;")
+        layout.addWidget(lbl_title)
+
+        lbl_desc = QLabel(
+            "Digite o código de 6 dígitos que está aparecendo agora na tela do seu celular "
+            "(Google Authenticator, Aegis, 2FAS, etc.) para verificar se ele está pronto para uso:"
+        )
+        lbl_desc.setWordWrap(True)
+        lbl_desc.setStyleSheet("font-size: 13px; color: #a6adc8; line-height: 1.4;")
+        layout.addWidget(lbl_desc)
+
+        # Entrada de OTP
+        input_box = QHBoxLayout()
+        self.edit_otp = QLineEdit()
+        self.edit_otp.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.edit_otp.setMaxLength(6)
+        self.edit_otp.setPlaceholderText("000000")
+        self.edit_otp.textChanged.connect(self.on_otp_text_changed)
+        self.edit_otp.returnPressed.connect(self.run_verification)
+        input_box.addWidget(self.edit_otp)
+
+        self.btn_verify = QPushButton("Verificar")
+        self.btn_verify.setObjectName("btnVerify")
+        self.btn_verify.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_verify.clicked.connect(self.run_verification)
+        input_box.addWidget(self.btn_verify)
+        layout.addLayout(input_box)
+
+        # Card de Resultado (dinâmico)
+        self.card_result = QFrame()
+        self.card_result.setObjectName("cardResult")
+        res_layout = QVBoxLayout(self.card_result)
+        res_layout.setContentsMargins(16, 16, 16, 16)
+        res_layout.setSpacing(10)
+
+        # Badge de Status
+        self.badge_status = QLabel("AGUARDANDO CÓDIGO")
+        self.badge_status.setStyleSheet("background-color: #313244; color: #a6adc8; padding: 4px 10px; border-radius: 4px; font-weight: bold; font-size: 11px;")
+        res_layout.addWidget(self.badge_status, alignment=Qt.AlignmentFlag.AlignLeft)
+
+        # Mensagem Principal (Humana)
+        self.lbl_verdict = QLabel("Digite o código acima e clique em 'Verificar'.")
+        self.lbl_verdict.setStyleSheet("font-size: 14px; font-weight: bold; color: #cdd6f4;")
+        self.lbl_verdict.setWordWrap(True)
+        res_layout.addWidget(self.lbl_verdict)
+
+        # Próximo Passo / Instrução de Ação
+        self.lbl_instruction = QLabel("Esta verificação é segura e passiva: ela não gasta o código nem avança o computador.")
+        self.lbl_instruction.setStyleSheet("font-size: 12px; color: #bac2de; line-height: 1.4;")
+        self.lbl_instruction.setWordWrap(True)
+        res_layout.addWidget(self.lbl_instruction)
+
+        # Detalhes do Diagnóstico
+        self.frame_details = QFrame()
+        self.frame_details.setStyleSheet("background-color: #11111b; border-radius: 6px; padding: 6px;")
+        det_layout = QGridLayout(self.frame_details)
+        det_layout.setContentsMargins(10, 8, 10, 8)
+        det_layout.setHorizontalSpacing(14)
+        det_layout.setVerticalSpacing(4)
+
+        det_layout.addWidget(QLabel("Código Testado:"), 0, 0)
+        self.lbl_det_code = QLabel("-")
+        self.lbl_det_code.setStyleSheet("font-weight: bold; font-family: monospace;")
+        det_layout.addWidget(self.lbl_det_code, 0, 1)
+
+        det_layout.addWidget(QLabel("Posição no Celular:"), 1, 0)
+        self.lbl_det_phone = QLabel("-")
+        self.lbl_det_phone.setStyleSheet("font-weight: bold; font-family: monospace;")
+        det_layout.addWidget(self.lbl_det_phone, 1, 1)
+
+        det_layout.addWidget(QLabel("Próximo Código a Usar:"), 2, 0)
+        self.lbl_det_next = QLabel("-")
+        self.lbl_det_next.setStyleSheet("font-weight: bold; font-family: monospace; color: #89b4fa;")
+        det_layout.addWidget(self.lbl_det_next, 2, 1)
+
+        res_layout.addWidget(self.frame_details)
+        self.frame_details.hide()
+
+        layout.addWidget(self.card_result)
+
+        # Rodapé de segurança
+        lbl_security = QLabel("🔒 Verificação passiva: o contador do sistema NÃO é alterado e nenhum comando é executado.")
+        lbl_security.setStyleSheet("font-size: 11px; color: #6c7086;")
+        layout.addWidget(lbl_security)
+
+        # Botão Fechar
+        btn_box = QHBoxLayout()
+        btn_box.addStretch()
+        btn_close = QPushButton("Fechar")
+        btn_close.setObjectName("btnClose")
+        btn_close.setCursor(Qt.CursorShape.PointingHandCursor)
+        btn_close.clicked.connect(self.accept)
+        btn_box.addWidget(btn_close)
+        layout.addLayout(btn_box)
+
+    def on_otp_text_changed(self, text):
+        clean = "".join([c for c in text if c.isdigit()])
+        if clean != text:
+            self.edit_otp.setText(clean)
+
+    def run_verification(self):
+        otp = self.edit_otp.text().strip()
+        if len(otp) != 6 or not otp.isdigit():
+            self.badge_status.setText("CÓDIGO INCOMPLETO")
+            self.badge_status.setStyleSheet("background-color: #fab387; color: #11111b; padding: 4px 10px; border-radius: 4px; font-weight: bold; font-size: 11px;")
+            self.lbl_verdict.setText("O código deve conter exatamente 6 números.")
+            self.lbl_instruction.setText("Consulte os 6 dígitos exibidos no aplicativo do seu celular e tente novamente.")
+            self.frame_details.hide()
+            return
+
+        self.btn_verify.setEnabled(False)
+        self.btn_verify.setText("Verificando...")
+        QApplication.processEvents()
+
+        try:
+            res = self.hotp_auth.diagnose_otp_sync(otp)
+        finally:
+            self.btn_verify.setEnabled(True)
+            self.btn_verify.setText("Verificar")
+
+        if res.get("success"):
+            st = res.get("status")
+            matched = res.get("matched_counter")
+            next_c = res.get("next_counter")
+            summary = res.get("summary", "")
+            action = res.get("action_instruction", "")
+
+            if st == "synchronized":
+                self.badge_status.setText("100% SINCRONIZADO")
+                self.badge_status.setStyleSheet("background-color: #a6e3a1; color: #11111b; padding: 4px 10px; border-radius: 4px; font-weight: bold; font-size: 11px;")
+                self.lbl_verdict.setText(f"✅ {summary}")
+                self.lbl_instruction.setText(action)
+                self.lbl_det_phone.setText(f"OTP #{matched} (Atual)")
+                self.lbl_det_next.setText(f"OTP #{next_c}")
+            elif st == "ahead":
+                self.badge_status.setText("COMPATÍVEL (À FRENTE)")
+                self.badge_status.setStyleSheet("background-color: #89b4fa; color: #11111b; padding: 4px 10px; border-radius: 4px; font-weight: bold; font-size: 11px;")
+                self.lbl_verdict.setText(f"ℹ️ {summary}")
+                self.lbl_instruction.setText(action)
+                self.lbl_det_phone.setText(f"OTP #{matched}")
+                self.lbl_det_next.setText(f"OTP #{next_c}")
+            else:
+                self.badge_status.setText("CÓDIGO ANTIGO (ATRASADO)")
+                self.badge_status.setStyleSheet("background-color: #fab387; color: #11111b; padding: 4px 10px; border-radius: 4px; font-weight: bold; font-size: 11px;")
+                self.lbl_verdict.setText(f"⚠️ {summary}")
+                self.lbl_instruction.setText(action)
+                self.lbl_det_phone.setText(f"OTP #{matched} (Expirado)")
+                self.lbl_det_next.setText(f"OTP #{next_c} (Aguardando no PC)")
+
+            self.lbl_det_code.setText(otp)
+            self.frame_details.show()
+        else:
+            self.badge_status.setText("NÃO RECONHECIDO")
+            self.badge_status.setStyleSheet("background-color: #f38ba8; color: #11111b; padding: 4px 10px; border-radius: 4px; font-weight: bold; font-size: 11px;")
+            self.lbl_verdict.setText("❌ " + res.get("summary", "Código não encontrado."))
+            self.lbl_instruction.setText(res.get("action_instruction", res.get("error", "Verifique se o código foi digitado corretamente.")))
+            self.lbl_det_code.setText(otp)
+            self.lbl_det_phone.setText("Não localizado")
+            self.lbl_det_next.setText(f"OTP #{res.get('current_counter')}")
+            self.frame_details.show()
+
+
+# -----------------------------------------------------------------------------
 # JANELA PRINCIPAL DA CENTRAL DE GESTÃO (SYSTEM TRAY & DASHBOARD)
 # -----------------------------------------------------------------------------
 class AdminBridgeWindow(QMainWindow):
@@ -1414,6 +1654,15 @@ class AdminBridgeWindow(QMainWindow):
         target_file = req_files[0]
         req_id = target_file.stem
 
+        # Se for uma solicitação de probe passivo do daemon (sync_probe), deixa o daemon SYSTEM processar
+        try:
+            with open(target_file, "r", encoding="utf-8") as f:
+                peek_req = json.load(f)
+            if peek_req.get("script_type") == "sync_probe":
+                return
+        except Exception:
+            pass
+
         # Reivindicação atômica: move imediatamente para processing/
         PROCESSING_DIR.mkdir(parents=True, exist_ok=True)
         processing_file = PROCESSING_DIR / f"{req_id}.json"
@@ -1690,55 +1939,8 @@ class AdminBridgeWindow(QMainWindow):
         )
 
     def show_sync_test_dialog(self):
-        otp, ok = QInputDialog.getText(
-            self,
-            "Diagnóstico de Sincronia HOTP",
-            "Digite o código OTP de 6 dígitos gerado no aplicativo do seu celular:\n"
-            "(Esta verificação é passiva e NÃO avança o contador do sistema)",
-            QLineEdit.EchoMode.Normal
-        )
-        if not ok or not otp:
-            return
-
-        res = self.hotp_auth.diagnose_otp_sync(otp.strip())
-        if res.get("success"):
-            matched = res.get("matched_counter")
-            current = res.get("current_counter")
-            next_otp = res.get("next_counter")
-            msg = res.get("message")
-            if res.get("status") == "synchronized":
-                QMessageBox.information(
-                    self,
-                    "Autenticador Sincronizado",
-                    f"✅ {msg}\n\n"
-                    f"• Contador do Celular: #{matched}\n"
-                    f"• Contador no Computador: #{current}\n"
-                    f"• Próximo OTP Necessário: #{next_otp}"
-                )
-            elif res.get("status") == "ahead":
-                QMessageBox.information(
-                    self,
-                    "Autenticador Identificado",
-                    f"ℹ️ {msg}\n\n"
-                    f"• Contador do Celular: #{matched}\n"
-                    f"• Contador no Computador: #{current}\n"
-                    f"• Próximo OTP Necessário: #{next_otp}"
-                )
-            else:
-                QMessageBox.warning(
-                    self,
-                    "Autenticador Atrasado",
-                    f"⚠️ {msg}\n\n"
-                    f"• Contador do Celular: #{matched}\n"
-                    f"• Contador no Computador: #{current}\n"
-                    f"• Próximo OTP Necessário no Computador: #{next_otp}"
-                )
-        else:
-            QMessageBox.critical(
-                self,
-                "Código Não Encontrado",
-                f"❌ {res.get('message', res.get('error'))}"
-            )
+        dlg = SyncTestDialog(self.hotp_auth, self)
+        dlg.exec()
 
 
 
@@ -1769,6 +1971,23 @@ def run_daemon_loop(hotp_auth: HOTPAuth):
                         peek_data = json.load(f)
                 except Exception:
                     time.sleep(0.5)
+                    continue
+
+                script_type = peek_data.get("script_type")
+                if script_type == "sync_probe":
+                    req_id = target.stem
+                    proc_file = PROCESSING_DIR / f"{req_id}.json"
+                    try:
+                        target.rename(proc_file)
+                    except Exception:
+                        continue
+                    otp_probe = peek_data.get("otp", "")
+                    la = peek_data.get("lookahead", 10)
+                    lb = peek_data.get("lookback")
+                    res = hotp_auth.diagnose_otp_sync(otp_probe, max_lookahead=la, max_lookback=lb)
+                    with open(RESPONSES_DIR / f"{req_id}.json", "w", encoding="utf-8") as f:
+                        json.dump(res, f, indent=2, ensure_ascii=False)
+                    proc_file.unlink(missing_ok=True)
                     continue
 
                 has_otp = bool(peek_data.get("otp"))
@@ -1948,21 +2167,27 @@ def run_cli_client(args, hotp_auth: HOTPAuth):
         print("          DIAGNÓSTICO DE SINCRONIA HOTP (PASSIVO)")
         print("=" * 65)
         if res.get("success"):
-            status_map = {
-                "synchronized": "SINCRONIZADO",
-                "ahead": "COMPATÍVEL (À FRENTE)",
-                "behind": "ATRASADO"
-            }
-            st_badge = status_map.get(res.get("status"), res.get("status", "").upper())
+            st_badge = res.get("status_label", res.get("status", "").upper())
             print(f"  Diagnóstico:        {st_badge}")
             print(f"  Contador no PC:     #{res.get('current_counter')}")
             print(f"  Contador no App:    #{res.get('matched_counter')}")
             print(f"  Próximo OTP:        #{res.get('next_counter')}")
             print("-" * 65)
+            if res.get("summary"):
+                print(f"  Resumo:             {res.get('summary')}")
+            if res.get("action_instruction"):
+                print(f"  Instrução:          {res.get('action_instruction')}")
+            print("-" * 65)
             print(f"  {res.get('message')}")
         else:
-            print("  Status:             NÃO ENCONTRADO")
-            print(f"  Contador no PC:     #{res.get('current_counter')}")
+            print(f"  Status:             {res.get('status_label', 'NÃO ENCONTRADO')}")
+            if res.get("current_counter") is not None:
+                print(f"  Contador no PC:     #{res.get('current_counter')}")
+            print("-" * 65)
+            if res.get("summary"):
+                print(f"  Resumo:             {res.get('summary')}")
+            if res.get("action_instruction"):
+                print(f"  Instrução:          {res.get('action_instruction')}")
             print("-" * 65)
             print(f"  {res.get('message', res.get('error'))}")
         print("=" * 65)
