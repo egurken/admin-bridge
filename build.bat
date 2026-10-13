@@ -17,11 +17,21 @@ if %ERRORLEVEL% NEQ 0 (
 
 echo.
 echo [2/2] Gerando executavel standalone (Onefile com UAC Admin)...
+if exist "C:\Utilitario\AntigravityBridge.exe" (
+    del /f /q "C:\Utilitario\AntigravityBridge.exe" 2>nul
+    if exist "C:\Utilitario\AntigravityBridge.exe" (
+        move /y "C:\Utilitario\AntigravityBridge.exe" "C:\Utilitario\AntigravityBridge_%RANDOM%.old" >nul 2>&1
+    )
+)
+
+if exist "%~dp0icon.ico" (
+    copy /y "%~dp0icon.ico" "C:\Utilitario\icon.ico" >nul 2>&1
+)
+
 python -m PyInstaller ^
-    --uac-admin ^
     --noconsole ^
     --onefile ^
-    --icon="icon.ico" ^
+    --icon="%~dp0icon.ico" ^
     --name="AntigravityBridge" ^
     --distpath="C:\Utilitario" ^
     --workpath="C:\Utilitario\build" ^

@@ -2,6 +2,7 @@ import base64
 import ctypes
 import hashlib
 import hmac
+import json
 import msvcrt
 import os
 import secrets
@@ -28,6 +29,7 @@ crypt32 = ctypes.windll.crypt32
 kernel32 = ctypes.windll.kernel32
 
 DPAPI_ENTROPY = b"AntigravityBridge_TPM_DPAPI_Entropy_2026"
+DPAPI_MAC_ENTROPY = b"AntigravityConfigIntegrityV2"
 CRYPTPROTECT_UI_FORBIDDEN = 0x1
 
 
@@ -38,6 +40,8 @@ def wipe_buffer(buf):
     if isinstance(buf, bytearray):
         for i in range(len(buf)):
             buf[i] = 0
+    elif isinstance(buf, (bytes, str)):
+        pass
 
 
 def dpapi_protect(plaintext: bytes, entropy: bytes = DPAPI_ENTROPY) -> bytes:
@@ -115,6 +119,115 @@ def dpapi_unprotect(ciphertext: bytes, entropy: bytes = DPAPI_ENTROPY) -> bytear
     return bytearray(raw_bytes)
 
 
+def _canonical_payload(cfg: dict) -> bytes:
+    """Gera representação canônica em bytes dos campos sensíveis do estado para assinatura."""
+    fields = [
+        str(cfg.get("provisioned_flag", 0)),
+        str(cfg.get("lockdown", False)),
+        str(cfg.get("counter", 0)),
+        str(cfg.get("digits", 6)),
+        str(cfg.get("look_ahead_window", 5)),
+        str(cfg.get("secret_dpapi", "")),
+        str(cfg.get("recovery_hash_dpapi", "")),
+        str(cfg.get("recovery_salt", "")),
+        json.dumps(cfg.get("failures", []), sort_keys=True)
+    ]
+    return "|".join(fields).encode("utf-8")
+
+
+def compute_integrity_mac(cfg: dict) -> str:
+    """Gera uma assinatura de integridade protegida por DPAPI sobre os metadados do JSON.
+
+    Impede qualquer adulteração manual externa (por exemplo, edição com Bloco de Notas).
+    """
+    payload = _canonical_payload(cfg)
+    digest = hashlib.sha256(payload).digest()
+    encrypted_digest = dpapi_protect(digest, entropy=DPAPI_MAC_ENTROPY)
+    return base64.b64encode(encrypted_digest).decode("ascii")
+
+
+def verify_integrity_mac(cfg: dict) -> bool:
+    """Verifica se a assinatura de integridade corresponde aos metadados do JSON.
+
+    Retorna True se íntegro, False se adulterado ou corrompido.
+    """
+    mac_b64 = cfg.get("integrity_mac")
+    if not mac_b64:
+        return False
+    try:
+        raw_mac = base64.b64decode(mac_b64)
+        expected_digest_ba = dpapi_unprotect(raw_mac, entropy=DPAPI_MAC_ENTROPY)
+        expected_digest = bytes(expected_digest_ba)
+        wipe_buffer(expected_digest_ba)
+
+        payload = _canonical_payload(cfg)
+        actual_digest = hashlib.sha256(payload).digest()
+        return hmac.compare_digest(actual_digest, expected_digest)
+    except Exception:
+        return False
+
+
+def read_passive_metadata(config_path: Path) -> dict:
+    """Lê metadados passivos (contador, flag, falhas, lockdown) SEM decodificar a chave secreta.
+
+    Verifica a assinatura de integridade antes de retornar os dados.
+    """
+    if not config_path.exists():
+        return {
+            "counter": 0,
+            "provisioned_flag": 0,
+            "lockdown": False,
+            "recent_failures": 0,
+            "max_failures": 3,
+            "status_text": "Aguardando Provisionamento",
+            "tampered": False
+        }
+
+    try:
+        with open(config_path, "r", encoding="utf-8") as f:
+            cfg = json.load(f)
+    except Exception:
+        return {
+            "counter": 0,
+            "provisioned_flag": 0,
+            "lockdown": True,
+            "recent_failures": 3,
+            "status_text": "Arquivo Corrompido",
+            "tampered": True
+        }
+
+    is_valid = verify_integrity_mac(cfg)
+    now = time.time()
+    failures_5m = [t for t in cfg.get("failures", []) if (now - t) < 300]
+    lockdown = cfg.get("lockdown", False) or not is_valid
+    provisioned = cfg.get("provisioned_flag", 0) == 1
+
+    status_text = "Ativo"
+    if not is_valid:
+        status_text = "Bloqueado (Adulteração Detectada)"
+    elif lockdown:
+        status_text = "Bloqueado (Lockdown Fail-Safe)"
+    elif not provisioned:
+        status_text = "Aguardando Provisionamento"
+
+    return {
+        "counter": cfg.get("counter", 0),
+        "provisioned_flag": cfg.get("provisioned_flag", 0),
+        "lockdown": lockdown,
+        "recent_failures": len(failures_5m),
+        "max_failures": 3,
+        "status_text": status_text,
+        "tampered": not is_valid,
+        "last_used_at": cfg.get("last_used_at"),
+        "created_at": cfg.get("created_at")
+    }
+
+
+def generate_physical_challenge() -> str:
+    """Gera um código aleatório dinâmico para desafio de presença física na máquina."""
+    return f"PHYS-{secrets.randbelow(900000) + 100000}"
+
+
 def hash_recovery_password(password: str, salt: Optional[bytes] = None) -> Tuple[str, str]:
     """Gera hash seguro PBKDF2-HMAC-SHA256 para a senha de recuperação (600.000 iterações)."""
     if salt is None:
@@ -132,30 +245,63 @@ def verify_recovery_password(password: str, expected_hash_b64: str, salt_b64: st
     return hmac.compare_digest(derived, expected_hash)
 
 
-def apply_strict_acls(target_path: Path):
-    """Aplica permissões ACL restritas no arquivo ou pasta via comando nativo icacls:
+def apply_system_only_ntfs_acls(target_path: Path):
+    """Aplica permissões ACL restritas: Exclusivo para AUTORIDADE NT\\SISTEMA (*S-1-5-18).
 
-    Remove qualquer herança de permissões (/inheritance:r) e concede acesso exclusivo a
-    SYSTEM (*S-1-5-18), grupo de Administradores locais (*S-1-5-32-544) e usuário ativo.
+    Desativa totalmente a herança (/inheritance:r) e NÃO concede permissão para
+    Administradores nem para usuários comuns.
     """
     if not target_path.exists():
         return
-    username = os.getenv("USERNAME", "")
+
     is_dir = target_path.is_dir()
     perm_system = "*S-1-5-18:(OI)(CI)(F)" if is_dir else "*S-1-5-18:(F)"
-    perm_admin = "*S-1-5-32-544:(OI)(CI)(F)" if is_dir else "*S-1-5-32-544:(F)"
-    perm_user = f'"{username}":(OI)(CI)(M)' if is_dir else f'"{username}":(M)'
 
-    cmd = f'icacls "{target_path}" /inheritance:r /grant:r {perm_system} /grant:r {perm_admin} '
-    if username:
-        cmd += f'/grant:r {perm_user} '
-
+    # Desativa herança e concede acesso total EXCLUSIVAMENTE a SYSTEM
+    cmd = f'icacls "{target_path}" /inheritance:r /grant:r {perm_system}'
     try:
         subprocess.run(
             ["cmd.exe", "/c", cmd],
             capture_output=True,
             check=False,
             creationflags=0x08000000  # CREATE_NO_WINDOW
+        )
+    except Exception:
+        pass
+
+    if is_dir:
+        # Aplica aos arquivos internos também
+        cmd_files = f'icacls "{target_path}\\*" /inheritance:r /grant:r *S-1-5-18:(F)'
+        try:
+            subprocess.run(
+                ["cmd.exe", "/c", cmd_files],
+                capture_output=True,
+                check=False,
+                creationflags=0x08000000
+            )
+        except Exception:
+            pass
+
+
+def restore_ntfs_acls_for_removal(target_path: Path):
+    """Assume posse (takeown) e restaura permissões para Administradores para permitir remoção/desinstalação."""
+    if not target_path.exists():
+        return
+
+    try:
+        # 1. Assume a posse do diretório e arquivos
+        subprocess.run(
+            ["takeown", "/f", str(target_path), "/r", "/d", "y"],
+            capture_output=True,
+            check=False,
+            creationflags=0x08000000
+        )
+        # 2. Concede controle total para Administradores (*S-1-5-32-544)
+        subprocess.run(
+            ["icacls", str(target_path), "/grant", "*S-1-5-32-544:(OI)(CI)(F)", "/t"],
+            capture_output=True,
+            check=False,
+            creationflags=0x08000000
         )
     except Exception:
         pass
@@ -262,7 +408,6 @@ def verify_caller_origin(caller_data: Optional[dict]) -> Tuple[bool, str]:
     if not pid:
         return False, "PID do chamador não informado."
 
-    # Verifica se o executável do chamador é o Python oficial da máquina ou o binário do Utilitário
     is_valid_exe = (
         "python" in exe
         or "antigravity" in exe
