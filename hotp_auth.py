@@ -765,15 +765,15 @@ class HOTPAuth:
     def diagnose_otp_sync(
         self,
         provided_otp: str,
-        max_lookahead: int = 150,
-        max_lookback: int = 100
+        max_lookahead: int = 10,
+        max_lookback: Optional[int] = None
     ) -> dict:
         """
         Modo de diagnóstico e teste de sincronia HOTP (RFC 4226).
         NÃO AVANÇA O CONTADOR nem altera nenhum estado ou arquivo.
         
-        Compara o código fornecido contra índices passados e futuros do contador
-        para informar ao usuário em que índice exato o autenticador está.
+        Testa estritamente até 10 posições acima e todas as posições anteriores até 0.
+        Informa o índice exato do autenticador e qual é o próximo OTP necessário.
         """
         clean_otp = str(provided_otp).strip()
         if not clean_otp.isdigit() or len(clean_otp) != DEFAULT_DIGITS:
@@ -798,58 +798,64 @@ class HOTPAuth:
             secret_ba = dpapi_unprotect(secret_enc)
 
             try:
-                min_c = max(0, current_counter - max_lookback)
-                max_c = current_counter + max_lookahead
+                # Busca estritamente no máximo 10 posições acima
+                eff_lookahead = min(max_lookahead if max_lookahead is not None else 10, 10)
+                max_c = current_counter + eff_lookahead
+
+                # Busca até o índice 0 abaixo (ou respeita limite se especificado)
+                min_c = 0 if max_lookback is None else max(0, current_counter - max_lookback)
 
                 # 1. Verifica primeiro o índice atual exato
                 current_expected = self._compute_hotp_internal(secret_ba, current_counter, DEFAULT_DIGITS)
                 if hmac.compare_digest(clean_otp, current_expected):
+                    next_c = current_counter + 1
                     return {
                         "success": True,
                         "matched_counter": current_counter,
                         "current_counter": current_counter,
+                        "next_counter": next_c,
                         "diff": 0,
                         "status": "synchronized",
                         "message": (
                             f"Seu autenticador está no OTP #{current_counter} e está "
-                            f"100% SINCRONIZADO com o computador!"
+                            f"sincronizado com o computador. O próximo OTP necessário é o #{next_c}."
                         )
                     }
 
-                # 2. Busca à frente (lookahead)
+                # 2. Busca estritamente até 10 posições acima (lookahead)
                 for c in range(current_counter + 1, max_c + 1):
                     code = self._compute_hotp_internal(secret_ba, c, DEFAULT_DIGITS)
                     if hmac.compare_digest(clean_otp, code):
                         diff = c - current_counter
+                        next_c = c + 1
                         return {
                             "success": True,
                             "matched_counter": c,
                             "current_counter": current_counter,
+                            "next_counter": next_c,
                             "diff": diff,
                             "status": "ahead",
                             "message": (
-                                f"Seu autenticador está no OTP #{c} ({diff} "
-                                f"{'posição' if diff == 1 else 'posições'} À FRENTE do computador, que está em #{current_counter}).\n"
-                                f"O sistema aceitará o código normalmente e sincronizará de forma automática."
+                                f"Seu autenticador está no OTP #{c}. "
+                                f"O próximo OTP necessário é o #{next_c}."
                             )
                         }
 
-                # 3. Busca atrás (lookback / histórico)
+                # 3. Busca posições anteriores até o zero (lookback)
                 for c in range(current_counter - 1, min_c - 1, -1):
                     code = self._compute_hotp_internal(secret_ba, c, DEFAULT_DIGITS)
                     if hmac.compare_digest(clean_otp, code):
                         diff = c - current_counter
-                        abs_diff = abs(diff)
                         return {
                             "success": True,
                             "matched_counter": c,
                             "current_counter": current_counter,
+                            "next_counter": current_counter,
                             "diff": diff,
                             "status": "behind",
                             "message": (
-                                f"Seu autenticador está no OTP #{c} ({abs_diff} "
-                                f"{'posição' if abs_diff == 1 else 'posições'} ATRÁS do computador, que está em #{current_counter}).\n"
-                                f"Você precisa avançar {abs_diff} vezes no seu aplicativo autenticador para sincronizar."
+                                f"Seu autenticador está no OTP #{c} (abaixo do contador do computador, que está no #{current_counter}). "
+                                f"O próximo OTP necessário no computador é o #{current_counter}."
                             )
                         }
 
@@ -857,12 +863,12 @@ class HOTPAuth:
                     "success": False,
                     "matched_counter": None,
                     "current_counter": current_counter,
+                    "next_counter": current_counter,
                     "diff": None,
                     "status": "not_found",
                     "message": (
-                        f"O código digitado ({clean_otp[:2]}****) não foi encontrado na janela de busca "
-                        f"(índices #{min_c} até #{max_c}, computador em #{current_counter}).\n"
-                        f"Verifique se o código foi digitado corretamente ou se pertence a outra chave."
+                        f"Código OTP ({clean_otp[:2]}****) não encontrado. Foram testadas até 10 posições acima "
+                        f"(#{current_counter} até #{max_c}) e todas as anteriores até #0 (computador em #{current_counter})."
                     )
                 }
 

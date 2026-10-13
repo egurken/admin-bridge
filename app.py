@@ -303,13 +303,21 @@ def perform_full_uninstall(parent_widget=None) -> bool:
 
         # 3. Remove atalhos da Área de Trabalho
         try:
-            desktop = Path(os.environ.get("USERPROFILE", "")) / "Desktop"
-            if desktop.exists():
-                for lnk in desktop.glob("*Antigravity*.lnk"):
-                    try:
-                        lnk.unlink(missing_ok=True)
-                    except Exception:
-                        pass
+            desktops = []
+            ud = get_desktop_dir()
+            if ud and ud.exists():
+                desktops.append(ud)
+            pub = Path(os.environ.get("PUBLIC", "C:/Users/Public")) / "Desktop"
+            if pub.exists() and pub not in desktops:
+                desktops.append(pub)
+            for d in desktops:
+                for pattern in ["*Admin*.lnk", "*Antigravity*.lnk", "*Admin Bridge*"]:
+                    for item in d.glob(pattern):
+                        try:
+                            if item.is_file():
+                                item.unlink(missing_ok=True)
+                        except Exception:
+                            pass
         except Exception:
             pass
 
@@ -1622,17 +1630,10 @@ class AdminBridgeWindow(QMainWindow):
         self.refresh_dashboard()
 
     def open_uninstall_dialog(self):
-        if not is_admin():
-            try:
-                request_elevation_with_args(["uninstall"])
-                return
-            except Exception as e:
-                QMessageBox.critical(self, "Permissão Necessária", f"Privilégios de Administrador são necessários: {e}")
-                return
         res = QMessageBox.question(
             self,
             "Desinstalar Utilitário",
-            "Tem certeza que deseja desinstalar completamente o Antigravity Bridge?\n\n"
+            "Tem certeza que deseja desinstalar completamente o Admin Bridge?\n\n"
             "Esta ação irá:\n"
             "• Remover a tarefa agendada do Windows (schtasks)\n"
             "• Restaurar as permissões de acesso NTFS\n"
@@ -1642,21 +1643,31 @@ class AdminBridgeWindow(QMainWindow):
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
             QMessageBox.StandardButton.No
         )
-        if res == QMessageBox.StandardButton.Yes:
-            success = perform_full_uninstall(self)
-            if success:
-                QMessageBox.information(
-                    self,
-                    "Desinstalação Concluída",
-                    "O Antigravity Bridge foi desinstalado com sucesso da máquina."
-                )
-                self.quit_app()
-            else:
-                QMessageBox.critical(
-                    self,
-                    "Erro",
-                    "Falha ao executar a rotina de desinstalação completa."
-                )
+        if res != QMessageBox.StandardButton.Yes:
+            return
+
+        if not is_admin():
+            try:
+                request_elevation_with_args(["uninstall", "--force"])
+                return
+            except Exception as e:
+                QMessageBox.critical(self, "Permissão Necessária", f"Privilégios de Administrador são necessários: {e}")
+                return
+
+        success = perform_full_uninstall(self)
+        if success:
+            QMessageBox.information(
+                self,
+                "Desinstalação Concluída",
+                "O Admin Bridge foi desinstalado com sucesso da máquina."
+            )
+            self.quit_app()
+        else:
+            QMessageBox.critical(
+                self,
+                "Erro",
+                "Falha ao executar a rotina de desinstalação completa."
+            )
 
     def show_counter_status_dialog(self):
         st = self.hotp_auth.get_counter_status()
@@ -1691,31 +1702,36 @@ class AdminBridgeWindow(QMainWindow):
 
         res = self.hotp_auth.diagnose_otp_sync(otp.strip())
         if res.get("success"):
+            matched = res.get("matched_counter")
+            current = res.get("current_counter")
+            next_otp = res.get("next_counter")
+            msg = res.get("message")
             if res.get("status") == "synchronized":
                 QMessageBox.information(
                     self,
-                    "Autenticador 100% Sincronizado",
-                    f"✅ {res.get('message')}\n\n"
-                    f"• Contador no Computador: #{res.get('current_counter')}\n"
-                    f"• Contador no Autenticador: #{res.get('matched_counter')}"
+                    "Autenticador Sincronizado",
+                    f"✅ {msg}\n\n"
+                    f"• Contador do Celular: #{matched}\n"
+                    f"• Contador no Computador: #{current}\n"
+                    f"• Próximo OTP Necessário: #{next_otp}"
                 )
             elif res.get("status") == "ahead":
                 QMessageBox.information(
                     self,
-                    "Autenticador À Frente (Compatível)",
-                    f"ℹ️ {res.get('message')}\n\n"
-                    f"• Contador no Computador: #{res.get('current_counter')}\n"
-                    f"• Contador no Autenticador: #{res.get('matched_counter')}\n"
-                    f"• Diferença: {res.get('diff')} posições à frente"
+                    "Autenticador Identificado",
+                    f"ℹ️ {msg}\n\n"
+                    f"• Contador do Celular: #{matched}\n"
+                    f"• Contador no Computador: #{current}\n"
+                    f"• Próximo OTP Necessário: #{next_otp}"
                 )
             else:
                 QMessageBox.warning(
                     self,
                     "Autenticador Atrasado",
-                    f"⚠️ {res.get('message')}\n\n"
-                    f"• Contador no Computador: #{res.get('current_counter')}\n"
-                    f"• Contador no Autenticador: #{res.get('matched_counter')}\n"
-                    f"• Diferença: {abs(res.get('diff', 0))} posições atrás"
+                    f"⚠️ {msg}\n\n"
+                    f"• Contador do Celular: #{matched}\n"
+                    f"• Contador no Computador: #{current}\n"
+                    f"• Próximo OTP Necessário no Computador: #{next_otp}"
                 )
         else:
             QMessageBox.critical(
@@ -1862,6 +1878,32 @@ def run_daemon_loop(hotp_auth: HOTPAuth):
         time.sleep(1.0)
 
 
+def safe_input(prompt: str = "") -> str:
+    """Lê entrada com proteção absoluta contra 'RuntimeError: lost sys.stdin' e suporte a fallback de diálogo."""
+    if sys.stdin is not None:
+        try:
+            return input(prompt)
+        except (RuntimeError, EOFError):
+            pass
+        try:
+            line = sys.stdin.readline()
+            if line:
+                return line.strip()
+        except Exception:
+            pass
+
+    if sys.platform == "win32":
+        try:
+            # Diálogo nativo MB_ICONQUESTION (0x20) | MB_YESNO (0x04)
+            ret = ctypes.windll.user32.MessageBoxW(0, prompt or "Confirmar ação?", "Admin Bridge", 0x24)
+            if ret == 6:  # IDYES
+                return "s"
+            return "n"
+        except Exception:
+            pass
+    return ""
+
+
 # -----------------------------------------------------------------------------
 # INTERFACE DE LINHA DE COMANDO (CLI) INTEGRAL
 # -----------------------------------------------------------------------------
@@ -1872,8 +1914,16 @@ def run_cli_client(args, hotp_auth: HOTPAuth):
             if ctypes.windll.kernel32.AttachConsole(-1):
                 sys.stdout = open("CONOUT$", "w", encoding="utf-8", errors="replace")
                 sys.stderr = open("CONOUT$", "w", encoding="utf-8", errors="replace")
+                try:
+                    sys.stdin = open("CONIN$", "r", encoding="utf-8", errors="replace")
+                except Exception:
+                    pass
         except Exception:
             pass
+
+    if sys.stdin is None:
+        import io
+        sys.stdin = io.StringIO("")
 
     if args.subcommand == "status":
         st = hotp_auth.get_counter_status()
@@ -1891,15 +1941,15 @@ def run_cli_client(args, hotp_auth: HOTPAuth):
         sys.exit(0)
 
     elif args.subcommand in ("sync", "check-otp"):
-        lookahead = getattr(args, "lookahead", 150)
-        lookback = getattr(args, "lookback", 100)
-        res = hotp_auth.diagnose_otp_sync(args.otp, max_lookahead=lookahead, max_lookback=lookback)
+        lookahead = getattr(args, "lookahead", 10)
+        lookback = getattr(args, "lookback", None)
+        res = hotp_auth.diagnose_otp_sync(args.otp, max_lookahead=min(lookahead, 10), max_lookback=lookback)
         print("=" * 65)
         print("          DIAGNÓSTICO DE SINCRONIA HOTP (PASSIVO)")
         print("=" * 65)
         if res.get("success"):
             status_map = {
-                "synchronized": "100% SINCRONIZADO",
+                "synchronized": "SINCRONIZADO",
                 "ahead": "COMPATÍVEL (À FRENTE)",
                 "behind": "ATRASADO"
             }
@@ -1907,13 +1957,7 @@ def run_cli_client(args, hotp_auth: HOTPAuth):
             print(f"  Diagnóstico:        {st_badge}")
             print(f"  Contador no PC:     #{res.get('current_counter')}")
             print(f"  Contador no App:    #{res.get('matched_counter')}")
-            diff = res.get("diff", 0)
-            if diff > 0:
-                print(f"  Diferença:          +{diff} posições à frente")
-            elif diff < 0:
-                print(f"  Diferença:          {diff} posições atrás")
-            else:
-                print(f"  Diferença:          0 (Exato)")
+            print(f"  Próximo OTP:        #{res.get('next_counter')}")
             print("-" * 65)
             print(f"  {res.get('message')}")
         else:
@@ -1948,12 +1992,15 @@ def run_cli_client(args, hotp_auth: HOTPAuth):
         print("=" * 60)
         user_ch = getattr(args, "challenge", None)
         if not user_ch:
-            user_ch = input("Digite o código de presença física acima: ").strip()
+            user_ch = safe_input("Digite o código de presença física acima: ").strip()
 
         pw = getattr(args, "password", None)
         if not pw:
-            import getpass
-            pw = getpass.getpass("Digite sua Palavra-passe de Recuperação: ").strip()
+            try:
+                import getpass
+                pw = getpass.getpass("Digite sua Palavra-passe de Recuperação: ").strip()
+            except Exception:
+                pw = safe_input("Digite sua Palavra-passe de Recuperação: ").strip()
 
         try:
             caller_info = {
@@ -1977,7 +2024,7 @@ def run_cli_client(args, hotp_auth: HOTPAuth):
     elif args.subcommand == "uninstall":
         force = getattr(args, "force", False)
         if not force:
-            ans = input("Tem certeza que deseja desinstalar completamente o utilitário? (s/N): ").strip().lower()
+            ans = safe_input("Tem certeza que deseja desinstalar completamente o utilitário? (s/N): ").strip().lower()
             if ans not in ("s", "sim", "y", "yes"):
                 print("Operação cancelada.")
                 sys.exit(0)
@@ -2086,8 +2133,8 @@ def run_cli_setup(args, hotp_auth: HOTPAuth):
             pw = getpass.getpass("Defina a Palavra-passe de Recuperação (mínimo 8 caracteres): ").strip()
             pw_conf = getpass.getpass("Confirme a Palavra-passe de Recuperação: ").strip()
         except Exception:
-            pw = input("Defina a Palavra-passe de Recuperação (mínimo 8 caracteres): ").strip()
-            pw_conf = input("Confirme a Palavra-passe de Recuperação: ").strip()
+            pw = safe_input("Defina a Palavra-passe de Recuperação (mínimo 8 caracteres): ").strip()
+            pw_conf = safe_input("Confirme a Palavra-passe de Recuperação: ").strip()
 
         if pw != pw_conf:
             print("\n[ERRO]: As senhas digitadas não coincidem. Operação cancelada.", file=sys.stderr)
@@ -2178,8 +2225,8 @@ def main():
     # Comando sync (teste passivo de sincronia do contador)
     p_sync = subparsers.add_parser("sync", help="Diagnóstico e teste de sincronia HOTP sem avançar o contador")
     p_sync.add_argument("--otp", required=True, help="Código OTP de 6 dígitos gerado no aplicativo do celular")
-    p_sync.add_argument("--lookahead", type=int, default=150, help="Janela máxima de busca à frente (padrão: 150)")
-    p_sync.add_argument("--lookback", type=int, default=100, help="Janela máxima de busca atrás (padrão: 100)")
+    p_sync.add_argument("--lookahead", type=int, default=10, help="Janela máxima de busca à frente (padrão: 10)")
+    p_sync.add_argument("--lookback", type=int, default=None, help="Janela máxima de busca atrás (padrão: até o zero)")
 
     # Comando history
     subparsers.add_parser("history", help="Exibe o histórico recente de auditoria e execuções")
@@ -2214,7 +2261,10 @@ def main():
     if args.subcommand:
         if args.subcommand in ("setup", "reset", "uninstall") and not is_admin():
             try:
-                request_elevation()
+                cli_args = [args.subcommand]
+                if getattr(args, "force", False):
+                    cli_args.append("--force")
+                request_elevation_with_args(cli_args)
                 return
             except Exception as e:
                 print(f"[ERRO] Permissão de Administrador necessária: {e}", file=sys.stderr)

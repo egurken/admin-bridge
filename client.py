@@ -140,8 +140,7 @@ def main():
     # Subcomando: sync (diagnóstico passivo de sincronia)
     p_sync = subparsers.add_parser("sync", help="Diagnóstico e teste de sincronia HOTP sem avançar o contador")
     p_sync.add_argument("--otp", required=True, help="Código OTP de 6 dígitos gerado no celular")
-    p_sync.add_argument("--lookahead", type=int, default=150, help="Janela máxima à frente (padrão: 150)")
-    p_sync.add_argument("--lookback", type=int, default=100, help="Janela máxima atrás (padrão: 100)")
+    p_sync.add_argument("--lookahead", type=int, default=10, help="Janela máxima à frente (padrão: 10)")
 
     # Subcomando: history
     subparsers.add_parser("history", help="Exibe histórico recente de execuções")
@@ -204,10 +203,11 @@ def main():
         exe_path = BASE_DIR / "AntigravityBridge.exe"
         if not exe_path.exists():
             exe_path = BASE_DIR / "AdminBridge.exe"
+        lookahead = getattr(args, "lookahead", 10)
         if exe_path.exists():
-            cmd = [str(exe_path), "sync", "--otp", args.otp, "--lookahead", str(args.lookahead), "--lookback", str(args.lookback)]
+            cmd = [str(exe_path), "sync", "--otp", args.otp, "--lookahead", str(lookahead)]
         else:
-            cmd = [sys.executable, str(BASE_DIR / "app.py"), "sync", "--otp", args.otp, "--lookahead", str(args.lookahead), "--lookback", str(args.lookback)]
+            cmd = [sys.executable, str(BASE_DIR / "app.py"), "sync", "--otp", args.otp, "--lookahead", str(lookahead)]
         res = subprocess.run(cmd)
         sys.exit(res.returncode)
 

@@ -150,30 +150,46 @@ def test_all_security_rules():
         c_before_sync = auth.get_counter_status()["counter"]
         secret_ba_test = bytearray(secret_bytes_pre)
         current_sync_otp = auth._compute_hotp_internal(secret_ba_test, c_before_sync, 6)
-        future_sync_otp = auth._compute_hotp_internal(secret_ba_test, c_before_sync + 5, 6)
+        future_sync_otp_5 = auth._compute_hotp_internal(secret_ba_test, c_before_sync + 5, 6)
+        future_sync_otp_15 = auth._compute_hotp_internal(secret_ba_test, c_before_sync + 15, 6)
+        past_sync_otp_0 = auth._compute_hotp_internal(secret_ba_test, 0, 6)
 
-        # 1. Código exato do contador atual: deve reportar 'synchronized'
+        # 1. Código exato do contador atual: deve reportar 'synchronized' e next_counter = c + 1
         diag_cur = auth.diagnose_otp_sync(current_sync_otp)
         assert diag_cur["success"]
         assert diag_cur["status"] == "synchronized"
         assert diag_cur["matched_counter"] == c_before_sync
-        assert diag_cur["diff"] == 0
+        assert diag_cur["next_counter"] == c_before_sync + 1
+        assert "sincronizado" in diag_cur["message"].lower()
 
-        # 2. Código 5 posições à frente: deve reportar 'ahead'
-        diag_ahead = auth.diagnose_otp_sync(future_sync_otp)
+        # 2. Código 5 posições à frente: deve reportar 'ahead' e next_counter = c + 5 + 1
+        diag_ahead = auth.diagnose_otp_sync(future_sync_otp_5)
         assert diag_ahead["success"]
         assert diag_ahead["status"] == "ahead"
         assert diag_ahead["matched_counter"] == c_before_sync + 5
+        assert diag_ahead["next_counter"] == c_before_sync + 5 + 1
         assert diag_ahead["diff"] == 5
 
-        # 3. Código inexistente / errado: deve reportar 'not_found'
+        # 3. Código 15 posições à frente (acima do limite estrito de 10): NÃO DEVE ENCONTRAR
+        diag_far = auth.diagnose_otp_sync(future_sync_otp_15)
+        assert not diag_far["success"] or diag_far["status"] == "not_found"
+
+        # 4. Código anterior (posição 0): se c_before_sync > 0, deve reportar 'behind'
+        if c_before_sync > 0:
+            diag_past = auth.diagnose_otp_sync(past_sync_otp_0)
+            assert diag_past["success"]
+            assert diag_past["status"] == "behind"
+            assert diag_past["matched_counter"] == 0
+            assert diag_past["next_counter"] == c_before_sync
+
+        # 5. Código inválido / inexistente
         diag_none = auth.diagnose_otp_sync("000000" if current_sync_otp != "000000" else "999999")
         assert not diag_none["success"] or diag_none["status"] == "not_found"
 
-        # 4. CRÍTICO: Garantir que o contador NÃO se moveu após os 3 diagnósticos
+        # 6. CRÍTICO: Garantir que o contador NÃO se moveu durante nenhuma das checagens
         c_after_sync = auth.get_counter_status()["counter"]
         assert c_before_sync == c_after_sync, f"Contador alterado indevidamente durante probe passivo! ({c_before_sync} != {c_after_sync})"
-        print("  -> PASSOU: Diagnóstico passivo detecta índices sem mover o contador!")
+        print("  -> PASSOU: Diagnóstico passivo estritamente limitado a 10 acima, busca até 0 e reporta próximo OTP!")
 
     print("\n=======================================================")
     print("TODOS OS REQUISITOS DE SEGURANÇA FORAM TESTADOS E APROVADOS!")
