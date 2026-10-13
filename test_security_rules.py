@@ -1,7 +1,13 @@
 import json
 import tempfile
+import time
 from pathlib import Path
 from hotp_auth import HOTPAuth, SecurityError
+from hotp_crypto import (
+    verify_owner_anchor, verify_owner_password, generate_mutual_confirmation_code
+)
+from app import is_self_targeting_command
+
 
 def test_all_security_rules():
     with tempfile.TemporaryDirectory() as tmpdir:
@@ -256,6 +262,86 @@ def test_all_security_rules():
         ok_rep_good, _ = auth.repair_corrupted_installation("SenhaMestra@2026")
         assert ok_rep_good
         print("  -> PASSOU: Status Bloqueado por adulteração limpo e reparo protegido por senha mestra!")
+
+        # -------------------------------------------------------------
+        # TESTE 13: Bloqueio de Comandos Auto-Direcionados
+        # -------------------------------------------------------------
+        print("[*] 13. Testando Bloqueio de Comandos Auto-Direcionados...")
+        assert is_self_targeting_command(r"dir C:\Utilitario")
+        assert is_self_targeting_command(r"cat c:/utilitario/config/hotp_config.json")
+        assert is_self_targeting_command(r"cd UTILIT~1")
+        assert is_self_targeting_command(r"schtasks /delete /tn AdminBridge /f")
+        assert is_self_targeting_command(r"powershell -ExecutionPolicy Bypass -File C:\Utilitario\AdminBridge.exe")
+        # Comando Powershell ofuscado em Base64 contendo 'c:\utilitario'
+        import base64 as b64_mod
+        b64_evil = b64_mod.b64encode(r"Get-ChildItem C:\Utilitario".encode("utf-16le")).decode("ascii")
+        assert is_self_targeting_command(f"powershell.exe -enc {b64_evil}")
+        # Comando legítimo não direcionado ao utilitário
+        assert not is_self_targeting_command("ipconfig /all")
+        assert not is_self_targeting_command("netstat -ano")
+        print("  -> PASSOU: Comandos auto-direcionados e ofuscados bloqueados com sucesso!")
+
+        # -------------------------------------------------------------
+        # TESTE 14: Âncora Soberana Ed25519 e Validação da Senha Mestra
+        # -------------------------------------------------------------
+        print("[*] 14. Testando Âncora Soberana Ed25519 e Senha Mestra...")
+        res_anchor = auth.provision("SenhaSoberana@2026", force=True, caller_info=caller)
+        anchor_file = auth.config_dir / "owner_anchor.json"
+        if not anchor_file.exists():
+            anchor_file = auth.config_dir.parent / "config" / "owner_anchor.json"
+
+        ok_anc, msg_anc = verify_owner_anchor(anchor_file, auth.config_dir)
+        assert ok_anc, f"Falha na verificacao da ancora: {msg_anc}"
+        assert verify_owner_password("SenhaSoberana@2026", anchor_file, auth.config_dir)
+        assert not verify_owner_password("SenhaIncorreta@123", anchor_file, auth.config_dir)
+        print("  -> PASSOU: Âncora Ed25519 soberana e Senha Mestra validadas com sucesso!")
+
+        # -------------------------------------------------------------
+        # TESTE 15: Ciclo de 14 Dias e Renovação sem Bloqueio Abrupto
+        # -------------------------------------------------------------
+        print("[*] 15. Testando Ciclo de 14 Dias e Renovação de Senha Mestra...")
+        ok_14d_init, elapsed_init = auth.check_owner_password_status()
+        assert ok_14d_init
+        assert elapsed_init < 60
+
+        # Simula expiração forçando timestamp para 15 dias atrás
+        with open(cfg_path, "r", encoding="utf-8") as f:
+            cfg_14d = json.load(f)
+        cfg_14d["last_owner_password_verified_at"] = time.time() - (15 * 86400)
+        auth._save_config_raw(cfg_14d)
+
+        ok_14d_exp, elapsed_exp = auth.check_owner_password_status()
+        assert not ok_14d_exp, "Ciclo de 14 dias deveria constar como expirado"
+        assert elapsed_exp >= 15 * 86400
+
+        # Renovação com senha incorreta deve falhar
+        ok_renew_bad = auth.refresh_owner_password_verification("SenhaErrada")
+        assert not ok_renew_bad
+
+        # Renovação com senha soberana legítima deve ter sucesso
+        ok_renew_good = auth.refresh_owner_password_verification("SenhaSoberana@2026")
+        assert ok_renew_good
+
+        ok_14d_renewed, _ = auth.check_owner_password_status()
+        assert ok_14d_renewed
+        print("  -> PASSOU: Ciclo de 14 dias detecta expiração e renova com Senha Mestra!")
+
+        # -------------------------------------------------------------
+        # TESTE 16: Contra-Senha de Confirmação Mútua do HOTP
+        # -------------------------------------------------------------
+        print("[*] 16. Testando Contra-Senha de Confirmação Mútua no Modo Auth...")
+        secret_b32_16 = urllib.parse.parse_qs(urllib.parse.urlparse(res_anchor["uri"]).query)["secret"][0]
+        secret_ba_16 = bytearray(b64_mod.b32decode(secret_b32_16))
+        valid_otp_16 = auth._compute_hotp_internal(secret_ba_16, 0, 6)
+
+        ok_ticket_16, msg_ticket_16, data_ticket_16 = auth.create_preauth_ticket(valid_otp_16, caller)
+        assert ok_ticket_16
+        assert "mutual_confirmation_code" in data_ticket_16
+        m_code = data_ticket_16["mutual_confirmation_code"]
+        assert len(m_code) == 6
+        expected_m_code = generate_mutual_confirmation_code(bytes(secret_ba_16), valid_otp_16)
+        assert m_code == expected_m_code
+        print("  -> PASSOU: Contra-senha mútua gerada e validada matematicamente no modo auth!")
 
     print("\n=======================================================")
     print("TODOS OS REQUISITOS DE SEGURANÇA FORAM TESTADOS E APROVADOS!")

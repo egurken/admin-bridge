@@ -20,14 +20,19 @@ from hotp_crypto import (
     check_integrity_mac,
     compute_integrity_mac,
     create_detached_signature_file,
+    create_owner_anchor,
     dpapi_protect,
     dpapi_unprotect,
+    generate_mutual_confirmation_code,
     generate_physical_challenge,
+    get_file_usn,
     hash_recovery_password,
     read_passive_metadata,
     restore_ntfs_acls_for_removal,
     verify_caller_origin,
     verify_integrity_mac,
+    verify_owner_anchor,
+    verify_owner_password,
     verify_recovery_password,
     wipe_buffer,
     DPAPI_ENTROPY,
@@ -72,7 +77,7 @@ class HOTPAuth:
     # OPERAÇÕES DE ARQUIVO E INTEGRIDADE (DPAPI MAC)
     # -------------------------------------------------------------------------
     def _load_config_raw(self) -> dict:
-        """Carrega a configuração bruta e valida a assinatura de integridade HMAC/DPAPI."""
+        """Carrega a configuracao bruta e valida a assinatura de integridade HMAC/DPAPI e USN."""
         try:
             if not self.config_file.exists():
                 return {}
@@ -84,20 +89,9 @@ class HOTPAuth:
         if not cfg:
             return {}
 
-        # Validação estrita da assinatura de integridade
-        is_valid, reason = check_integrity_mac(cfg)
+        # Validacao estrita da assinatura de integridade e do USN
+        is_valid, reason = check_integrity_mac(cfg, self.config_file)
         if not is_valid:
-            if reason == "decrypt_error":
-                # Tenta auto-migração se a chave foi protegida sob a conta de usuário legada
-                try:
-                    if self.migrate_config_to_machine_dpapi():
-                        with open(self.config_file, "r", encoding="utf-8") as f:
-                            cfg = json.load(f)
-                        if verify_integrity_mac(cfg):
-                            return cfg
-                except Exception:
-                    pass
-
             self._log_audit(
                 "TAMPER_DETECTED",
                 cfg.get("counter", 0),
@@ -113,10 +107,7 @@ class HOTPAuth:
         return cfg
 
     def migrate_config_to_machine_dpapi(self) -> bool:
-        """Migra de forma transparente o arquivo hotp_config.json legado para DPAPI de máquina.
-
-        Permite que o serviço SYSTEM e o usuário autentiquem sem violações de integridade.
-        """
+        """Migra o arquivo hotp_config.json para DPAPI de maquina apenas se o arquivo for autentico."""
         with AtomicLock():
             if not self.config_file.exists():
                 return False
@@ -124,6 +115,11 @@ class HOTPAuth:
                 with open(self.config_file, "r", encoding="utf-8") as f:
                     cfg = json.load(f)
                 if not cfg.get("secret_dpapi"):
+                    return False
+
+                # Nao migra e nao re-assina arquivo que ja foi adulterado
+                is_valid, _ = check_integrity_mac(cfg, self.config_file)
+                if not is_valid:
                     return False
 
                 sec_raw = base64.b64decode(cfg["secret_dpapi"])
@@ -140,15 +136,16 @@ class HOTPAuth:
                 cfg["recovery_hash_dpapi"] = base64.b64encode(new_rec_dpapi).decode("ascii")
                 cfg["integrity_mac"] = compute_integrity_mac(cfg)
 
-                # Gravação atômica
+                # Gravacao atomica
                 tmp_file = self.config_file.with_suffix(".tmp")
                 with open(tmp_file, "w", encoding="utf-8") as f:
                     json.dump(cfg, f, indent=2, ensure_ascii=False)
                 tmp_file.replace(self.config_file)
 
                 apply_isolated_bridge_ntfs_acls(BASE_DIR)
+                create_detached_signature_file(self.config_file, cfg)
                 self._update_public_status(cfg)
-                logging.info("[MIGRAÇÃO] hotp_config.json migrado para DPAPI de máquina com sucesso.")
+                logging.info("[MIGRAÇÃO] hotp_config.json migrado para DPAPI de maquina com sucesso.")
                 return True
             except Exception as e:
                 logging.warning(f"[MIGRAÇÃO] Falha ao migrar hotp_config.json: {e}")
@@ -262,6 +259,11 @@ class HOTPAuth:
         otp = bin_code % (10**digits)
         return str(otp).zfill(digits)
 
+    @staticmethod
+    def compute_hotp(secret: bytes, counter: int, digits: int = 6) -> str:
+        """Alias para compatibilidade retroativa de calculo do HOTP RFC 4226."""
+        return HOTPAuth._compute_hotp_internal(bytearray(secret), counter, digits)
+
     # -------------------------------------------------------------------------
     # PROVISIONAMENTO INICIAL
     # -------------------------------------------------------------------------
@@ -271,6 +273,9 @@ class HOTPAuth:
             cfg = self._load_config_raw()
             if cfg:
                 return cfg.get("provisioned_flag", 0) == 1
+        except SecurityError:
+            # Se o arquivo existe e foi adulterado, ele esta provisionado [mas bloqueado]
+            return True
         except Exception:
             pass
 
@@ -283,6 +288,9 @@ class HOTPAuth:
             except Exception:
                 pass
 
+        if self.config_file.exists():
+            return True
+
         return False
 
     def is_lockdown(self) -> bool:
@@ -291,6 +299,8 @@ class HOTPAuth:
             cfg = self._load_config_raw()
             if cfg:
                 return cfg.get("lockdown", False) is True
+        except SecurityError:
+            return True
         except Exception:
             pass
 
@@ -304,10 +314,81 @@ class HOTPAuth:
 
         return False
 
+    def force_lockdown(self, reason: str = "Bloqueio forçado"):
+        """Força o estado de lockdown de segurança no arquivo de configuração."""
+        with AtomicLock():
+            try:
+                if self.config_file.exists():
+                    try:
+                        with open(self.config_file, "r", encoding="utf-8") as f:
+                            cfg = json.load(f)
+                    except Exception:
+                        cfg = {}
+                    cfg["lockdown"] = True
+                    cfg["lockdown_reason"] = reason
+                    self._save_config_raw(cfg)
+                else:
+                    self._update_public_status({"lockdown": True, "lockdown_reason": reason, "provisioned_flag": 0})
+            except Exception:
+                pass
+
+    def check_owner_password_status(self) -> Tuple[bool, float]:
+        """Verifica se o ciclo de 14 dias para confirmação da Senha Mestra expirou.
+
+        Retorna [True, segundos_decorridos] se ainda dentro dos 14 dias.
+        Retorna [False, segundos_decorridos] se o ciclo de 14 dias expirou.
+        """
+        try:
+            cfg = self._load_config_raw()
+            last_v = cfg.get("last_owner_password_verified_at")
+            if not last_v:
+                return True, 0.0
+            elapsed = time.time() - float(last_v)
+            is_valid = elapsed <= 1209600.0
+            return is_valid, elapsed
+        except Exception:
+            return True, 0.0
+
+    def refresh_owner_password_verification(self, password: str) -> bool:
+        """Renova o ciclo de 14 dias mediante confirmação da Senha Mestra legítima."""
+        with AtomicLock():
+            try:
+                anchor_file = self.config_dir / "owner_anchor.json"
+                if anchor_file.exists():
+                    if not verify_owner_password(password, anchor_file, self.config_dir.parent):
+                        return False
+                else:
+                    cfg = self._load_config_raw()
+                    salt_b64 = cfg.get("recovery_salt")
+                    hash_dpapi_b64 = cfg.get("recovery_hash_dpapi")
+                    if not salt_b64 or not hash_dpapi_b64:
+                        return False
+                    hash_raw = base64.b64decode(hash_dpapi_b64)
+                    expected_hash_ba = dpapi_unprotect(hash_raw)
+                    expected_hash = bytes(expected_hash_ba).decode("ascii")
+                    wipe_buffer(expected_hash_ba)
+                    if not verify_recovery_password(password, expected_hash, salt_b64):
+                        return False
+
+                cfg = self._load_config_raw()
+                cfg["last_owner_password_verified_at"] = time.time()
+                self._save_config_raw(cfg)
+                self._log_audit(
+                    "OWNER_PASSWORD_REFRESHED",
+                    cfg.get("counter", 0),
+                    cfg.get("counter", 0),
+                    True,
+                    "Ciclo de 14 dias da Senha Mestra renovado com sucesso pelo proprietario."
+                )
+                return True
+            except Exception as e:
+                logging.warning(f"Falha ao renovar ciclo de 14 dias: {e}")
+                return False
+
     def provision(self, recovery_password: str, force: bool = False, caller_info: Optional[dict] = None) -> dict:
         """Gera a chave secreta inicial em memória, protege com DPAPI e trava o flag em 1.
 
-        Permitido estritamente uma única vez (ou durante reset autenticado).
+        Permitido estritamente uma única vez [ou durante reset autenticado].
         """
         with AtomicLock():
             cfg = {}
@@ -336,6 +417,12 @@ class HOTPAuth:
 
             if not recovery_password or len(recovery_password) < 8:
                 raise ValueError("A palavra-passe de recuperação deve conter pelo menos 8 caracteres.")
+
+            # Cria a ancora Ed25519 do proprietario
+            try:
+                create_owner_anchor(recovery_password, self.config_dir.parent)
+            except Exception as e:
+                logging.warning(f"Aviso ao gerar ancora do proprietario: {e}")
 
             # 1. Gera segredo criptográfico de 160 bits - 20 bytes
             raw_secret = secrets.token_bytes(20)
@@ -373,6 +460,7 @@ class HOTPAuth:
                 "created_at": datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S"),
                 "last_used_at": None,
                 "last_success_counter": 0,
+                "last_owner_password_verified_at": time.time(),
             }
             self._save_config_raw(new_config)
 
@@ -772,10 +860,22 @@ class HOTPAuth:
         if not is_valid:
             return False, auth_msg, {}
 
+        # Deriva a contra-senha de confirmacao mutua
+        mutual_code = ""
+        try:
+            cfg = self._load_config_raw()
+            sec_raw = base64.b64decode(cfg["secret_dpapi"])
+            sec_ba = dpapi_unprotect(sec_raw)
+            mutual_code = generate_mutual_confirmation_code(bytes(sec_ba), otp)
+            wipe_buffer(sec_ba)
+        except Exception:
+            pass
+
         token = secrets.token_hex(24)
         token_hash = hashlib.sha256(token.encode("ascii")).hexdigest()
         ticket_data = {
             "token_hash": token_hash,
+            "mutual_confirmation_code": mutual_code,
             "caller_user": caller.get("user", os.getenv("USERNAME", "unknown")),
             "caller_pid": caller.get("pid", 0),
             "counter_used": used_counter - 1,
@@ -804,6 +904,7 @@ class HOTPAuth:
 
         return True, f"Pre-autorizacao confirmada com sucesso! Valida por ate {lifetime_seconds // 60} minutos.", {
             "token": token,
+            "mutual_confirmation_code": mutual_code,
             "expires_in": lifetime_seconds,
             "counter": used_counter - 1
         }

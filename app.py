@@ -1,4 +1,5 @@
 import argparse
+import base64
 import ctypes
 from ctypes import wintypes
 import gc
@@ -34,7 +35,7 @@ from hotp_auth import HOTPAuth, SecurityError, PREAUTH_TICKET_FILE
 from hotp_crypto import (
     wipe_buffer, apply_isolated_bridge_ntfs_acls, apply_system_only_ntfs_acls, restore_ntfs_acls_for_removal,
     verify_caller_origin, generate_physical_challenge, read_passive_metadata, check_forensic_integrity,
-    configure_anti_dump_mitigations
+    configure_anti_dump_mitigations, harden_process_dacl
 )
 from app_icon import get_app_icon
 
@@ -188,18 +189,100 @@ def ensure_environment_installed():
         except Exception as e:
             logging.warning(f"Aviso ao copiar executavel para C:\\Utilitario: {e}")
 
-    # Aplica permissões restritas exclusivas para SYSTEM se for Administrador
+    # Aplica permissoes restritas exclusivas para SYSTEM se for Administrador
     if is_admin():
         apply_isolated_bridge_ntfs_acls(BASE_DIR)
 
-    # Migração automática transparente para DPAPI de máquina
+    create_desktop_shortcut()
+
+
+def is_self_targeting_command(cmd_text: str) -> bool:
+    r"""Verifica se uma linha de comando tenta inspecionar, alterar ou afetar a pasta C:\Utilitario ou seus processos."""
+    if not cmd_text:
+        return False
+    raw = cmd_text.lower()
+
+    # 1. Alvos diretos e caminhos proibidos
+    forbidden_targets = [
+        "c:\\utilitario",
+        "c:/utilitario",
+        "\\utilitario",
+        "/utilitario",
+        "utilit~1",
+        "adminbridge.exe",
+        "adminbridge",
+        "hotp_config.json",
+        "owner_anchor.json",
+        "system32\\tasks\\adminbridge",
+        "system32/tasks/adminbridge",
+    ]
+
+    for target in forbidden_targets:
+        if target in raw:
+            return True
+
+    # 2. Desofuscacao de comandos PowerShell codificados em Base64 [-enc ou -encodedcommand]
+    if "-enc" in raw or "-encodedcommand" in raw:
+        try:
+            parts = cmd_text.split()
+            for idx, part in enumerate(parts):
+                if part.lower() in ("-enc", "-encodedcommand") and idx + 1 < len(parts):
+                    b64_str = parts[idx + 1]
+                    decoded_bytes = base64.b64decode(b64_str)
+                    decoded_str = decoded_bytes.decode("utf-16le", errors="ignore").lower()
+                    for target in forbidden_targets:
+                        if target in decoded_str:
+                            return True
+        except Exception:
+            pass
+
+    return False
+
+
+def trigger_incident_lockdown(req_id: Optional[str] = None, reason: str = "Adulteração ou violação detectada"):
+    """Dispara o Protocolo de Incidente com desarmamento imediato da tarefa agendada e registro."""
+    logging.critical(f"[LOCKDOWN PROTOCOL] {reason}")
+
+    # 1. Desarma a tarefa agendada imediatamente
     try:
-        hotp_auth = HOTPAuth()
-        hotp_auth.migrate_config_to_machine_dpapi()
+        for tn in ("AdminBridge", "AntigravityAdminBridge"):
+            subprocess.run(["schtasks", "/delete", "/tn", tn, "/f"], capture_output=True, check=False, creationflags=0x08000000)
+    except Exception as e:
+        logging.error(f"Erro ao desarmar tarefa agendada: {e}")
+
+    # 2. Força o estado de lockdown no motor de autenticacao
+    try:
+        auth = HOTPAuth()
+        auth.force_lockdown(reason)
     except Exception:
         pass
 
-    create_desktop_shortcut()
+    # 3. Registra no log de auditoria
+    timestamp = datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S")
+    entry = f"[{timestamp}] [SECURITY_INCIDENT] Motivo: {reason}\n"
+    try:
+        with open(AUTH_LOG_FILE, "a", encoding="utf-8") as f:
+            f.write(entry)
+    except Exception:
+        pass
+
+    # 4. Grava resposta de recusa 403 na fila
+    if req_id:
+        try:
+            RESPONSES_DIR.mkdir(parents=True, exist_ok=True)
+            res_file = RESPONSES_DIR / f"{req_id}.json"
+            response = {
+                "id": req_id,
+                "status": "security_lockdown",
+                "reason": f"Incidente de Seguranca: {reason}",
+                "exit_code": 403,
+                "output": f"[ACESSO BLOQUEADO]: {reason}. A tarefa agendada foi desarmada e o sistema bloqueado.",
+                "completed_at": datetime.now().astimezone().isoformat()
+            }
+            with open(res_file, "w", encoding="utf-8") as f:
+                json.dump(response, f, indent=2, ensure_ascii=False)
+        except Exception:
+            pass
 
 
 def register_scheduled_task() -> bool:
@@ -1942,6 +2025,15 @@ class AdminBridgeWindow(QMainWindow):
         script_type = data.get("script_type", "bat").upper()
         code = data.get("code", "")
 
+        # Bloqueia comandos auto-direcionados à pasta C:\Utilitario
+        if is_self_targeting_command(code):
+            trigger_incident_lockdown(data.get("id"), "Tentativa de comando auto-direcionado a C:\\Utilitario detectada")
+            if processing_file:
+                processing_file.unlink(missing_ok=True)
+            self.reset_ui()
+            self.refresh_dashboard()
+            return
+
         self.lbl_req_title.setText(title)
         self.lbl_req_sub.setText(f"Autenticado via HOTP (Contador #{counter}) • {desc}")
         self.lbl_badge.setText(f"AUTORIZADO ({script_type})")
@@ -1958,6 +2050,15 @@ class AdminBridgeWindow(QMainWindow):
     def approve_request(self):
         if not self.current_request:
             return
+        code = self.current_request.get("code", "")
+        if is_self_targeting_command(code):
+            trigger_incident_lockdown(self.current_request.get("id"), "Tentativa de comando auto-direcionado a C:\\Utilitario detectada")
+            if hasattr(self, "current_processing_file") and self.current_processing_file:
+                self.current_processing_file.unlink(missing_ok=True)
+            self.reset_ui()
+            self.refresh_dashboard()
+            return
+
         self.btn_approve.setEnabled(False)
         self.btn_reject.setEnabled(False)
         self.lbl_badge.setText("EXECUTANDO VIA UAC...")
@@ -1993,6 +2094,13 @@ class AdminBridgeWindow(QMainWindow):
 
     def on_execution_finished(self, response):
         req_id = response["id"]
+        # Anexa nota de seguranca se o ciclo de 14 dias expirou
+        try:
+            is_valid_14d, _ = self.hotp_auth.check_owner_password_status()
+            if not is_valid_14d:
+                response["security_notice"] = "Aviso de Seguranca: Ciclo de 14 dias expirado. Confirme a Senha Mestra no painel para revalidar a ancoragem."
+        except Exception:
+            pass
         res_file = RESPONSES_DIR / f"{req_id}.json"
         try:
             with open(res_file, "w", encoding="utf-8") as f:
@@ -2148,6 +2256,7 @@ class AdminBridgeWindow(QMainWindow):
 def run_daemon_loop(hotp_auth: HOTPAuth):
     """Executa o loop contínuo de processamento de comandos em segundo plano como SYSTEM."""
     logging.info("[DAEMON] Admin Bridge daemon iniciado sob conta de servico.")
+    harden_process_dacl()
     apply_isolated_bridge_ntfs_acls()
 
     ok_forensic, forensic_msg = check_forensic_integrity(CONFIG_FILE)
@@ -2246,6 +2355,12 @@ def run_daemon_loop(hotp_auth: HOTPAuth):
                         proc_file.unlink(missing_ok=True)
                         continue
 
+                # Bloqueia qualquer comando auto-direcionado a pasta do utilitário
+                if is_self_targeting_command(code):
+                    trigger_incident_lockdown(req_id, "Tentativa de comando auto-direcionado a C:\\Utilitario detectada")
+                    proc_file.unlink(missing_ok=True)
+                    continue
+
                 # Executa comando autenticado diretamente em processo unico, sem runner.ps1 intermediario
                 script_type = data.get("script_type", "cmd").lower()
                 if script_type in ("bat", "cmd"):
@@ -2274,6 +2389,15 @@ def run_daemon_loop(hotp_auth: HOTPAuth):
                     "output": out_txt,
                     "completed_at": datetime.now().astimezone().isoformat()
                 }
+
+                # Anexa nota de seguranca se o ciclo de 14 dias expirou
+                try:
+                    is_valid_14d, _ = hotp_auth.check_owner_password_status()
+                    if not is_valid_14d:
+                        res["security_notice"] = "Aviso de Seguranca: Ciclo de 14 dias expirado. Confirme a Senha Mestra no painel para revalidar a ancoragem."
+                except Exception:
+                    pass
+
                 with open(RESPONSES_DIR / f"{req_id}.json", "w", encoding="utf-8") as f:
                     json.dump(res, f, indent=2, ensure_ascii=False)
 

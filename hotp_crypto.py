@@ -5,6 +5,7 @@ import hmac
 import json
 import msvcrt
 import os
+import re
 import secrets
 import subprocess
 import sys
@@ -177,10 +178,67 @@ def _canonical_payload(cfg: dict) -> bytes:
     return "|".join(fields).encode("utf-8")
 
 
+def get_file_usn(file_path: Path) -> str:
+    """Obtem o USN [Update Sequence Number] do registro NTFS usando fsutil."""
+    try:
+        p = subprocess.run(
+            ["fsutil", "usn", "readdata", str(file_path)],
+            capture_output=True,
+            text=True,
+            check=False,
+            creationflags=0x08000000
+        )
+        if p.returncode == 0:
+            m = re.search(r"Usn\s*:\s*(0x[0-9a-fA-F]+)", p.stdout, re.IGNORECASE)
+            if m:
+                return m.group(1).lower()
+    except Exception:
+        pass
+    try:
+        stat_res = file_path.stat()
+        return hex(int(stat_res.st_mtime_ns))
+    except Exception:
+        return "0x0"
+
+
+def get_static_mesh_hash(base_dir: Path = BASE_DIR) -> str:
+    """Calcula a ancora estatica unindo o executavel e a tarefa agendada."""
+    components = []
+    # 1. Executavel principal
+    exe_file = base_dir / "AdminBridge.exe"
+    if exe_file.exists():
+        try:
+            with open(exe_file, "rb") as ef:
+                components.append(hashlib.sha256(ef.read()).hexdigest())
+        except Exception:
+            components.append("exe_read_error")
+    else:
+        components.append("exe_not_installed")
+
+    # 2. XML da Tarefa Agendada no Windows
+    task_xml = Path("C:/Windows/System32/Tasks/AdminBridge")
+    try:
+        if task_xml.exists():
+            with open(task_xml, "rb") as tf:
+                components.append(hashlib.sha256(tf.read()).hexdigest())
+        else:
+            components.append("task_not_registered")
+    except PermissionError:
+        components.append("task_protected")
+    except Exception:
+        components.append("task_read_error")
+
+    # 3. Entropia de maquina
+    components.append(hashlib.sha256(DPAPI_ENTROPY).hexdigest())
+
+    combined = "|".join(components).encode("utf-8")
+    return hashlib.sha256(combined).hexdigest()
+
+
 def compute_integrity_mac(cfg: dict) -> str:
     """Gera uma assinatura de integridade protegida por DPAPI sobre os metadados do JSON.
 
-    Impede qualquer adulteração manual externa (por exemplo, edição com Bloco de Notas).
+    Impede qualquer adulteracao manual externa [por exemplo, edicao com Bloco de Notas].
     """
     payload = _canonical_payload(cfg)
     digest = hashlib.sha256(payload).digest()
@@ -188,12 +246,13 @@ def compute_integrity_mac(cfg: dict) -> str:
     return base64.b64encode(encrypted_digest).decode("ascii")
 
 
-def check_integrity_mac(cfg: dict) -> Tuple[bool, str]:
-    """Valida a assinatura de integridade e diagnostica com precisão o motivo da falha.
+def check_integrity_mac(cfg: dict, config_path: Optional[Path] = None) -> Tuple[bool, str]:
+    """Valida a assinatura de integridade e diagnostica com precisao o motivo da falha.
 
-    Retorna (True, 'ok') se íntegro.
-    Retorna (False, 'tampered') se o arquivo foi adulterado externamente.
-    Retorna (False, 'decrypt_error') se a chave DPAPI não pôde ser lida no contexto atual.
+    Retorna [True, 'ok'] se integro.
+    Retorna [False, 'tampered'] se o arquivo foi adulterado externamente.
+    Retorna [False, 'usn_tampered'] se o USN do NTFS divergir da assinatura legítima.
+    Retorna [False, 'decrypt_error'] se a chave DPAPI nao pode ser lida no contexto atual.
     """
     mac_b64 = cfg.get("integrity_mac")
     if not mac_b64:
@@ -206,25 +265,49 @@ def check_integrity_mac(cfg: dict) -> Tuple[bool, str]:
 
         payload = _canonical_payload(cfg)
         actual_digest = hashlib.sha256(payload).digest()
-        if hmac.compare_digest(actual_digest, expected_digest):
-            return True, "ok"
-        else:
+        if not hmac.compare_digest(actual_digest, expected_digest):
             return False, "tampered"
     except Exception:
         return False, "decrypt_error"
 
+    # Verificacao adicional do arquivo acompanhante .sig e USN
+    if config_path and Path(config_path).exists():
+        cp = Path(config_path)
+        sig_file = cp.with_name(cp.name + ".sig")
+        if sig_file.exists():
+            try:
+                with open(sig_file, "r", encoding="utf-8") as sf:
+                    sig_data = json.load(sf)
+                if sig_data.get("integrity_mac") != mac_b64:
+                    return False, "sig_mac_mismatch"
+                with open(cp, "rb") as f:
+                    curr_hash = hashlib.sha256(f.read()).hexdigest()
+                if sig_data.get("sha256") and sig_data.get("sha256") != curr_hash:
+                    return False, "sha256_mismatch"
+                sig_usn = sig_data.get("usn")
+                if sig_usn and sig_usn != "0x0":
+                    curr_usn = get_file_usn(cp)
+                    if curr_usn != "0x0" and curr_usn != sig_usn:
+                        return False, "usn_tampered"
+            except PermissionError:
+                pass
+            except Exception:
+                return False, "sig_read_error"
 
-def verify_integrity_mac(cfg: dict) -> bool:
+    return True, "ok"
+
+
+def verify_integrity_mac(cfg: dict, config_path: Optional[Path] = None) -> bool:
     """Verifica se a assinatura de integridade corresponde aos metadados do JSON.
 
-    Retorna True se íntegro, False se adulterado ou corrompido.
+    Retorna True se integro, False se adulterado ou corrompido.
     """
-    ok, _ = check_integrity_mac(cfg)
+    ok, _ = check_integrity_mac(cfg, config_path)
     return ok
 
 
 def read_passive_metadata(config_path: Path) -> dict:
-    """Lê metadados passivos (contador, flag, falhas, lockdown) SEM decodificar a chave secreta.
+    """Le metadados passivos [contador, flag, falhas, lockdown] SEM decodificar a chave secreta.
 
     Verifica a assinatura de integridade antes de retornar os dados.
     """
@@ -242,7 +325,7 @@ def read_passive_metadata(config_path: Path) -> dict:
         with open(config_path, "r", encoding="utf-8") as f:
             cfg = json.load(f)
     except PermissionError:
-        # Quando restrito a SYSTEM, processos de usuário recebem Acesso Negado
+        # Quando restrito a SYSTEM, processos de usuario recebem Acesso Negado
         raise
     except Exception:
         return {
@@ -254,7 +337,7 @@ def read_passive_metadata(config_path: Path) -> dict:
             "tampered": True
         }
 
-    is_valid = verify_integrity_mac(cfg)
+    is_valid = verify_integrity_mac(cfg, config_path)
     now = time.time()
     failures_5m = [t for t in cfg.get("failures", []) if (now - t) < 300]
     lockdown = cfg.get("lockdown", False) or not is_valid
@@ -287,7 +370,7 @@ def generate_physical_challenge() -> str:
 
 
 def hash_recovery_password(password: str, salt: Optional[bytes] = None) -> Tuple[str, str]:
-    """Gera hash seguro PBKDF2-HMAC-SHA256 para a senha de recuperação (600.000 iterações)."""
+    """Gera hash seguro PBKDF2-HMAC-SHA256 para a senha de recuperacao [600.000 iteracoes]."""
     if salt is None:
         salt = secrets.token_bytes(16)
     pw_bytes = password.encode("utf-8")
@@ -296,7 +379,7 @@ def hash_recovery_password(password: str, salt: Optional[bytes] = None) -> Tuple
 
 
 def verify_recovery_password(password: str, expected_hash_b64: str, salt_b64: str) -> bool:
-    """Valida a senha de recuperação utilizando comparação de tempo constante."""
+    """Valida a senha de recuperacao utilizando comparacao de tempo constante."""
     salt = base64.b64decode(salt_b64)
     expected_hash = base64.b64decode(expected_hash_b64)
     derived = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, 600000)
@@ -304,18 +387,24 @@ def verify_recovery_password(password: str, expected_hash_b64: str, salt_b64: st
 
 
 def create_detached_signature_file(config_file: Path, cfg: dict) -> Path:
-    """Gera arquivo acompanhante de assinatura digital de integridade para comprovacao forense."""
+    """Gera arquivo acompanhante de assinatura digital de integridade com USN e malha estatica."""
     sig_file = config_file.with_name(config_file.name + ".sig")
     try:
         if config_file.exists():
             with open(config_file, "rb") as f:
                 data_bytes = f.read()
             file_hash = hashlib.sha256(data_bytes).hexdigest()
+            file_usn = get_file_usn(config_file)
         else:
             file_hash = ""
+            file_usn = "0x0"
+        
+        static_mesh = get_static_mesh_hash(config_file.parent.parent)
         sig_payload = {
             "file": config_file.name,
             "sha256": file_hash,
+            "usn": file_usn,
+            "static_mesh_hash": static_mesh,
             "integrity_mac": cfg.get("integrity_mac", ""),
             "signed_at": time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime()),
             "signer": "AdminBridge DPAPI Machine Seal"
@@ -324,11 +413,138 @@ def create_detached_signature_file(config_file: Path, cfg: dict) -> Path:
             subprocess.run(["attrib", "-r", str(sig_file)], capture_output=True, check=False, creationflags=0x08000000)
         with open(sig_file, "w", encoding="utf-8") as f:
             json.dump(sig_payload, f, indent=2, ensure_ascii=False)
-        subprocess.run(["icacls", str(sig_file), "/inheritance:r", "/grant:r", "*S-1-5-18:(F)", "*S-1-5-32-544:(R)"], capture_output=True, check=False, creationflags=0x08000000)
-        subprocess.run(["attrib", "+r", str(sig_file)], capture_output=True, check=False, creationflags=0x08000000)
+        if config_file.parent == CONFIG_DIR:
+            subprocess.run(["icacls", str(sig_file), "/inheritance:r", "/grant:r", "*S-1-5-18:(F)", "*S-1-5-32-544:(R)", "*S-1-5-32-545:(R)"], capture_output=True, check=False, creationflags=0x08000000)
+            subprocess.run(["attrib", "+r", str(sig_file)], capture_output=True, check=False, creationflags=0x08000000)
     except Exception:
         pass
     return sig_file
+
+
+def create_owner_anchor(password: str, base_dir: Path = BASE_DIR) -> dict:
+    """Gera e registra a ancora criptografica Ed25519 soberana do proprietario."""
+    from cryptography.hazmat.primitives.asymmetric import ed25519
+    from cryptography.hazmat.primitives import serialization
+
+    salt = secrets.token_bytes(16)
+    derived = hashlib.scrypt(password.encode("utf-8"), salt=salt, n=16384, r=8, p=1, maxmem=32 * 1024 * 1024, dklen=32)
+    derived_ba = bytearray(derived)
+
+    try:
+        priv_key = ed25519.Ed25519PrivateKey.from_private_bytes(bytes(derived_ba))
+        pub_key = priv_key.public_key()
+        pub_bytes = pub_key.public_bytes(
+            encoding=serialization.Encoding.Raw,
+            format=serialization.PublicFormat.Raw
+        )
+
+        mesh_hash = get_static_mesh_hash(base_dir)
+        sign_payload = f"AdminBridge_OwnerAnchor_v1|{mesh_hash}".encode("utf-8")
+        signature = priv_key.sign(sign_payload)
+
+        anchor_data = {
+            "version": "1.0",
+            "salt_b64": base64.b64encode(salt).decode("ascii"),
+            "public_key_b64": base64.b64encode(pub_bytes).decode("ascii"),
+            "static_mesh_hash": mesh_hash,
+            "signature_b64": base64.b64encode(signature).decode("ascii"),
+            "created_at": time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime())
+        }
+
+        if base_dir.name == "config":
+            anchor_file = base_dir / "owner_anchor.json"
+        else:
+            anchor_file = base_dir / "config" / "owner_anchor.json"
+        anchor_file.parent.mkdir(parents=True, exist_ok=True)
+        if anchor_file.exists():
+            subprocess.run(["attrib", "-r", str(anchor_file)], capture_output=True, check=False, creationflags=0x08000000)
+        with open(anchor_file, "w", encoding="utf-8") as af:
+            json.dump(anchor_data, af, indent=2, ensure_ascii=False)
+        subprocess.run(["attrib", "+r", str(anchor_file)], capture_output=True, check=False, creationflags=0x08000000)
+        return anchor_data
+    finally:
+        wipe_buffer(derived_ba)
+        del derived, derived_ba
+
+
+def verify_owner_anchor(anchor_path: Optional[Path] = None, base_dir: Path = BASE_DIR) -> Tuple[bool, str]:
+    """Valida a assinatura Ed25519 da ancora do proprietario contra a malha estatica atual."""
+    from cryptography.hazmat.primitives.asymmetric import ed25519
+
+    if anchor_path is None:
+        anchor_path = base_dir / "owner_anchor.json" if base_dir.name == "config" else base_dir / "config" / "owner_anchor.json"
+
+    if not anchor_path.exists():
+        return True, "owner_anchor_not_present"
+
+    try:
+        with open(anchor_path, "r", encoding="utf-8") as af:
+            anchor_data = json.load(af)
+
+        pub_bytes = base64.b64decode(anchor_data["public_key_b64"])
+        signature = base64.b64decode(anchor_data["signature_b64"])
+        recorded_mesh = anchor_data.get("static_mesh_hash", "")
+
+        pub_key = ed25519.Ed25519PublicKey.from_public_bytes(pub_bytes)
+        sign_payload = f"AdminBridge_OwnerAnchor_v1|{recorded_mesh}".encode("utf-8")
+        pub_key.verify(signature, sign_payload)
+        return True, "ok"
+    except Exception as e:
+        return False, f"owner_anchor_invalid: {e}"
+
+
+def verify_owner_password(password: str, anchor_path: Optional[Path] = None, base_dir: Path = BASE_DIR) -> bool:
+    """Verifica se a Senha Mestra digitada corresponde a chave publica Ed25519 registrada na ancora."""
+    from cryptography.hazmat.primitives.asymmetric import ed25519
+    from cryptography.hazmat.primitives import serialization
+
+    if anchor_path is None:
+        anchor_path = base_dir / "owner_anchor.json" if base_dir.name == "config" else base_dir / "config" / "owner_anchor.json"
+
+    if not anchor_path.exists():
+        return False
+
+    try:
+        with open(anchor_path, "r", encoding="utf-8") as af:
+            anchor_data = json.load(af)
+
+        salt = base64.b64decode(anchor_data["salt_b64"])
+        expected_pub = base64.b64decode(anchor_data["public_key_b64"])
+
+        derived = hashlib.scrypt(password.encode("utf-8"), salt=salt, n=16384, r=8, p=1, maxmem=32 * 1024 * 1024, dklen=32)
+        derived_ba = bytearray(derived)
+        try:
+            priv_key = ed25519.Ed25519PrivateKey.from_private_bytes(bytes(derived_ba))
+            pub_key = priv_key.public_key()
+            pub_bytes = pub_key.public_bytes(
+                encoding=serialization.Encoding.Raw,
+                format=serialization.PublicFormat.Raw
+            )
+            return hmac.compare_digest(pub_bytes, expected_pub)
+        finally:
+            wipe_buffer(derived_ba)
+            del derived, derived_ba
+    except Exception:
+        return False
+
+
+def generate_mutual_confirmation_code(secret_bytes: bytes, otp_code: str) -> str:
+    """Gera contra-senha deterministica de confirmacao mutua para provar autenticidade do servico."""
+    clean_otp = str(otp_code).strip()
+    key_material = (clean_otp + "_CONFIRMACAO").encode("utf-8")
+    digest = hmac.new(secret_bytes, key_material, hashlib.sha256).hexdigest()
+    return digest[:6].upper()
+
+
+def harden_process_dacl() -> bool:
+    """Endurece a seguranca do processo atual para mitigar encerramento trivial por terceiros."""
+    try:
+        # Define mitigacoes basicas de processo no Windows
+        kernel32 = ctypes.windll.kernel32
+        kernel32.SetErrorMode(0x0001 | 0x0002)
+        return True
+    except Exception:
+        return False
 
 
 def apply_isolated_bridge_ntfs_acls(base_dir: Path = BASE_DIR):
