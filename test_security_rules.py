@@ -143,6 +143,38 @@ def test_all_security_rules():
         assert not ok_reuse
         print("  -> PASSOU: Pré-autorização e consumo atômico de ticket funcionam com sucesso!")
 
+        # -------------------------------------------------------------
+        # TESTE 10: Diagnóstico Passivo de Sincronia sem Avançar Contador
+        # -------------------------------------------------------------
+        print("[*] 10. Testando Diagnóstico Passivo de Sincronia (Sync Probe)...")
+        c_before_sync = auth.get_counter_status()["counter"]
+        secret_ba_test = bytearray(secret_bytes_pre)
+        current_sync_otp = auth._compute_hotp_internal(secret_ba_test, c_before_sync, 6)
+        future_sync_otp = auth._compute_hotp_internal(secret_ba_test, c_before_sync + 5, 6)
+
+        # 1. Código exato do contador atual: deve reportar 'synchronized'
+        diag_cur = auth.diagnose_otp_sync(current_sync_otp)
+        assert diag_cur["success"]
+        assert diag_cur["status"] == "synchronized"
+        assert diag_cur["matched_counter"] == c_before_sync
+        assert diag_cur["diff"] == 0
+
+        # 2. Código 5 posições à frente: deve reportar 'ahead'
+        diag_ahead = auth.diagnose_otp_sync(future_sync_otp)
+        assert diag_ahead["success"]
+        assert diag_ahead["status"] == "ahead"
+        assert diag_ahead["matched_counter"] == c_before_sync + 5
+        assert diag_ahead["diff"] == 5
+
+        # 3. Código inexistente / errado: deve reportar 'not_found'
+        diag_none = auth.diagnose_otp_sync("000000" if current_sync_otp != "000000" else "999999")
+        assert not diag_none["success"] or diag_none["status"] == "not_found"
+
+        # 4. CRÍTICO: Garantir que o contador NÃO se moveu após os 3 diagnósticos
+        c_after_sync = auth.get_counter_status()["counter"]
+        assert c_before_sync == c_after_sync, f"Contador alterado indevidamente durante probe passivo! ({c_before_sync} != {c_after_sync})"
+        print("  -> PASSOU: Diagnóstico passivo detecta índices sem mover o contador!")
+
     print("\n=======================================================")
     print("TODOS OS REQUISITOS DE SEGURANÇA FORAM TESTADOS E APROVADOS!")
     print("=======================================================")

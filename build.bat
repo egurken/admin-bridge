@@ -2,7 +2,7 @@
 setlocal enabledelayedexpansion
 
 echo ========================================================
-echo Compilando AntigravityBridge no repositorio Git
+echo Compilando Admin Bridge no repositorio Git
 echo Repositorio: %~dp0
 echo ========================================================
 
@@ -22,7 +22,7 @@ python -m PyInstaller ^
     --onefile ^
     --icon="icon.ico" ^
     --add-data="icon.ico;." ^
-    --name="AntigravityBridge" ^
+    --name="AdminBridge" ^
     --distpath="dist" ^
     --workpath="build" ^
     --specpath="." ^
@@ -37,15 +37,12 @@ if %ERRORLEVEL% EQU 0 (
     echo.
     echo ========================================================
     echo Sucesso! Executavel gerado em:
-    echo %~dp0dist\AntigravityBridge.exe
+    echo %~dp0dist\AdminBridge.exe
     echo ========================================================
 
-    echo Copiando para C:\Utilitario\AntigravityBridge.exe...
-    if exist "C:\Utilitario\AntigravityBridge.exe" (
-        del /f /q "C:\Utilitario\AntigravityBridge.old.exe" 2>nul
-        move /y "C:\Utilitario\AntigravityBridge.exe" "C:\Utilitario\AntigravityBridge.old.exe" >nul 2>nul
-    )
-    copy /y "%~dp0dist\AntigravityBridge.exe" "C:\Utilitario\AntigravityBridge.exe" >nul
+    echo Atualizando C:\Utilitario...
+    copy /y "%~dp0dist\AdminBridge.exe" "C:\Utilitario\AdminBridge.exe" >nul
+    copy /y "%~dp0dist\AdminBridge.exe" "C:\Utilitario\AntigravityBridge.exe" >nul
     echo Executavel copiado para C:\Utilitario com sucesso!
 
     set "DESK_DIR="
@@ -56,13 +53,16 @@ if %ERRORLEVEL% EQU 0 (
     )
 
     if defined DESK_DIR (
-        echo Copiando para a Area de Trabalho: !DESK_DIR!\AntigravityBridge.exe
-        if exist "!DESK_DIR!\AntigravityBridge.exe" (
-            del /f /q "!DESK_DIR!\AntigravityBridge.old.exe" 2>nul
-            move /y "!DESK_DIR!\AntigravityBridge.exe" "!DESK_DIR!\AntigravityBridge.old.exe" >nul 2>nul
-        )
-        copy /y "%~dp0dist\AntigravityBridge.exe" "!DESK_DIR!\AntigravityBridge.exe" >nul
-        echo Executavel copiado para a Area de Trabalho com sucesso!
+        echo Atualizando Area de Trabalho: !DESK_DIR!
+        del /f /q "!DESK_DIR!\AntigravityBridge.old.exe" 2>nul
+        del /f /q "!DESK_DIR!\Antigravity Bridge.lnk" 2>nul
+        del /f /q "!DESK_DIR!\Antigravity Admin Bridge.lnk" 2>nul
+        del /f /q "!DESK_DIR!\Configurar Antigravity Bridge.lnk" 2>nul
+        del /f /q "!DESK_DIR!\AntigravityBridge.exe" 2>nul
+        copy /y "%~dp0dist\AdminBridge.exe" "!DESK_DIR!\Admin Bridge.exe" >nul
+
+        powershell -NoProfile -Command "$ws = New-Object -ComObject WScript.Shell; $s = $ws.CreateShortcut('!DESK_DIR!\Admin Bridge.lnk'); $s.TargetPath = 'C:\Utilitario\AdminBridge.exe'; $s.WorkingDirectory = 'C:\Utilitario'; $s.IconLocation = 'C:\Utilitario\icon.ico,0'; $s.Description = 'Admin Bridge • Central de Gestao e Autorizacao'; $s.Save()" >nul 2>nul
+        echo Executavel e atalho 'Admin Bridge' atualizados na Area de Trabalho!
     )
 ) else (
     echo.

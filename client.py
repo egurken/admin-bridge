@@ -76,7 +76,7 @@ def submit_request(title: str, description: str, script_type: str, code: str, ot
         "otp": otp,
         "preauth_token": preauth_token,
         "timeout": timeout,
-        "created_at": datetime.now(timezone.utc).isoformat(),
+        "created_at": datetime.now().astimezone().isoformat(),
         "caller": {
             "pid": os.getpid(),
             "exe": sys.executable,
@@ -131,11 +131,17 @@ def submit_request(title: str, description: str, script_type: str, code: str, ot
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Cliente CLI do Antigravity Admin Bridge.")
+    parser = argparse.ArgumentParser(description="Cliente CLI do Admin Bridge.")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     # Subcomando: status
     subparsers.add_parser("status", help="Consulta status atual do serviço e contador")
+
+    # Subcomando: sync (diagnóstico passivo de sincronia)
+    p_sync = subparsers.add_parser("sync", help="Diagnóstico e teste de sincronia HOTP sem avançar o contador")
+    p_sync.add_argument("--otp", required=True, help="Código OTP de 6 dígitos gerado no celular")
+    p_sync.add_argument("--lookahead", type=int, default=150, help="Janela máxima à frente (padrão: 150)")
+    p_sync.add_argument("--lookback", type=int, default=100, help="Janela máxima atrás (padrão: 100)")
 
     # Subcomando: history
     subparsers.add_parser("history", help="Exibe histórico recente de execuções")
@@ -182,7 +188,7 @@ def main():
                 pass
 
         print("=" * 60)
-        print("         STATUS DO ANTIGRAVITY ADMIN BRIDGE")
+        print("             STATUS DO ADMIN BRIDGE")
         print("=" * 60)
         print(f"  Serviço Heartbeat:        {'ONLINE' if active else 'OFFLINE'}")
         if st_data:
@@ -193,6 +199,17 @@ def main():
             print(f"  Falhas Recentes:          {st_data.get('recent_failures', 0)} / 3")
         print("=" * 60)
         sys.exit(0 if active else 1)
+
+    elif args.command == "sync":
+        exe_path = BASE_DIR / "AntigravityBridge.exe"
+        if not exe_path.exists():
+            exe_path = BASE_DIR / "AdminBridge.exe"
+        if exe_path.exists():
+            cmd = [str(exe_path), "sync", "--otp", args.otp, "--lookahead", str(args.lookahead), "--lookback", str(args.lookback)]
+        else:
+            cmd = [sys.executable, str(BASE_DIR / "app.py"), "sync", "--otp", args.otp, "--lookahead", str(args.lookahead), "--lookback", str(args.lookback)]
+        res = subprocess.run(cmd)
+        sys.exit(res.returncode)
 
     elif args.command == "history":
         if not AUTH_LOG_FILE.exists():

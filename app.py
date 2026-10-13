@@ -24,7 +24,7 @@ from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QLabel, QPushButton, QPlainTextEdit, QFrame, QSystemTrayIcon,
     QMenu, QMessageBox, QDialog, QLineEdit, QTableWidget, QTableWidgetItem,
-    QHeaderView, QAbstractItemView
+    QHeaderView, QAbstractItemView, QInputDialog
 )
 
 from hotp_auth import HOTPAuth, SecurityError, PREAUTH_TICKET_FILE
@@ -176,19 +176,23 @@ def create_desktop_shortcut():
             desktops_to_create.append(pub_desktop)
 
         target = (BASE_DIR / "AntigravityBridge.exe").resolve()
+        if not target.exists():
+            target = (BASE_DIR / "AdminBridge.exe").resolve()
         icon_path = (BASE_DIR / "icon.ico").resolve()
 
         for d in desktops_to_create:
-            lnk_path = d / "Antigravity Bridge.lnk"
-            if lnk_path.exists():
-                continue
+            # Remove atalhos antigos com nomes legados
+            for old_lnk in ["Antigravity Bridge.lnk", "Antigravity Admin Bridge.lnk", "Configurar Antigravity Bridge.lnk"]:
+                (d / old_lnk).unlink(missing_ok=True)
+
+            lnk_path = d / "Admin Bridge.lnk"
             ps_cmd = (
                 f'$ws = New-Object -ComObject WScript.Shell; '
                 f'$s = $ws.CreateShortcut("{lnk_path}"); '
                 f'$s.TargetPath = "{target}"; '
                 f'$s.WorkingDirectory = "{BASE_DIR}"; '
                 f'$s.IconLocation = "{icon_path},0"; '
-                f'$s.Description = "Antigravity Admin Bridge & Central de Gestao"; '
+                f'$s.Description = "Admin Bridge • Central de Gestao e Autorizacao"; '
                 f'$s.Save()'
             )
             subprocess.run(
@@ -365,8 +369,14 @@ def load_recent_history(max_items: int = 50) -> list:
                         details = token.split(":", 1)[1].strip()
 
                 try:
-                    dt = datetime.fromisoformat(ts_raw)
-                    dt_str = dt.strftime("%d/%m/%Y %H:%M:%S")
+                    if "T" in ts_raw:
+                        dt = datetime.fromisoformat(ts_raw)
+                        if dt.tzinfo is not None:
+                            dt = dt.astimezone()
+                        dt_str = dt.strftime("%d/%m/%Y %H:%M:%S")
+                    else:
+                        dt = datetime.strptime(ts_raw[:19], "%Y-%m-%d %H:%M:%S")
+                        dt_str = dt.strftime("%d/%m/%Y %H:%M:%S")
                 except Exception:
                     dt_str = ts_raw[:19]
 
@@ -808,7 +818,7 @@ class ExecutionThread(QThread):
                             "status": "rejected",
                             "exit_code": -1,
                             "output": "Operação cancelada pelo usuário no prompt UAC.",
-                            "completed_at": datetime.now(timezone.utc).isoformat()
+                            "completed_at": datetime.now().astimezone().isoformat()
                         }
                         self.finished_signal.emit(response)
                         return
@@ -861,7 +871,7 @@ class ExecutionThread(QThread):
             "status": "approved",
             "exit_code": exit_code,
             "output": output_data,
-            "completed_at": datetime.now(timezone.utc).isoformat()
+            "completed_at": datetime.now().astimezone().isoformat()
         }
 
         # Limpeza segura do script temporário
@@ -885,7 +895,7 @@ class AdminBridgeWindow(QMainWindow):
         self.current_request = None
         self.exec_thread = None
 
-        self.setWindowTitle("Antigravity Admin Bridge • Central de Gestão")
+        self.setWindowTitle("Admin Bridge • Central de Gestão")
         self.resize(760, 600)
         self.setMinimumSize(660, 480)
 
@@ -1041,7 +1051,7 @@ class AdminBridgeWindow(QMainWindow):
 
         title_layout = QVBoxLayout()
         title_layout.setSpacing(1)
-        lbl_app_title = QLabel("Antigravity Admin Bridge")
+        lbl_app_title = QLabel("Admin Bridge")
         lbl_app_title.setStyleSheet("font-size: 16px; font-weight: bold; color: #cdd6f4;")
         lbl_app_sub = QLabel("Central de Gestão e Autorização Elevada HOTP")
         lbl_app_sub.setStyleSheet("font-size: 11px; color: #a6adc8;")
@@ -1085,6 +1095,10 @@ class AdminBridgeWindow(QMainWindow):
                 color: #89b4fa;
             }
         """)
+
+        act_sync = QAction("🔍 Testar Sincronia do Autenticador...", self)
+        act_sync.triggered.connect(self.show_sync_test_dialog)
+        self.settings_menu.addAction(act_sync)
 
         act_status = QAction("📋 Status Detalhado do Contador", self)
         act_status.triggered.connect(self.show_counter_status_dialog)
@@ -1424,7 +1438,7 @@ class AdminBridgeWindow(QMainWindow):
                     "reason": f"Autenticação HOTP recusada: {auth_msg}",
                     "exit_code": 403 if is_lockdown else 401,
                     "output": f"[ACESSO RECUSADO]: {auth_msg}\nEnvie um código válido no formato 'OTP: 123456'.",
-                    "completed_at": datetime.now(timezone.utc).isoformat()
+                    "completed_at": datetime.now().astimezone().isoformat()
                 }
                 try:
                     with open(res_file, "w", encoding="utf-8") as f:
@@ -1537,7 +1551,7 @@ class AdminBridgeWindow(QMainWindow):
             "status": "rejected",
             "exit_code": -1,
             "output": "A solicitação foi recusada pelo usuário na Central de Gestão.",
-            "completed_at": datetime.now(timezone.utc).isoformat()
+            "completed_at": datetime.now().astimezone().isoformat()
         }
         try:
             with open(res_file, "w", encoding="utf-8") as f:
@@ -1664,6 +1678,53 @@ class AdminBridgeWindow(QMainWindow):
             "Consulte seu aplicativo autenticador no telemóvel."
         )
 
+    def show_sync_test_dialog(self):
+        otp, ok = QInputDialog.getText(
+            self,
+            "Diagnóstico de Sincronia HOTP",
+            "Digite o código OTP de 6 dígitos gerado no aplicativo do seu celular:\n"
+            "(Esta verificação é passiva e NÃO avança o contador do sistema)",
+            QLineEdit.EchoMode.Normal
+        )
+        if not ok or not otp:
+            return
+
+        res = self.hotp_auth.diagnose_otp_sync(otp.strip())
+        if res.get("success"):
+            if res.get("status") == "synchronized":
+                QMessageBox.information(
+                    self,
+                    "Autenticador 100% Sincronizado",
+                    f"✅ {res.get('message')}\n\n"
+                    f"• Contador no Computador: #{res.get('current_counter')}\n"
+                    f"• Contador no Autenticador: #{res.get('matched_counter')}"
+                )
+            elif res.get("status") == "ahead":
+                QMessageBox.information(
+                    self,
+                    "Autenticador À Frente (Compatível)",
+                    f"ℹ️ {res.get('message')}\n\n"
+                    f"• Contador no Computador: #{res.get('current_counter')}\n"
+                    f"• Contador no Autenticador: #{res.get('matched_counter')}\n"
+                    f"• Diferença: {res.get('diff')} posições à frente"
+                )
+            else:
+                QMessageBox.warning(
+                    self,
+                    "Autenticador Atrasado",
+                    f"⚠️ {res.get('message')}\n\n"
+                    f"• Contador no Computador: #{res.get('current_counter')}\n"
+                    f"• Contador no Autenticador: #{res.get('matched_counter')}\n"
+                    f"• Diferença: {abs(res.get('diff', 0))} posições atrás"
+                )
+        else:
+            QMessageBox.critical(
+                self,
+                "Código Não Encontrado",
+                f"❌ {res.get('message', res.get('error'))}"
+            )
+
+
 
 # -----------------------------------------------------------------------------
 # DAEMON EM SEGUNDO PLANO (HEADLESS PARA TAREFA AGENDADA COMO SYSTEM)
@@ -1737,7 +1798,7 @@ def run_daemon_loop(hotp_auth: HOTPAuth):
                         "reason": auth_msg,
                         "exit_code": 401,
                         "output": f"[ACESSO RECUSADO]: {auth_msg}",
-                        "completed_at": datetime.now(timezone.utc).isoformat()
+                        "completed_at": datetime.now().astimezone().isoformat()
                     }
                     with open(RESPONSES_DIR / f"{req_id}.json", "w", encoding="utf-8") as f:
                         json.dump(res, f, indent=2, ensure_ascii=False)
@@ -1785,7 +1846,7 @@ def run_daemon_loop(hotp_auth: HOTPAuth):
                     "status": "approved",
                     "exit_code": ec,
                     "output": out_txt,
-                    "completed_at": datetime.now(timezone.utc).isoformat()
+                    "completed_at": datetime.now().astimezone().isoformat()
                 }
                 with open(RESPONSES_DIR / f"{req_id}.json", "w", encoding="utf-8") as f:
                     json.dump(res, f, indent=2, ensure_ascii=False)
@@ -1817,7 +1878,7 @@ def run_cli_client(args, hotp_auth: HOTPAuth):
     if args.subcommand == "status":
         st = hotp_auth.get_counter_status()
         print("=" * 60)
-        print("         STATUS DO ANTIGRAVITY ADMIN BRIDGE")
+        print("             STATUS DO ADMIN BRIDGE")
         print("=" * 60)
         print(f"  Contador Atual:           {st.get('counter', 0)}")
         print(f"  Estado do Serviço:        {st.get('status_text', 'Ativo')}")
@@ -1828,6 +1889,42 @@ def run_cli_client(args, hotp_auth: HOTPAuth):
         print(f"  Último Uso:               {st.get('last_used_at') or 'Nenhum'}")
         print("=" * 60)
         sys.exit(0)
+
+    elif args.subcommand in ("sync", "check-otp"):
+        lookahead = getattr(args, "lookahead", 150)
+        lookback = getattr(args, "lookback", 100)
+        res = hotp_auth.diagnose_otp_sync(args.otp, max_lookahead=lookahead, max_lookback=lookback)
+        print("=" * 65)
+        print("          DIAGNÓSTICO DE SINCRONIA HOTP (PASSIVO)")
+        print("=" * 65)
+        if res.get("success"):
+            status_map = {
+                "synchronized": "100% SINCRONIZADO",
+                "ahead": "COMPATÍVEL (À FRENTE)",
+                "behind": "ATRASADO"
+            }
+            st_badge = status_map.get(res.get("status"), res.get("status", "").upper())
+            print(f"  Diagnóstico:        {st_badge}")
+            print(f"  Contador no PC:     #{res.get('current_counter')}")
+            print(f"  Contador no App:    #{res.get('matched_counter')}")
+            diff = res.get("diff", 0)
+            if diff > 0:
+                print(f"  Diferença:          +{diff} posições à frente")
+            elif diff < 0:
+                print(f"  Diferença:          {diff} posições atrás")
+            else:
+                print(f"  Diferença:          0 (Exato)")
+            print("-" * 65)
+            print(f"  {res.get('message')}")
+        else:
+            print("  Status:             NÃO ENCONTRADO")
+            print(f"  Contador no PC:     #{res.get('current_counter')}")
+            print("-" * 65)
+            print(f"  {res.get('message', res.get('error'))}")
+        print("=" * 65)
+        print("  [INFO]: O contador não foi avançado. Verificação 100% segura.")
+        print("=" * 65)
+        sys.exit(0 if res.get("success") else 1)
 
     elif args.subcommand == "history":
         hist = load_recent_history(20)
@@ -1930,7 +2027,7 @@ def run_cli_client(args, hotp_auth: HOTPAuth):
             "otp": args.otp,
             "preauth_token": getattr(args, "preauth_token", None),
             "timeout": args.timeout or 120,
-            "created_at": datetime.now(timezone.utc).isoformat(),
+            "created_at": datetime.now().astimezone().isoformat(),
             "caller": {
                 "pid": os.getpid(),
                 "exe": sys.executable,
@@ -2061,7 +2158,7 @@ def main():
     hotp_auth = HOTPAuth()
 
     parser = argparse.ArgumentParser(
-        description="Antigravity Admin Bridge & Central de Gestão HOTP",
+        description="Admin Bridge • Central de Gestão HOTP",
         add_help=True
     )
     parser.add_argument("--daemon", action="store_true", help="Executa o daemon em segundo plano (modo serviço)")
@@ -2077,6 +2174,12 @@ def main():
 
     # Comando status
     subparsers.add_parser("status", help="Consulta o status atual do serviço e contador")
+
+    # Comando sync (teste passivo de sincronia do contador)
+    p_sync = subparsers.add_parser("sync", help="Diagnóstico e teste de sincronia HOTP sem avançar o contador")
+    p_sync.add_argument("--otp", required=True, help="Código OTP de 6 dígitos gerado no aplicativo do celular")
+    p_sync.add_argument("--lookahead", type=int, default=150, help="Janela máxima de busca à frente (padrão: 150)")
+    p_sync.add_argument("--lookback", type=int, default=100, help="Janela máxima de busca atrás (padrão: 100)")
 
     # Comando history
     subparsers.add_parser("history", help="Exibe o histórico recente de auditoria e execuções")

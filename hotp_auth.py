@@ -187,7 +187,7 @@ class HOTPAuth:
             "status_text": status_text,
             "last_used_at": cfg.get("last_used_at"),
             "created_at": cfg.get("created_at"),
-            "updated_at": datetime.now(timezone.utc).isoformat()
+            "updated_at": datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S")
         }
 
         try:
@@ -208,8 +208,8 @@ class HOTPAuth:
         otp_provided: str = "",
         caller_info: Optional[dict] = None
     ):
-        """Registra logs estruturados de auditoria de todas as operações."""
-        timestamp = datetime.now(timezone.utc).isoformat()
+        """Registra logs estruturados de auditoria de todas as operações no fuso horário local do usuário."""
+        timestamp = datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S")
         status_str = "SUCCESS" if success else "FAIL"
         # Mantém estritamente apenas os 2 primeiros dígitos visíveis
         clean_otp = str(otp_provided).strip()
@@ -356,7 +356,7 @@ class HOTPAuth:
                 "digits": DEFAULT_DIGITS,
                 "look_ahead_window": DEFAULT_LOOK_AHEAD_WINDOW,
                 "failures": [],
-                "created_at": datetime.now(timezone.utc).isoformat(),
+                "created_at": datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S"),
                 "last_used_at": None,
                 "last_success_counter": 0,
             }
@@ -546,7 +546,7 @@ class HOTPAuth:
                 new_counter = match_counter + 1
                 cfg["counter"] = new_counter
                 cfg["last_success_counter"] = match_counter
-                cfg["last_used_at"] = datetime.now(timezone.utc).isoformat()
+                cfg["last_used_at"] = datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S")
                 cfg["failures"] = []  # Limpa falhas anteriores
                 self._save_config_raw(cfg)
 
@@ -588,7 +588,7 @@ class HOTPAuth:
 
         if len(failures) >= FAIL_SAFE_MAX_FAILURES:
             cfg["lockdown"] = True
-            cfg["lockdown_at"] = datetime.now(timezone.utc).isoformat()
+            cfg["lockdown_at"] = datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S")
             self._save_config_raw(cfg)
 
             # Aciona desativação/remoção imediata da tarefa agendada
@@ -761,3 +761,112 @@ class HOTPAuth:
                 "Ticket de pré-autorização validado e consumido com sucesso para execução imediata."
             )
             return True, "Ticket de pré-autorização validado e consumido com sucesso."
+
+    def diagnose_otp_sync(
+        self,
+        provided_otp: str,
+        max_lookahead: int = 150,
+        max_lookback: int = 100
+    ) -> dict:
+        """
+        Modo de diagnóstico e teste de sincronia HOTP (RFC 4226).
+        NÃO AVANÇA O CONTADOR nem altera nenhum estado ou arquivo.
+        
+        Compara o código fornecido contra índices passados e futuros do contador
+        para informar ao usuário em que índice exato o autenticador está.
+        """
+        clean_otp = str(provided_otp).strip()
+        if not clean_otp.isdigit() or len(clean_otp) != DEFAULT_DIGITS:
+            return {
+                "success": False,
+                "error": f"O código OTP deve conter exatamente {DEFAULT_DIGITS} dígitos numéricos."
+            }
+
+        with AtomicLock():
+            cfg = self._load_config_raw()
+            if not cfg or cfg.get("provisioned_flag") != 1:
+                return {
+                    "success": False,
+                    "error": "O utilitário ainda não está provisionado."
+                }
+
+            current_counter = cfg.get("counter", 0)
+
+            # Recupera segredo em memória de forma segura
+            secret_dpapi_b64 = cfg.get("secret_dpapi")
+            secret_enc = base64.b64decode(secret_dpapi_b64)
+            secret_ba = dpapi_unprotect(secret_enc)
+
+            try:
+                min_c = max(0, current_counter - max_lookback)
+                max_c = current_counter + max_lookahead
+
+                # 1. Verifica primeiro o índice atual exato
+                current_expected = self._compute_hotp_internal(secret_ba, current_counter, DEFAULT_DIGITS)
+                if hmac.compare_digest(clean_otp, current_expected):
+                    return {
+                        "success": True,
+                        "matched_counter": current_counter,
+                        "current_counter": current_counter,
+                        "diff": 0,
+                        "status": "synchronized",
+                        "message": (
+                            f"Seu autenticador está no OTP #{current_counter} e está "
+                            f"100% SINCRONIZADO com o computador!"
+                        )
+                    }
+
+                # 2. Busca à frente (lookahead)
+                for c in range(current_counter + 1, max_c + 1):
+                    code = self._compute_hotp_internal(secret_ba, c, DEFAULT_DIGITS)
+                    if hmac.compare_digest(clean_otp, code):
+                        diff = c - current_counter
+                        return {
+                            "success": True,
+                            "matched_counter": c,
+                            "current_counter": current_counter,
+                            "diff": diff,
+                            "status": "ahead",
+                            "message": (
+                                f"Seu autenticador está no OTP #{c} ({diff} "
+                                f"{'posição' if diff == 1 else 'posições'} À FRENTE do computador, que está em #{current_counter}).\n"
+                                f"O sistema aceitará o código normalmente e sincronizará de forma automática."
+                            )
+                        }
+
+                # 3. Busca atrás (lookback / histórico)
+                for c in range(current_counter - 1, min_c - 1, -1):
+                    code = self._compute_hotp_internal(secret_ba, c, DEFAULT_DIGITS)
+                    if hmac.compare_digest(clean_otp, code):
+                        diff = c - current_counter
+                        abs_diff = abs(diff)
+                        return {
+                            "success": True,
+                            "matched_counter": c,
+                            "current_counter": current_counter,
+                            "diff": diff,
+                            "status": "behind",
+                            "message": (
+                                f"Seu autenticador está no OTP #{c} ({abs_diff} "
+                                f"{'posição' if abs_diff == 1 else 'posições'} ATRÁS do computador, que está em #{current_counter}).\n"
+                                f"Você precisa avançar {abs_diff} vezes no seu aplicativo autenticador para sincronizar."
+                            )
+                        }
+
+                return {
+                    "success": False,
+                    "matched_counter": None,
+                    "current_counter": current_counter,
+                    "diff": None,
+                    "status": "not_found",
+                    "message": (
+                        f"O código digitado ({clean_otp[:2]}****) não foi encontrado na janela de busca "
+                        f"(índices #{min_c} até #{max_c}, computador em #{current_counter}).\n"
+                        f"Verifique se o código foi digitado corretamente ou se pertence a outra chave."
+                    )
+                }
+
+            finally:
+                wipe_buffer(secret_ba)
+                del secret_ba
+                gc.collect()

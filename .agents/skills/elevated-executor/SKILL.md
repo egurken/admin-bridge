@@ -88,14 +88,21 @@ The central UI opens a prompt on the desktop requesting physical confirmation vi
 
 ### Consult Bridge Status & Counter:
 ```powershell
-& "C:\Utilitario\AntigravityBridge.exe" status
+& "C:\Utilitario\AdminBridge.exe" status
 # Or:
 python C:\Utilitario\client.py status
 ```
 
-### Consult Audit History:
+### Test Authenticator Counter Sync (Passive Diagnostic - Does Not Advance Counter):
 ```powershell
-& "C:\Utilitario\AntigravityBridge.exe" history
+& "C:\Utilitario\AdminBridge.exe" sync --otp "123456"
+# Or:
+python C:\Utilitario\client.py sync --otp "123456"
+```
+
+### Consult Audit History (Local Timezone):
+```powershell
+& "C:\Utilitario\AdminBridge.exe" history
 # Or:
 python C:\Utilitario\client.py history
 ```
