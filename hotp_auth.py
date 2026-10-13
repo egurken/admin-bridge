@@ -102,11 +102,11 @@ class HOTPAuth:
                 cfg.get("counter", 0),
                 cfg.get("counter", 0),
                 False,
-                f"Assinatura de integridade inválida ({reason})! O arquivo foi modificado externamente."
+                f"Assinatura de integridade invalida: {reason}. O arquivo foi modificado externamente."
             )
             raise SecurityError(
                 "VIOLAÇÃO DE SEGURANÇA: A assinatura de integridade do arquivo hotp_config.json falhou. "
-                "O arquivo foi modificado externamente (ex: Bloco de Notas). Execução bloqueada."
+                "O arquivo foi modificado externamente. Execução bloqueada."
             )
 
         return cfg
@@ -321,14 +321,14 @@ class HOTPAuth:
                     caller_info=caller_info
                 )
                 raise PermissionError(
-                    "Operação Bloqueada: A chave HOTP já foi provisionada e está travada (flag=1). "
+                    "Operação Bloqueada: A chave HOTP já foi provisionada e está travada em flag=1. "
                     "Geração de nova chave proibida sem procedimento de reset autenticado."
                 )
 
             if not recovery_password or len(recovery_password) < 8:
                 raise ValueError("A palavra-passe de recuperação deve conter pelo menos 8 caracteres.")
 
-            # 1. Gera segredo criptográfico de 160 bits (20 bytes)
+            # 1. Gera segredo criptográfico de 160 bits - 20 bytes
             raw_secret = secrets.token_bytes(20)
             secret_b32 = base64.b32encode(raw_secret).decode("ascii")
 
@@ -342,7 +342,7 @@ class HOTPAuth:
             del raw_secret, raw_secret_ba
             gc.collect()
 
-            # 3. Hash da senha de recuperação (PBKDF2 600.000 iterações) e proteção DPAPI
+            # 3. Hash da senha de recuperação PBKDF2 600.000 iterações e proteção DPAPI
             pw_hash_b64, salt_b64 = hash_recovery_password(recovery_password)
             pw_hash_dpapi = dpapi_protect(pw_hash_b64.encode("ascii"))
             pw_hash_dpapi_b64 = base64.b64encode(pw_hash_dpapi).decode("ascii")
@@ -382,6 +382,95 @@ class HOTPAuth:
                 "digits": DEFAULT_DIGITS,
                 "counter": 0
             }
+
+    def verify_and_finalize_initial_otp(self, otp: str) -> Tuple[bool, str]:
+        """Valida o primeiro codigo gerado no celular para confirmar o pareamento e trava a configuracao."""
+        clean_otp = str(otp).strip()
+        if not clean_otp.isdigit() or len(clean_otp) != DEFAULT_DIGITS:
+            return False, f"O codigo OTP deve conter exatamente {DEFAULT_DIGITS} digitos numericos."
+
+        with AtomicLock():
+            cfg = self._load_config_raw()
+            if not cfg:
+                return False, "Configuracao nao encontrada para validacao inicial."
+
+            secret_dpapi_b64 = cfg.get("secret_dpapi")
+            secret_enc = base64.b64decode(secret_dpapi_b64)
+            secret_ba = dpapi_unprotect(secret_enc)
+            try:
+                # Compara nas posicoes 0 a 2 para tolerar cliques iniciais no celular
+                matched = None
+                for test_c in range(0, 3):
+                    expected = self._compute_hotp_internal(secret_ba, test_c, DEFAULT_DIGITS)
+                    if hmac.compare_digest(expected, clean_otp):
+                        matched = test_c
+                        break
+
+                if matched is None:
+                    return False, "Codigo incorreto. Digite os 6 digitos exibidos no aplicativo do seu celular."
+
+                # Avanco estrito: proximo sera matched + 1
+                new_c = matched + 1
+                cfg["counter"] = new_c
+                cfg["provisioned_flag"] = 1
+                cfg["last_success_counter"] = matched
+                cfg["last_used_at"] = datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S")
+                self._save_config_raw(cfg)
+
+                self._log_audit(
+                    "INITIAL_PAIRING_VERIFIED",
+                    0,
+                    new_c,
+                    True,
+                    f"Pareamento inicial confirmado com sucesso no indice #{matched}. Proximo contador: {new_c}."
+                )
+                return True, "Pareamento inicial validado com sucesso."
+            finally:
+                wipe_buffer(secret_ba)
+                del secret_ba
+                gc.collect()
+
+    def repair_corrupted_installation(self, recovery_password: str) -> Tuple[bool, str]:
+        """Restaura pastas e arquivos apos deteccao de adulteracao exigindo a palavra-passe do proprietario."""
+        if not recovery_password or len(recovery_password) < 8:
+            return False, "A palavra-passe deve conter pelo menos 8 caracteres."
+
+        with AtomicLock():
+            # Tenta validar a palavra-passe contra o hash existente se disponivel
+            if self.config_file.exists():
+                try:
+                    with open(self.config_file, "r", encoding="utf-8") as f:
+                        raw_data = json.load(f)
+                    salt_b64 = raw_data.get("recovery_salt")
+                    hash_dpapi_b64 = raw_data.get("recovery_hash_dpapi")
+                    if salt_b64 and hash_dpapi_b64:
+                        hash_raw = base64.b64decode(hash_dpapi_b64)
+                        expected_hash_ba = dpapi_unprotect(hash_raw)
+                        expected_hash = bytes(expected_hash_ba).decode("ascii")
+                        wipe_buffer(expected_hash_ba)
+                        if not verify_recovery_password(recovery_password, expected_hash, salt_b64):
+                            return False, "Palavra-passe de recuperacao incorreta. Apenas o proprietario pode reparar o sistema."
+                except Exception:
+                    pass
+
+            # Executa a restauracao das pastas e remocao de arquivos adulterados
+            try:
+                self.config_file.unlink(missing_ok=True)
+                if self.ticket_file.exists():
+                    self.ticket_file.unlink(missing_ok=True)
+                if STATUS_FILE.exists():
+                    STATUS_FILE.unlink(missing_ok=True)
+
+                self.config_dir.mkdir(parents=True, exist_ok=True)
+                QUEUE_DIR.mkdir(parents=True, exist_ok=True)
+                LOGS_DIR.mkdir(parents=True, exist_ok=True)
+                (BASE_DIR / "scripts").mkdir(parents=True, exist_ok=True)
+
+                apply_isolated_bridge_ntfs_acls(BASE_DIR)
+                self._log_audit("REPAIR_SUCCESS", 0, 0, True, "Reparo do sistema executado pelo proprietario com sucesso.")
+                return True, "Estrutura do sistema reparada com sucesso. Pronto para reinicializacao."
+            except Exception as e:
+                return False, f"Falha ao executar reparo de pastas: {e}"
 
     # -------------------------------------------------------------------------
     # RESET E AUTODESTRUIÇÃO DE PRIVILÉGIOS (REQUISITO 3)

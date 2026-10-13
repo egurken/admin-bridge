@@ -37,13 +37,51 @@ DPAPI_FLAGS = CRYPTPROTECT_UI_FORBIDDEN | CRYPTPROTECT_LOCAL_MACHINE  # 0x5
 
 
 def wipe_buffer(buf):
-    """Sobrescreve buffers de memória com zeros para higiene estrita de memória."""
+    """Sobrescreve buffers de memoria com zeros para higiene estrita de memoria."""
     if buf is None:
         return
     if isinstance(buf, bytearray):
-        for i in range(len(buf)):
-            buf[i] = 0
+        raw_len = len(buf)
+        if raw_len > 0:
+            try:
+                p_buf = (ctypes.c_char * raw_len).from_buffer(buf)
+                kernel32.RtlZeroMemory(ctypes.byref(p_buf), raw_len)
+            except Exception:
+                for i in range(raw_len):
+                    buf[i] = 0
     elif isinstance(buf, (bytes, str)):
+        pass
+
+
+def lock_memory_page(buf: bytearray) -> bool:
+    """Bloqueia paginas de memoria fisica no Windows impedindo descarregamento no arquivo pagefile.sys."""
+    try:
+        if not buf:
+            return False
+        raw_len = len(buf)
+        p_buf = (ctypes.c_char * raw_len).from_buffer(buf)
+        return bool(kernel32.VirtualLock(ctypes.byref(p_buf), raw_len))
+    except Exception:
+        return False
+
+
+def unlock_memory_page(buf: bytearray) -> bool:
+    """Desbloqueia paginas de memoria fisica previamente travadas."""
+    try:
+        if not buf:
+            return False
+        raw_len = len(buf)
+        p_buf = (ctypes.c_char * raw_len).from_buffer(buf)
+        return bool(kernel32.VirtualUnlock(ctypes.byref(p_buf), raw_len))
+    except Exception:
+        return False
+
+
+def configure_anti_dump_mitigations():
+    """Desativa caixas de dialogo de falha e despejos de memoria crash dump no Windows."""
+    try:
+        kernel32.SetErrorMode(0x0001 | 0x0002)
+    except Exception:
         pass
 
 
@@ -224,9 +262,9 @@ def read_passive_metadata(config_path: Path) -> dict:
 
     status_text = "Ativo"
     if not is_valid:
-        status_text = "Bloqueado (Adulteração Detectada)"
+        status_text = "Bloqueado por adulteração"
     elif lockdown:
-        status_text = "Bloqueado (Lockdown Fail-Safe)"
+        status_text = "Bloqueado - Lockdown Fail-Safe"
     elif not provisioned:
         status_text = "Aguardando Provisionamento"
 
@@ -267,6 +305,7 @@ def verify_recovery_password(password: str, expected_hash_b64: str, salt_b64: st
 
 def apply_isolated_bridge_ntfs_acls(base_dir: Path = BASE_DIR):
     """Aplica permissões ACL granulares e blindadas:
+    - Posse exclusiva definida para SYSTEM ou Administradores
     - config: Acesso total EXCLUSIVO a SYSTEM (*S-1-5-18). Bloqueio total a Users e Administradores sem takeown.
     - scripts: Acesso total EXCLUSIVO a SYSTEM (*S-1-5-18) e Administradores (*S-1-5-32-544). Bloqueio total a Users.
     - queue: SYSTEM/Admins (F) e Users (*S-1-5-32-545) com Modificar (M) para envio de comandos.
@@ -276,6 +315,13 @@ def apply_isolated_bridge_ntfs_acls(base_dir: Path = BASE_DIR):
     scripts_dir = base_dir / "scripts"
     queue_dir = base_dir / "queue"
     logs_dir = base_dir / "logs"
+
+    # Define a posse explicitamente para SYSTEM ou Administradores
+    try:
+        if base_dir.exists():
+            subprocess.run(["cmd.exe", "/c", f'icacls "{base_dir}" /setowner "*S-1-5-18" /t /c /q'], capture_output=True, check=False, creationflags=0x08000000)
+    except Exception:
+        pass
 
     # 1. Blindagem estrita de config - somente SYSTEM
     try:

@@ -26,13 +26,14 @@ from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QLabel, QPushButton, QPlainTextEdit, QFrame, QSystemTrayIcon,
     QMenu, QMessageBox, QDialog, QLineEdit, QTableWidget, QTableWidgetItem,
-    QHeaderView, QAbstractItemView, QInputDialog, QGridLayout
+    QHeaderView, QAbstractItemView, QInputDialog, QGridLayout, QLayout
 )
 
 from hotp_auth import HOTPAuth, SecurityError, PREAUTH_TICKET_FILE
 from hotp_crypto import (
     wipe_buffer, apply_isolated_bridge_ntfs_acls, apply_system_only_ntfs_acls, restore_ntfs_acls_for_removal,
-    verify_caller_origin, generate_physical_challenge, read_passive_metadata, check_forensic_integrity
+    verify_caller_origin, generate_physical_challenge, read_passive_metadata, check_forensic_integrity,
+    configure_anti_dump_mitigations
 )
 from app_icon import get_app_icon
 
@@ -246,19 +247,21 @@ def unregister_scheduled_task() -> bool:
 def perform_full_uninstall(parent_widget=None) -> bool:
     """Executa o fluxo completo de desinstalação:
 
-    1. Remove a tarefa agendada do Windows.
-    2. Restaura permissões NTFS em C:\\Utilitario via takeown e icacls.
-    3. Remove atalhos criados na Área de Trabalho.
-    4. Limpa pastas de filas, logs e configurações.
-    5. Agenda remoção da pasta C:\\Utilitario e encerra o processo.
+    1. Encerra imediatamente qualquer processo interno do utilitário em execução.
+    2. Remove as tarefas agendadas do Windows.
+    3. Remove os atalhos criados na Área de Trabalho.
+    4. Cria e dispara script autônomo na pasta TEMP para assumir posse e apagar completamente C:\\Utilitario.
     """
     try:
-        # 1. Remove tarefa agendada
-        unregister_scheduled_task()
+        # 1. Encerra processos em execucao
+        try:
+            subprocess.run(["taskkill", "/f", "/im", "AdminBridge.exe"], capture_output=True, check=False, creationflags=0x08000000)
+            subprocess.run(["taskkill", "/f", "/im", "AntigravityBridge.exe"], capture_output=True, check=False, creationflags=0x08000000)
+        except Exception:
+            pass
 
-        # 2. Restaura permissões NTFS de C:\Utilitario\config
-        restore_ntfs_acls_for_removal(CONFIG_DIR)
-        restore_ntfs_acls_for_removal(BASE_DIR)
+        # 2. Remove tarefa agendada
+        unregister_scheduled_task()
 
         # 3. Remove atalhos da Área de Trabalho
         try:
@@ -280,22 +283,23 @@ def perform_full_uninstall(parent_widget=None) -> bool:
         except Exception:
             pass
 
-        # 4. Limpa dados em C:\Utilitario
-        for d in [REQUESTS_DIR, PROCESSING_DIR, RESPONSES_DIR, SCRIPTS_DIR, CONFIG_DIR, LOGS_DIR]:
-            if d.exists():
-                try:
-                    shutil.rmtree(d, ignore_errors=True)
-                except Exception:
-                    pass
-
-        # 5. Se estiver executando de dentro de C:\Utilitario, agenda auto-remoção
-        cleanup_cmd = (
-            'cmd.exe /c "timeout /t 2 /nobreak >nul & '
-            'takeown /f "C:\\Utilitario" /r /d y >nul 2>&1 & '
-            'icacls "C:\\Utilitario" /grant "*S-1-5-32-544:(OI)(CI)(F)" /t >nul 2>&1 & '
-            'rd /s /q "C:\\Utilitario" >nul 2>&1"'
+        # 4. Cria script desacoplado na pasta temporaria do Windows para exclusao total
+        temp_dir = Path(os.environ.get("TEMP", "C:/Windows/Temp"))
+        cleanup_bat = temp_dir / "adminbridge_cleanup.bat"
+        bat_content = (
+            "@echo off\r\n"
+            "timeout /t 1 /nobreak >nul\r\n"
+            "taskkill /f /im AdminBridge.exe >nul 2>&1\r\n"
+            "taskkill /f /im AntigravityBridge.exe >nul 2>&1\r\n"
+            "takeown /f \"C:\\Utilitario\" /r /d y >nul 2>&1\r\n"
+            "icacls \"C:\\Utilitario\" /grant \"*S-1-5-32-544:(OI)(CI)(F)\" /t >nul 2>&1\r\n"
+            "rd /s /q \"C:\\Utilitario\" >nul 2>&1\r\n"
+            "del /f /q \"%~f0\" >nul 2>&1\r\n"
         )
-        subprocess.Popen(cleanup_cmd, shell=True, creationflags=0x08000000)
+        with open(cleanup_bat, "w", encoding="ascii") as f:
+            f.write(bat_content)
+
+        subprocess.Popen(["cmd.exe", "/c", str(cleanup_bat)], creationflags=0x08000000)
         return True
     except Exception as e:
         logging.error(f"Erro na desinstalação: {e}")
@@ -485,7 +489,7 @@ class SetupWizardDialog(QDialog):
         self.txt_p2.setPlaceholderText("Repita a mesma senha")
         self.layout.addWidget(self.txt_p2)
 
-        self.btn_next = QPushButton("Gerar Pareamento Seguro - QR Code em RAM")
+        self.btn_next = QPushButton("Gerar QR Code")
         self.btn_next.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
         self.btn_next.clicked.connect(self.process_password_and_generate)
         self.layout.addWidget(self.btn_next)
@@ -520,6 +524,15 @@ class SetupWizardDialog(QDialog):
             QMessageBox.critical(self, "Erro no Provisionamento", f"Falha ao gerar chave: {e}")
 
     def show_qr_step(self, res):
+        # Aplica ambiente cego na tela impedindo captura ou visualização por softwares
+        try:
+            hwnd = int(self.winId())
+            ret = ctypes.windll.user32.SetWindowDisplayAffinity(hwnd, 0x00000011)
+            if not ret:
+                ctypes.windll.user32.SetWindowDisplayAffinity(hwnd, 0x00000001)
+        except Exception:
+            pass
+
         while self.layout.count():
             item = self.layout.takeAt(0)
             if item.widget():
@@ -562,23 +575,56 @@ class SetupWizardDialog(QDialog):
         lbl_warn.setStyleSheet("font-size: 11px; color: #f38ba8; font-weight: 600;")
         self.layout.addWidget(lbl_warn)
 
-        btn_finish = QPushButton("Concluir Pareamento • Já Escaneei no Celular")
-        btn_finish.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
-        btn_finish.setStyleSheet("background-color: #a6e3a1; color: #11111b; font-weight: bold; padding: 12px;")
-        btn_finish.clicked.connect(self.finalize_provisioning)
-        self.layout.addWidget(btn_finish)
+        lbl_otp_input = QLabel("Código OTP de Verificação - digite os 6 dígitos gerados no celular:")
+        lbl_otp_input.setStyleSheet("font-size: 12px; font-weight: 600; color: #89b4fa; margin-top: 6px;")
+        self.layout.addWidget(lbl_otp_input)
 
-    def finalize_provisioning(self):
+        self.txt_verify_otp = QLineEdit()
+        self.txt_verify_otp.setMaxLength(6)
+        self.txt_verify_otp.setPlaceholderText("000000")
+        self.txt_verify_otp.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.txt_verify_otp.setStyleSheet("font-family: Consolas, monospace; font-size: 20px; font-weight: bold; letter-spacing: 4px; color: #a6e3a1;")
+        self.txt_verify_otp.returnPressed.connect(self.verify_and_finalize_pairing)
+        self.layout.addWidget(self.txt_verify_otp)
+
+        self.btn_finish = QPushButton("Validar Código e Concluir Pareamento")
+        self.btn_finish.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+        self.btn_finish.setStyleSheet("background-color: #a6e3a1; color: #11111b; font-weight: bold; padding: 12px;")
+        self.btn_finish.clicked.connect(self.verify_and_finalize_pairing)
+        self.layout.addWidget(self.btn_finish)
+
+    def verify_and_finalize_pairing(self):
+        otp = self.txt_verify_otp.text().strip()
+        if len(otp) != 6 or not otp.isdigit():
+            QMessageBox.warning(self, "Código Inválido", "Digite o código OTP de 6 dígitos exibido no seu celular.")
+            return
+
+        ok, msg = self.hotp_auth.verify_and_finalize_initial_otp(otp)
+        if not ok:
+            QMessageBox.critical(self, "Falha de Pareamento", msg)
+            return
+
+        try:
+            hwnd = int(self.winId())
+            ctypes.windll.user32.SetWindowDisplayAffinity(hwnd, 0x00000000)
+        except Exception:
+            pass
+
         if self.raw_qr_buffer is not None:
             wipe_buffer(self.raw_qr_buffer)
             self.raw_qr_buffer = None
         gc.collect()
 
-        # Registra a tarefa elevada no Windows com /ru "SYSTEM" /rl HIGHEST
         register_scheduled_task()
+        QMessageBox.information(self, "Pareamento Concluído", "Autenticador pareado e sincronizado com sucesso!")
         self.accept()
 
     def closeEvent(self, event):
+        try:
+            hwnd = int(self.winId())
+            ctypes.windll.user32.SetWindowDisplayAffinity(hwnd, 0x00000000)
+        except Exception:
+            pass
         if self.raw_qr_buffer is not None:
             wipe_buffer(self.raw_qr_buffer)
             self.raw_qr_buffer = None
@@ -597,7 +643,7 @@ class ResetWizardDialog(QDialog):
         self.hotp_auth = hotp_auth
         self.challenge_code = generate_physical_challenge()
 
-        self.setWindowTitle("Admin Bridge • Revogar Privilégios e Resetar HOTP")
+        self.setWindowTitle("Admin Bridge • Reiniciar Configuração")
         self.setMinimumSize(480, 520)
         self.setStyleSheet("""
             QDialog {
@@ -646,14 +692,13 @@ class ResetWizardDialog(QDialog):
         self.init_ui()
 
     def init_ui(self):
-        lbl_title = QLabel("⚠️ Revogação de Privilégios & Reset")
+        lbl_title = QLabel("⚠️ Reiniciar Configuração")
         lbl_title.setStyleSheet("font-size: 18px; font-weight: bold; color: #f38ba8;")
         self.layout.addWidget(lbl_title)
 
         lbl_desc = QLabel(
-            "Esta operação destrói permanentemente a chave HOTP atual, remove a tarefa elevada "
-            "do Agendador de Tarefas do Windows e encerra todas as permissões administrativas.\n"
-            "Para reativar a Central no futuro, será exigida nova aprovação manual no Windows UAC."
+            "Esta operação reinicia a configuração atual e remove as credenciais anteriores "
+            "para que você possa definir uma nova palavra-passe e parear o autenticador novamente."
         )
         lbl_desc.setWordWrap(True)
         lbl_desc.setStyleSheet("font-size: 12px; color: #a6adc8; line-height: 1.4;")
@@ -684,7 +729,7 @@ class ResetWizardDialog(QDialog):
         self.txt_curr_pw.setPlaceholderText("Digite sua palavra-passe de recuperação")
         self.layout.addWidget(self.txt_curr_pw)
 
-        self.btn_submit = QPushButton("Confirmar Destruição de Chave & Revogar Tarefa")
+        self.btn_submit = QPushButton("Confirmar e Reiniciar Configuração")
         self.btn_submit.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
         self.btn_submit.clicked.connect(self.execute_reset)
         self.layout.addWidget(self.btn_submit)
@@ -717,14 +762,13 @@ class ResetWizardDialog(QDialog):
             )
             QMessageBox.information(
                 self,
-                "Privilégios Revogados",
-                "Sucesso! A chave HOTP foi destruída e a tarefa elevada do Windows foi removida.\n"
-                "A central de gestão será encerrada agora."
+                "Configuração Reiniciada",
+                "Sucesso! A configuração foi reiniciada com êxito.\n"
+                "Você pode agora configurar uma nova palavra-passe e parear o aplicativo."
             )
             self.accept()
-            QApplication.quit()
         except Exception as e:
-            QMessageBox.critical(self, "Erro no Reset", f"Falha na revogação: {e}")
+            QMessageBox.critical(self, "Erro na Reinicialização", f"Falha na reinicialização: {e}")
 
 
 # -----------------------------------------------------------------------------
@@ -1303,7 +1347,7 @@ class AdminBridgeWindow(QMainWindow):
 
         self.settings_menu.addSeparator()
 
-        act_reset = QAction("🔄 Resetar HOTP (Revogar Privilégios)...", self)
+        act_reset = QAction("🔄 Reiniciar Configuração...", self)
         act_reset.triggered.connect(self.open_reset_dialog)
         self.settings_menu.addAction(act_reset)
 
@@ -1352,6 +1396,14 @@ class AdminBridgeWindow(QMainWindow):
         self.lbl_status_val.setStyleSheet("color: #a6e3a1;")
         cs_layout.addWidget(lbl_s_title)
         cs_layout.addWidget(self.lbl_status_val)
+
+        self.btn_repair = QPushButton("🔧 Corrigir")
+        self.btn_repair.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+        self.btn_repair.setStyleSheet("background-color: #f38ba8; color: #11111b; font-weight: bold; border-radius: 4px; padding: 4px 8px; font-size: 11px;")
+        self.btn_repair.clicked.connect(self.prompt_and_execute_repair)
+        self.btn_repair.hide()
+        cs_layout.addWidget(self.btn_repair)
+
         metrics_layout.addWidget(card_status, 1)
 
         # Card 3: Falhas Recentes (Fail-Safe)
@@ -1480,7 +1532,7 @@ class AdminBridgeWindow(QMainWindow):
 
         tray_menu.addSeparator()
 
-        reset_action = QAction("🔄 Resetar HOTP - Revogar Privilégios...", self)
+        reset_action = QAction("🔄 Reiniciar Configuração...", self)
         reset_action.triggered.connect(self.open_reset_dialog)
         tray_menu.addAction(reset_action)
 
@@ -1558,12 +1610,19 @@ class AdminBridgeWindow(QMainWindow):
         self.lbl_status_val.setText(status_text)
         self.lbl_fails_val.setText(f"{fails} / {max_fails} Falhas")
 
-        if "Bloqueado" in status_text or status_data.get("lockdown"):
+        if "adulteração" in status_text.lower() or status_data.get("tampered"):
+            self.lbl_status_val.setText("Bloqueado por adulteração")
             self.lbl_status_val.setStyleSheet("color: #f38ba8;")
+            self.btn_repair.show()
+        elif "Bloqueado" in status_text or status_data.get("lockdown"):
+            self.lbl_status_val.setStyleSheet("color: #f38ba8;")
+            self.btn_repair.hide()
         elif "Aguardando" in status_text:
             self.lbl_status_val.setStyleSheet("color: #f9e2af;")
+            self.btn_repair.hide()
         else:
             self.lbl_status_val.setStyleSheet("color: #a6e3a1;")
+            self.btn_repair.hide()
 
         # 2. Popula a tabela de histórico
         history_items = load_recent_history(50)
@@ -1815,6 +1874,37 @@ class AdminBridgeWindow(QMainWindow):
         self.btn_reject.setEnabled(False)
         self.btn_approve.setEnabled(False)
 
+    def prompt_and_execute_repair(self):
+        if not is_admin():
+            try:
+                request_elevation_with_args(["gui"])
+                return
+            except Exception as e:
+                QMessageBox.critical(self, "Permissão Necessária", f"Privilégios de Administrador são necessários: {e}")
+                return
+
+        pwd, ok = QInputDialog.getText(
+            self,
+            "Reparo do Sistema",
+            "Digite a sua Palavra-passe de Recuperação para autorizar o reparo:",
+            QLineEdit.EchoMode.Password
+        )
+        if not ok or not pwd:
+            return
+
+        success, msg = self.hotp_auth.repair_corrupted_installation(pwd)
+        if success:
+            QMessageBox.information(
+                self,
+                "Reparo Concluído",
+                "As pastas e arquivos foram restaurados com sucesso.\nO assistente será iniciado agora para um novo pareamento."
+            )
+            wizard = SetupWizardDialog(self.hotp_auth, self)
+            wizard.exec()
+            self.refresh_dashboard()
+        else:
+            QMessageBox.critical(self, "Falha no Reparo", msg)
+
     def open_reset_dialog(self):
         if not is_admin():
             try:
@@ -1824,7 +1914,9 @@ class AdminBridgeWindow(QMainWindow):
                 QMessageBox.critical(self, "Permissão Necessária", f"Privilégios de Administrador são necessários: {e}")
                 return
         dlg = ResetWizardDialog(self.hotp_auth, self)
-        dlg.exec()
+        if dlg.exec() == QDialog.DialogCode.Accepted:
+            wizard = SetupWizardDialog(self.hotp_auth, self)
+            wizard.exec()
         self.refresh_dashboard()
 
     def open_uninstall_dialog(self):
@@ -1833,9 +1925,9 @@ class AdminBridgeWindow(QMainWindow):
             "Desinstalar Utilitário",
             "Tem certeza que deseja desinstalar completamente o Admin Bridge?\n\n"
             "Esta ação irá:\n"
-            "• Remover a tarefa agendada do Windows (schtasks)\n"
+            "• Remover a tarefa agendada do Windows schtasks\n"
             "• Restaurar as permissões de acesso NTFS\n"
-            "• Apagar todos os arquivos e filas de C:\\Utilitario\n"
+            "• Apagar todos os arquivos e pastas de C:\\Utilitario\n"
             "• Remover os atalhos da Área de Trabalho\n\n"
             "Deseja prosseguir?",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
@@ -1859,7 +1951,7 @@ class AdminBridgeWindow(QMainWindow):
                 "Desinstalação Concluída",
                 "O Admin Bridge foi desinstalado com sucesso da máquina."
             )
-            self.quit_app()
+            os._exit(0)
         else:
             QMessageBox.critical(
                 self,
@@ -1870,8 +1962,8 @@ class AdminBridgeWindow(QMainWindow):
     def show_counter_status_dialog(self):
         st = self.hotp_auth.get_counter_status()
         counter = st.get("counter", 0)
-        lockdown = "SIM (Bloqueado)" if st.get("lockdown") else "NÃO (Ativo)"
-        provisioned = "SIM (Flag=1)" if st.get("provisioned_flag") == 1 else "NÃO (Flag=0)"
+        lockdown = "SIM - Bloqueado" if st.get("lockdown") else "NÃO - Ativo"
+        provisioned = "SIM - Flag=1" if st.get("provisioned_flag") == 1 else "NÃO - Flag=0"
         fails = st.get("recent_failures", 0)
         status_txt = st.get("status_text", "Ativo")
 
@@ -1882,14 +1974,15 @@ class AdminBridgeWindow(QMainWindow):
             f"Estado do Serviço: {status_txt}\n"
             f"Provisionado: {provisioned}\n"
             f"Bloqueio Fail-Safe: {lockdown}\n"
-            f"Falhas Recentes (5m): {fails} / 3\n\n"
-            "O código OTP nunca é exibido no computador por segurança.\n"
-            "Consulte seu aplicativo autenticador no telemóvel."
+            f"Falhas Recentes: {fails} / 3"
         )
 
     def show_sync_test_dialog(self):
-        dlg = SyncTestDialog(self.hotp_auth, self)
-        dlg.exec()
+        try:
+            dlg = SyncTestDialog(self.hotp_auth, self)
+            dlg.exec()
+        except Exception as e:
+            QMessageBox.critical(self, "Erro", f"Não foi possível abrir o diagnóstico de sincronia: {e}")
 
 
 
@@ -2433,6 +2526,7 @@ def run_cli_setup(args, hotp_auth: HOTPAuth):
 # PONTO DE ENTRADA PRINCIPAL
 # -----------------------------------------------------------------------------
 def main():
+    configure_anti_dump_mitigations()
     ensure_environment_installed()
     hotp_auth = HOTPAuth()
 

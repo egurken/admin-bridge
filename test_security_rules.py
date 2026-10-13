@@ -21,15 +21,15 @@ def test_all_security_rules():
         assert auth.is_provisioned()
         print("  -> PASSOU: Chave provisionada e protegida com DPAPI!")
 
-        print("[*] 2. Testando Bloqueio de Geração Duplicada (Flag=1)...")
+        print("[*] 2. Testando Bloqueio de Geração Duplicada - Flag=1...")
         try:
             auth.provision(recovery_password="OutraSenha123", caller_info=caller)
             assert False, "Deveria ter lançado PermissionError!"
         except PermissionError as e:
-            print(f"  -> PASSOU: Bloqueado conforme esperado! ({e})")
+            print(f"  -> PASSOU: Bloqueado conforme esperado! - {e}")
 
-        print("[*] 3. Testando Assinatura de Integridade (Detecção de Adulteração Manual)...")
-        # Simula edição manual externa em Bloco de Notas (adulterando o contador de 0 para 999)
+        print("[*] 3. Testando Assinatura de Integridade - Detecção de Adulteração Manual...")
+        # Simula edição manual externa em Bloco de Notas adulterando o contador de 0 para 999
         with open(cfg_path, "r", encoding="utf-8") as f:
             tampered_data = json.load(f)
         tampered_data["counter"] = 999
@@ -40,7 +40,7 @@ def test_all_security_rules():
             auth._load_config_raw()
             assert False, "Deveria ter detectado adulteração e lançado SecurityError!"
         except SecurityError as e:
-            print(f"  -> PASSOU: Adulteração externa detectada com sucesso! ({e})")
+            print(f"  -> PASSOU: Adulteração externa detectada com sucesso! - {e}")
 
         # Restaura a chave para continuar os testes
         auth = HOTPAuth(config_file=cfg_path)
@@ -199,7 +199,50 @@ def test_all_security_rules():
         assert diag_exhausted["next_counter"] == 18
         assert "(" not in diag_exhausted["message"] and ")" not in diag_exhausted["message"]
         assert auth.get_counter_status()["counter"] == 18, f"Esperado 18 após esgotamento, obtido {auth.get_counter_status()['counter']}"
-        print("  -> Subteste 10.4 PASSOU: Esgotamento das 10 posições salta contador para current + 11 (18)!")
+        print("  -> Subteste 10.4 PASSOU: Esgotamento das 10 posições salta contador para current + 11 [18]!")
+
+        # -------------------------------------------------------------
+        # TESTE 11: Confirmação de Pareamento Inicial com OTP
+        # -------------------------------------------------------------
+        print("[*] 11. Testando Validação Obrigatória de OTP no Pareamento Inicial...")
+        res_init = auth.provision("SenhaMestra@2026", force=True, caller_info=caller)
+        secret_b32_init = urllib.parse.parse_qs(urllib.parse.urlparse(res_init["uri"]).query)["secret"][0]
+        secret_ba_init = bytearray(base64.b32decode(secret_b32_init))
+        valid_otp_0 = auth._compute_hotp_internal(secret_ba_init, 0, 6)
+
+        # Erro com codigo incorreto
+        ok_bad, _ = auth.verify_and_finalize_initial_otp("000000" if valid_otp_0 != "000000" else "111111")
+        assert not ok_bad
+
+        # Sucesso com codigo correto
+        ok_good, _ = auth.verify_and_finalize_initial_otp(valid_otp_0)
+        assert ok_good
+        assert auth.get_counter_status()["counter"] == 1
+        print("  -> PASSOU: Pareamento inicial exige e valida OTP com sucesso!")
+
+        # -------------------------------------------------------------
+        # TESTE 12: Reparo de Instalação Corrompida com Senha Mestra
+        # -------------------------------------------------------------
+        print("[*] 12. Testando Reparo de Adulteração Protegido por Senha Mestra...")
+        # Simula adulteracao externa no arquivo
+        with open(cfg_path, "r", encoding="utf-8") as f:
+            tampered_data2 = json.load(f)
+        tampered_data2["counter"] = 777
+        with open(cfg_path, "w", encoding="utf-8") as f:
+            json.dump(tampered_data2, f, indent=2)
+
+        st_tampered = auth.get_counter_status()
+        assert st_tampered["status_text"] == "Bloqueado por adulteração"
+        assert "(" not in st_tampered["status_text"] and ")" not in st_tampered["status_text"]
+
+        # Tentativa de reparo com senha incorreta deve falhar
+        ok_rep_bad, _ = auth.repair_corrupted_installation("SenhaErrada123")
+        assert not ok_rep_bad
+
+        # Reparo com senha mestra correta deve ter sucesso
+        ok_rep_good, _ = auth.repair_corrupted_installation("SenhaMestra@2026")
+        assert ok_rep_good
+        print("  -> PASSOU: Status Bloqueado por adulteração limpo e reparo protegido por senha mestra!")
 
     print("\n=======================================================")
     print("TODOS OS REQUISITOS DE SEGURANÇA FORAM TESTADOS E APROVADOS!")
