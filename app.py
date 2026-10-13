@@ -26,7 +26,8 @@ from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QLabel, QPushButton, QPlainTextEdit, QFrame, QSystemTrayIcon,
     QMenu, QMessageBox, QDialog, QLineEdit, QTableWidget, QTableWidgetItem,
-    QHeaderView, QAbstractItemView, QInputDialog, QGridLayout, QLayout
+    QHeaderView, QAbstractItemView, QInputDialog, QGridLayout, QLayout,
+    QProgressBar
 )
 
 from hotp_auth import HOTPAuth, SecurityError, PREAUTH_TICKET_FILE
@@ -244,26 +245,100 @@ def unregister_scheduled_task() -> bool:
     return ok
 
 
-def perform_full_uninstall(parent_widget=None) -> bool:
-    """Executa o fluxo completo de desinstalação:
+class UninstallProgressDialog(QDialog):
+    """Diálogo interativo com progresso visual em tempo real para desinstalação completa."""
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Desinstalação • Admin Bridge")
+        self.resize(520, 340)
+        self.setMinimumSize(500, 320)
+        self.setStyleSheet("""
+            QDialog {
+                background-color: #11111b;
+                color: #cdd6f4;
+                font-family: 'Segoe UI', system-ui, sans-serif;
+            }
+            QLabel {
+                color: #cdd6f4;
+            }
+            QProgressBar {
+                border: 1px solid #313244;
+                border-radius: 6px;
+                text-align: center;
+                background-color: #181825;
+                color: #cdd6f4;
+                font-weight: bold;
+                height: 22px;
+            }
+            QProgressBar::chunk {
+                background-color: #a6e3a1;
+                border-radius: 5px;
+            }
+            QPushButton {
+                background-color: #313244;
+                color: #cdd6f4;
+                border: none;
+                border-radius: 6px;
+                padding: 10px 18px;
+                font-weight: bold;
+            }
+            QPushButton:hover {
+                background-color: #45475a;
+            }
+        """)
+        self.init_ui()
 
-    1. Encerra imediatamente qualquer processo interno do utilitário em execução.
-    2. Remove as tarefas agendadas do Windows.
-    3. Remove os atalhos criados na Área de Trabalho.
-    4. Cria e dispara script autônomo na pasta TEMP para assumir posse e apagar completamente C:\\Utilitario.
-    """
-    try:
-        # 1. Encerra processos em execucao
-        try:
-            subprocess.run(["taskkill", "/f", "/im", "AdminBridge.exe"], capture_output=True, check=False, creationflags=0x08000000)
-            subprocess.run(["taskkill", "/f", "/im", "AntigravityBridge.exe"], capture_output=True, check=False, creationflags=0x08000000)
-        except Exception:
-            pass
+    def init_ui(self):
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(24, 24, 24, 24)
+        layout.setSpacing(14)
 
-        # 2. Remove tarefa agendada
-        unregister_scheduled_task()
+        lbl_title = QLabel("Desinstalando Admin Bridge...")
+        lbl_title.setStyleSheet("font-size: 16px; font-weight: bold; color: #f38ba8;")
+        layout.addWidget(lbl_title)
 
-        # 3. Remove atalhos da Área de Trabalho
+        self.lbl_status = QLabel("Iniciando processo de remoção...")
+        self.lbl_status.setStyleSheet("font-size: 13px; color: #a6adc8;")
+        self.lbl_status.setWordWrap(True)
+        layout.addWidget(self.lbl_status)
+
+        self.progress = QProgressBar()
+        self.progress.setRange(0, 100)
+        self.progress.setValue(5)
+        layout.addWidget(self.progress)
+
+        self.log_area = QPlainTextEdit()
+        self.log_area.setReadOnly(True)
+        self.log_area.setStyleSheet("background-color: #181825; color: #bac2de; font-family: Consolas, monospace; font-size: 11px; border: 1px solid #313244; border-radius: 6px;")
+        layout.addWidget(self.log_area)
+
+        self.btn_close = QPushButton("Concluir e Sair")
+        self.btn_close.setEnabled(False)
+        self.btn_close.clicked.connect(self.accept)
+        layout.addWidget(self.btn_close, alignment=Qt.AlignmentFlag.AlignRight)
+
+    def log(self, text: str):
+        self.log_area.appendPlainText(text)
+        QApplication.processEvents()
+
+    def set_step(self, val: int, msg: str):
+        self.progress.setValue(val)
+        self.lbl_status.setText(msg)
+        self.log(f"[*] {msg}")
+        QApplication.processEvents()
+
+    def run_uninstall(self) -> bool:
+        self.set_step(15, "1/5 Encerrando tarefas agendadas do Windows...")
+        for tn in ("AdminBridge", "AntigravityAdminBridge"):
+            subprocess.run(["schtasks", "/end", "/tn", tn], capture_output=True, check=False, creationflags=0x08000000)
+            subprocess.run(["schtasks", "/delete", "/tn", tn, "/f"], capture_output=True, check=False, creationflags=0x08000000)
+        time.sleep(0.5)
+
+        self.set_step(35, "2/5 Finalizando processos em segundo plano...")
+        subprocess.run(["taskkill", "/f", "/im", "AntigravityBridge.exe"], capture_output=True, check=False, creationflags=0x08000000)
+        time.sleep(0.5)
+
+        self.set_step(55, "3/5 Removendo atalhos da Área de Trabalho...")
         try:
             desktops = []
             ud = get_desktop_dir()
@@ -278,32 +353,62 @@ def perform_full_uninstall(parent_widget=None) -> bool:
                         try:
                             if item.is_file():
                                 item.unlink(missing_ok=True)
+                                self.log(f"  - Atalho removido: {item.name}")
                         except Exception:
                             pass
-        except Exception:
-            pass
+        except Exception as e:
+            self.log(f"  Aviso ao remover atalhos: {e}")
+        time.sleep(0.5)
 
-        # 4. Cria script desacoplado na pasta temporaria do Windows para exclusao total
+        self.set_step(75, "4/5 Liberando permissões e travas de segurança...")
+        try:
+            restore_ntfs_acls_for_removal(BASE_DIR)
+        except Exception as e:
+            self.log(f"  Aviso ao restaurar permissões: {e}")
+        time.sleep(0.5)
+
+        self.set_step(90, "5/5 Disparando script de limpeza completa com repetições...")
         temp_dir = Path(os.environ.get("TEMP", "C:/Windows/Temp"))
         cleanup_bat = temp_dir / "adminbridge_cleanup.bat"
         bat_content = (
             "@echo off\r\n"
+            "setlocal enabledelayedexpansion\r\n"
+            "set RETRIES=0\r\n"
+            ":WAIT_KILL\r\n"
             "timeout /t 1 /nobreak >nul\r\n"
             "taskkill /f /im AdminBridge.exe >nul 2>&1\r\n"
             "taskkill /f /im AntigravityBridge.exe >nul 2>&1\r\n"
             "takeown /f \"C:\\Utilitario\" /r /d y >nul 2>&1\r\n"
             "icacls \"C:\\Utilitario\" /grant \"*S-1-5-32-544:(OI)(CI)(F)\" /t >nul 2>&1\r\n"
+            "attrib -r -h -s \"C:\\Utilitario\\*\" /s /d >nul 2>&1\r\n"
             "rd /s /q \"C:\\Utilitario\" >nul 2>&1\r\n"
+            "if not exist \"C:\\Utilitario\" goto DONE\r\n"
+            "set /a RETRIES+=1\r\n"
+            "if !RETRIES! leq 10 goto WAIT_KILL\r\n"
+            ":DONE\r\n"
             "del /f /q \"%~f0\" >nul 2>&1\r\n"
         )
-        with open(cleanup_bat, "w", encoding="ascii") as f:
-            f.write(bat_content)
+        try:
+            with open(cleanup_bat, "w", encoding="ascii") as f:
+                f.write(bat_content)
+            subprocess.Popen(["cmd.exe", "/c", str(cleanup_bat)], creationflags=0x08000000)
+        except Exception as e:
+            self.log(f"  Erro ao criar script de limpeza: {e}")
 
-        subprocess.Popen(["cmd.exe", "/c", str(cleanup_bat)], creationflags=0x08000000)
+        self.set_step(100, "Desinstalação concluída com sucesso!")
+        self.lbl_status.setStyleSheet("font-size: 13px; color: #a6e3a1; font-weight: bold;")
+        self.btn_close.setEnabled(True)
         return True
-    except Exception as e:
-        logging.error(f"Erro na desinstalação: {e}")
-        return False
+
+
+def perform_full_uninstall(parent_widget=None) -> bool:
+    """Executa o diálogo interativo de desinstalação completa."""
+    dlg = UninstallProgressDialog(parent_widget)
+    dlg.show()
+    QApplication.processEvents()
+    ok = dlg.run_uninstall()
+    dlg.exec()
+    return ok
 
 
 def load_recent_history(max_items: int = 50) -> list:
@@ -524,7 +629,7 @@ class SetupWizardDialog(QDialog):
             QMessageBox.critical(self, "Erro no Provisionamento", f"Falha ao gerar chave: {e}")
 
     def show_qr_step(self, res):
-        # Aplica ambiente cego na tela impedindo captura ou visualização por softwares
+        # Aplica ambiente cego na tela impedindo captura ou visualizacao por softwares
         try:
             hwnd = int(self.winId())
             ret = ctypes.windll.user32.SetWindowDisplayAffinity(hwnd, 0x00000011)
@@ -533,65 +638,98 @@ class SetupWizardDialog(QDialog):
         except Exception:
             pass
 
+        self.resize(820, 520)
+        self.setMinimumSize(800, 480)
+
         while self.layout.count():
             item = self.layout.takeAt(0)
             if item.widget():
                 item.widget().deleteLater()
 
-        lbl_title = QLabel("📷 Escaneie o QR Code no seu Celular")
-        lbl_title.setStyleSheet("font-size: 18px; font-weight: bold; color: #89b4fa;")
-        lbl_title.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.layout.addWidget(lbl_title)
+        lbl_header = QLabel("🔐 Pareamento e Ativação do Autenticador")
+        lbl_header.setStyleSheet("font-size: 18px; font-weight: bold; color: #a6e3a1;")
+        self.layout.addWidget(lbl_header)
 
-        lbl_sub = QLabel("Abra o Aegis, 2FAS ou Google Authenticator no celular e escaneie:")
-        lbl_sub.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        lbl_sub.setStyleSheet("font-size: 12px; color: #a6adc8;")
-        self.layout.addWidget(lbl_sub)
+        # Layout horizontal de duas colunas lado a lado
+        columns_layout = QHBoxLayout()
+        columns_layout.setSpacing(24)
+
+        # Coluna Esquerda: QR Code e Chave Manual
+        col_left = QVBoxLayout()
+        col_left.setSpacing(10)
+
+        lbl_qr_title = QLabel("1. Escaneie o QR Code no Celular")
+        lbl_qr_title.setStyleSheet("font-size: 13px; font-weight: bold; color: #89b4fa;")
+        col_left.addWidget(lbl_qr_title)
+
+        lbl_sub = QLabel("Abra o Aegis, 2FAS ou Google Authenticator:")
+        lbl_sub.setStyleSheet("font-size: 11px; color: #a6adc8;")
+        col_left.addWidget(lbl_sub)
 
         pixmap, self.raw_qr_buffer = render_qr_in_memory(res["uri"])
 
         lbl_img = QLabel()
         lbl_img.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        lbl_img.setPixmap(pixmap.scaled(240, 240, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation))
-        self.layout.addWidget(lbl_img)
+        lbl_img.setPixmap(pixmap.scaled(220, 220, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation))
+        col_left.addWidget(lbl_img)
 
         lbl_manual = QLabel("Chave Secreta para Inserção Manual:")
         lbl_manual.setStyleSheet("font-size: 11px; font-weight: 600; color: #a6adc8;")
-        self.layout.addWidget(lbl_manual)
+        col_left.addWidget(lbl_manual)
 
         txt_secret = QLineEdit(res.get("secret_base32", ""))
         txt_secret.setReadOnly(True)
         txt_secret.setStyleSheet("font-family: Consolas, monospace; font-size: 12px; background-color: #181825; color: #f9e2af;")
-        self.layout.addWidget(txt_secret)
+        col_left.addWidget(txt_secret)
 
-        lbl_meta = QLabel("Tipo: Baseado em Contador HOTP • Contador Inicial: 0 • Dígitos: 6 • SHA-1")
+        lbl_meta = QLabel("Padrão: HOTP RFC 4226 • Dígitos: 6 • HMAC-SHA1")
         lbl_meta.setStyleSheet("font-size: 10px; color: #6c7086;")
-        lbl_meta.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.layout.addWidget(lbl_meta)
+        col_left.addWidget(lbl_meta)
+        col_left.addStretch()
 
-        lbl_warn = QLabel("⚠️ ATENÇÃO: Esta é a ÚNICA vez que este código será exibido. A chave não será salva em disco.")
-        lbl_warn.setWordWrap(True)
-        lbl_warn.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        lbl_warn.setStyleSheet("font-size: 11px; color: #f38ba8; font-weight: 600;")
-        self.layout.addWidget(lbl_warn)
+        columns_layout.addLayout(col_left, stretch=1)
 
-        lbl_otp_input = QLabel("Código OTP de Verificação - digite os 6 dígitos gerados no celular:")
-        lbl_otp_input.setStyleSheet("font-size: 12px; font-weight: 600; color: #89b4fa; margin-top: 6px;")
-        self.layout.addWidget(lbl_otp_input)
+        # Coluna Direita: Validação do primeiro OTP e Conclusão
+        col_right = QVBoxLayout()
+        col_right.setSpacing(12)
+
+        lbl_val_title = QLabel("2. Validação e Conclusão")
+        lbl_val_title.setStyleSheet("font-size: 13px; font-weight: bold; color: #89b4fa;")
+        col_right.addWidget(lbl_val_title)
+
+        lbl_otp_input = QLabel("Digite o código de 6 dígitos que apareceu agora no celular para confirmar a sincronização:")
+        lbl_otp_input.setWordWrap(True)
+        lbl_otp_input.setStyleSheet("font-size: 12px; color: #cdd6f4; line-height: 1.4;")
+        col_right.addWidget(lbl_otp_input)
 
         self.txt_verify_otp = QLineEdit()
         self.txt_verify_otp.setMaxLength(6)
         self.txt_verify_otp.setPlaceholderText("000000")
         self.txt_verify_otp.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.txt_verify_otp.setStyleSheet("font-family: Consolas, monospace; font-size: 20px; font-weight: bold; letter-spacing: 4px; color: #a6e3a1;")
+        self.txt_verify_otp.setStyleSheet("font-family: Consolas, monospace; font-size: 26px; font-weight: bold; letter-spacing: 6px; color: #a6e3a1; padding: 12px;")
         self.txt_verify_otp.returnPressed.connect(self.verify_and_finalize_pairing)
-        self.layout.addWidget(self.txt_verify_otp)
+        col_right.addWidget(self.txt_verify_otp)
 
         self.btn_finish = QPushButton("Validar Código e Concluir Pareamento")
         self.btn_finish.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
         self.btn_finish.setStyleSheet("background-color: #a6e3a1; color: #11111b; font-weight: bold; padding: 12px;")
         self.btn_finish.clicked.connect(self.verify_and_finalize_pairing)
-        self.layout.addWidget(self.btn_finish)
+        col_right.addWidget(self.btn_finish)
+
+        lbl_warn = QLabel("⚠️ ATENÇÃO: Esta é a ÚNICA vez que este código será exibido. A chave não será salva em disco.")
+        lbl_warn.setWordWrap(True)
+        lbl_warn.setStyleSheet("font-size: 11px; color: #f38ba8; font-weight: 600; line-height: 1.3;")
+        col_right.addWidget(lbl_warn)
+
+        btn_cancel_step = QPushButton("Cancelar")
+        btn_cancel_step.setObjectName("btnCancel")
+        btn_cancel_step.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+        btn_cancel_step.clicked.connect(self.reject)
+        col_right.addWidget(btn_cancel_step)
+        col_right.addStretch()
+
+        columns_layout.addLayout(col_right, stretch=1)
+        self.layout.addLayout(columns_layout)
 
     def verify_and_finalize_pairing(self):
         otp = self.txt_verify_otp.text().strip()
@@ -1079,7 +1217,30 @@ class SyncTestDialog(QDialog):
         QApplication.processEvents()
 
         try:
-            res = self.hotp_auth.diagnose_otp_sync(otp)
+            res = self.hotp_auth.diagnose_otp_sync(otp, allow_lookahead=False)
+            if not res.get("success") and res.get("status") == "prompt_lookahead":
+                ask = QMessageBox.question(
+                    self,
+                    "Pesquisar Posições Futuras?",
+                    "O código digitado não corresponde ao contador atual nem aos anteriores.\n\n"
+                    "Deseja pesquisar nas próximas 10 posições futuras do seu autenticador?\n\n"
+                    "Atenção: caso o código não seja localizado nessa janela à frente, "
+                    "o contador do sistema saltará 10 posições para forçar o alinhamento com seu dispositivo.",
+                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                    QMessageBox.StandardButton.No
+                )
+                if ask == QMessageBox.StandardButton.Yes:
+                    res = self.hotp_auth.diagnose_otp_sync(otp, allow_lookahead=True)
+                else:
+                    self.badge_status.setText("NÃO RECONHECIDO")
+                    self.badge_status.setStyleSheet("background-color: #fab387; color: #11111b; padding: 4px 10px; border-radius: 4px; font-weight: bold; font-size: 11px;")
+                    self.lbl_verdict.setText("Código não localizado no contador atual.")
+                    self.lbl_instruction.setText("Verificação cancelada pelo usuário. O contador do sistema permaneceu inalterado.")
+                    self.lbl_det_code.setText(otp)
+                    self.lbl_det_phone.setText("Não localizado")
+                    self.lbl_det_next.setText(f"OTP #{res.get('current_counter')}")
+                    self.frame_details.show()
+                    return
         finally:
             self.btn_verify.setEnabled(True)
             self.btn_verify.setText("Verificar")
@@ -1946,11 +2107,6 @@ class AdminBridgeWindow(QMainWindow):
 
         success = perform_full_uninstall(self)
         if success:
-            QMessageBox.information(
-                self,
-                "Desinstalação Concluída",
-                "O Admin Bridge foi desinstalado com sucesso da máquina."
-            )
             os._exit(0)
         else:
             QMessageBox.critical(
@@ -2194,7 +2350,18 @@ def run_cli_client(args, hotp_auth: HOTPAuth):
     elif args.subcommand in ("sync", "check-otp"):
         lookahead = getattr(args, "lookahead", 10)
         lookback = getattr(args, "lookback", None)
-        res = hotp_auth.diagnose_otp_sync(args.otp, max_lookahead=min(lookahead, 10), max_lookback=lookback)
+        res = hotp_auth.diagnose_otp_sync(args.otp, allow_lookahead=False, max_lookahead=min(lookahead, 10), max_lookback=lookback)
+        if not res.get("success") and res.get("status") == "prompt_lookahead":
+            print("=" * 65)
+            print("  [AVISO]: Código não encontrado no contador atual nem nos anteriores.")
+            print("  Deseja pesquisar nas próximas 10 posições futuras do seu autenticador?")
+            print("  Atenção: caso não encontre, o contador do sistema saltará 10 posições.")
+            ans = safe_input("  Autorizar busca à frente? [s/n]: ").strip().lower()
+            if ans in ("s", "sim", "y", "yes"):
+                res = hotp_auth.diagnose_otp_sync(args.otp, allow_lookahead=True, max_lookahead=min(lookahead, 10), max_lookback=lookback)
+            else:
+                print("  Busca à frente cancelada. O contador permaneceu inalterado.")
+                sys.exit(1)
         print("=" * 65)
         print("          DIAGNÓSTICO E SINCRONIZAÇÃO HOTP")
         print("=" * 65)

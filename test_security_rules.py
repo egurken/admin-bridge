@@ -167,19 +167,27 @@ def test_all_security_rules():
 
         # Caso 2: Celular está à frente (por exemplo celular na posição 6, computador em 1).
         # Deve buscar de 2 até 11, encontrar em 6, interromper a busca e pular para 6 + 1 = 7.
+        # Caso 2: Codigo a frente exige allow_lookahead=True.
+        # Sem autorizacao previa [allow_lookahead=False], o sistema recusa saltar e solicita confirmacao.
         otp_6 = auth._compute_hotp_internal(secret_ba_s, 6, 6)
-        diag_ahead = auth.diagnose_otp_sync(otp_6)
+        diag_req = auth.diagnose_otp_sync(otp_6, allow_lookahead=False)
+        assert not diag_req["success"]
+        assert diag_req["status"] == "prompt_lookahead"
+        assert auth.get_counter_status()["counter"] == 1, "Contador deve permanecer intacto em 1"
+
+        # Com autorizacao expressa [allow_lookahead=True], pesquisa e avanca para 7
+        diag_ahead = auth.diagnose_otp_sync(otp_6, allow_lookahead=True)
         assert diag_ahead["success"]
         assert diag_ahead["status"] == "ahead"
         assert diag_ahead["matched_counter"] == 6
         assert diag_ahead["next_counter"] == 7
         assert "(" not in diag_ahead["message"] and ")" not in diag_ahead["message"]
         assert auth.get_counter_status()["counter"] == 7, "Contador em disco deve ter saltado para 7"
-        print("  -> Subteste 10.2 PASSOU: Código à frente (6) pula contador para 7 e interrompe busca!")
+        print("  -> Subteste 10.2 PASSOU: Código à frente (6) exige autorização e avança após confirmação!")
 
-        # Caso 3: Código do passado (por exemplo posição 2, enquanto computador já está em 7).
-        # A busca sequencial reversa (7 até 0) detecta a posição 2.
-        # Não recua o contador do computador e reporta código expirado.
+        # Caso 3: Codigo do passado [posicao 2 enquanto computador esta em 7].
+        # A busca sequencial reversa detecta a posicao 2.
+        # Nao recua o contador do computador e reporta codigo expirado.
         otp_2 = auth._compute_hotp_internal(secret_ba_s, 2, 6)
         diag_past = auth.diagnose_otp_sync(otp_2)
         assert diag_past["success"]
@@ -190,16 +198,21 @@ def test_all_security_rules():
         assert auth.get_counter_status()["counter"] == 7, "Contador em disco deve permanecer em 7"
         print("  -> Subteste 10.3 PASSOU: Código anterior (2) detectado sem recuar o computador!")
 
-        # Caso 4: Código não encontrado nas 10 posições à frente (testa 8 a 17 e não acha).
-        # Regra de esgotamento: salta obrigatoriamente para current + 11 (7 + 11 = 18).
-        # "agora o contador vai aguardar o 11" (isto é, posições esgotadas pulam para além da janela)
-        diag_exhausted = auth.diagnose_otp_sync("000000")
+        # Caso 4: Codigo nao encontrado e usuario recusa busca a frente
+        diag_denied = auth.diagnose_otp_sync("000000", allow_lookahead=False)
+        assert not diag_denied["success"]
+        assert diag_denied["status"] == "prompt_lookahead"
+        assert auth.get_counter_status()["counter"] == 7, "Contador deve continuar intacto em 7"
+
+        # Caso 5: Codigo nao encontrado e usuario autoriza busca a frente.
+        # Regra de esgotamento: salta 10 posicoes [7 + 10 = 17].
+        diag_exhausted = auth.diagnose_otp_sync("000000", allow_lookahead=True)
         assert not diag_exhausted["success"]
         assert diag_exhausted["status"] == "not_found"
-        assert diag_exhausted["next_counter"] == 18
+        assert diag_exhausted["next_counter"] == 17
         assert "(" not in diag_exhausted["message"] and ")" not in diag_exhausted["message"]
-        assert auth.get_counter_status()["counter"] == 18, f"Esperado 18 após esgotamento, obtido {auth.get_counter_status()['counter']}"
-        print("  -> Subteste 10.4 PASSOU: Esgotamento das 10 posições salta contador para current + 11 [18]!")
+        assert auth.get_counter_status()["counter"] == 17, f"Esperado 17 apos esgotamento, obtido {auth.get_counter_status()['counter']}"
+        print("  -> Subteste 10.4 PASSOU: Esgotamento das 10 posições salta contador 10 posições para 17!")
 
         # -------------------------------------------------------------
         # TESTE 11: Confirmação de Pareamento Inicial com OTP

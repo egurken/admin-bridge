@@ -303,33 +303,85 @@ def verify_recovery_password(password: str, expected_hash_b64: str, salt_b64: st
     return hmac.compare_digest(derived, expected_hash)
 
 
+def create_detached_signature_file(config_file: Path, cfg: dict) -> Path:
+    """Gera arquivo acompanhante de assinatura digital de integridade para comprovacao forense."""
+    sig_file = config_file.with_name(config_file.name + ".sig")
+    try:
+        if config_file.exists():
+            with open(config_file, "rb") as f:
+                data_bytes = f.read()
+            file_hash = hashlib.sha256(data_bytes).hexdigest()
+        else:
+            file_hash = ""
+        sig_payload = {
+            "file": config_file.name,
+            "sha256": file_hash,
+            "integrity_mac": cfg.get("integrity_mac", ""),
+            "signed_at": time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime()),
+            "signer": "AdminBridge DPAPI Machine Seal"
+        }
+        if sig_file.exists():
+            subprocess.run(["attrib", "-r", str(sig_file)], capture_output=True, check=False, creationflags=0x08000000)
+        with open(sig_file, "w", encoding="utf-8") as f:
+            json.dump(sig_payload, f, indent=2, ensure_ascii=False)
+        subprocess.run(["icacls", str(sig_file), "/inheritance:r", "/grant:r", "*S-1-5-18:(F)", "*S-1-5-32-544:(R)"], capture_output=True, check=False, creationflags=0x08000000)
+        subprocess.run(["attrib", "+r", str(sig_file)], capture_output=True, check=False, creationflags=0x08000000)
+    except Exception:
+        pass
+    return sig_file
+
+
 def apply_isolated_bridge_ntfs_acls(base_dir: Path = BASE_DIR):
-    """Aplica permissões ACL granulares e blindadas:
-    - Posse exclusiva definida para SYSTEM ou Administradores
-    - config: Acesso total EXCLUSIVO a SYSTEM (*S-1-5-18). Bloqueio total a Users e Administradores sem takeown.
-    - scripts: Acesso total EXCLUSIVO a SYSTEM (*S-1-5-18) e Administradores (*S-1-5-32-544). Bloqueio total a Users.
-    - queue: SYSTEM/Admins (F) e Users (*S-1-5-32-545) com Modificar (M) para envio de comandos.
-    - logs: SYSTEM/Admins (F) e Users com Modificar (M).
+    """Aplica permissoes ACL granulares e blindadas sem ocultar pastas:
+    - Posse exclusiva definida para SYSTEM
+    - Pastas visiveis normalmente no Windows Explorer, sem atributos ocultos
+    - config: Acesso total EXCLUSIVO a SYSTEM. Bloqueio estrito a usuarios comuns e leitura a Admins.
+    - hotp_config.json: Bloqueio estrito de heranca, somente leitura a Admins e atributo attrib +r.
+    - scripts: Acesso total EXCLUSIVO a SYSTEM e leitura restrita a Administradores.
+    - queue: SYSTEM [F], Admins [M] e Users [M] para envio de comandos.
+    - logs: SYSTEM [F] e Admins [R].
+    - AdminBridge.exe: Unico executavel com permissao de execucao para usuarios.
     """
     config_dir = base_dir / "config"
     scripts_dir = base_dir / "scripts"
     queue_dir = base_dir / "queue"
     logs_dir = base_dir / "logs"
+    config_file = config_dir / "hotp_config.json"
+    exe_file = base_dir / "AdminBridge.exe"
 
-    # Define a posse explicitamente para SYSTEM ou Administradores
+    # Garante que as pastas fiquem visiveis normalmente, sem atributos ocultos
+    for d in (config_dir, scripts_dir, queue_dir, logs_dir):
+        if d.exists():
+            try:
+                subprocess.run(["attrib", "-h", "-s", str(d)], capture_output=True, check=False, creationflags=0x08000000)
+            except Exception:
+                pass
+
+    # Define a posse explicitamente para SYSTEM
     try:
         if base_dir.exists():
             subprocess.run(["cmd.exe", "/c", f'icacls "{base_dir}" /setowner "*S-1-5-18" /t /c /q'], capture_output=True, check=False, creationflags=0x08000000)
     except Exception:
         pass
 
-    # 1. Blindagem estrita de config - somente SYSTEM
+    # Permissao no executavel principal: unico arquivo executavel para o usuario
+    try:
+        if exe_file.exists():
+            cmd_exe = f'icacls "{exe_file}" /grant "*S-1-5-18:(F)" "*S-1-5-32-544:(RX)" "*S-1-5-32-545:(RX)"'
+            subprocess.run(["cmd.exe", "/c", cmd_exe], capture_output=True, check=False, creationflags=0x08000000)
+    except Exception:
+        pass
+
+    # 1. Blindagem estrita de config - somente SYSTEM total e Admins leitura
     try:
         if config_dir.exists():
             cfg_str = str(config_dir)
-            cmd_cfg = f'icacls "{cfg_str}" /inheritance:r /grant:r *S-1-5-18:(OI)(CI)(F)'
+            cmd_cfg = f'icacls "{cfg_str}" /inheritance:r /grant:r "*S-1-5-18:(OI)(CI)(F)" "*S-1-5-32-544:(OI)(CI)(R)"'
             subprocess.run(["cmd.exe", "/c", cmd_cfg], capture_output=True, check=False, creationflags=0x08000000)
-            subprocess.run(["cmd.exe", "/c", f'icacls "{cfg_str}\\*" /grant:r *S-1-5-18:(F)'], capture_output=True, check=False, creationflags=0x08000000)
+            if config_file.exists():
+                cmd_cf = f'icacls "{config_file}" /inheritance:r /grant:r "*S-1-5-18:(F)" "*S-1-5-32-544:(R)"'
+                subprocess.run(["cmd.exe", "/c", cmd_cf], capture_output=True, check=False, creationflags=0x08000000)
+                subprocess.run(["attrib", "+r", str(config_file)], capture_output=True, check=False, creationflags=0x08000000)
     except Exception:
         pass
 
@@ -337,20 +389,28 @@ def apply_isolated_bridge_ntfs_acls(base_dir: Path = BASE_DIR):
     try:
         if scripts_dir.exists():
             sc_str = str(scripts_dir)
-            cmd_sc = f'icacls "{sc_str}" /inheritance:r /grant:r *S-1-5-18:(OI)(CI)(F) *S-1-5-32-544:(OI)(CI)(F)'
+            cmd_sc = f'icacls "{sc_str}" /inheritance:r /grant:r "*S-1-5-18:(OI)(CI)(F)" "*S-1-5-32-544:(OI)(CI)(R)"'
             subprocess.run(["cmd.exe", "/c", cmd_sc], capture_output=True, check=False, creationflags=0x08000000)
     except Exception:
         pass
 
-    # 3. Canal de fila e logs para envio de solicitacoes
-    for d in (queue_dir, logs_dir):
-        try:
-            if d.exists():
-                d_str = str(d)
-                cmd_d = f'icacls "{d_str}" /grant *S-1-5-18:(OI)(CI)(F) *S-1-5-32-544:(OI)(CI)(F) *S-1-5-32-545:(OI)(CI)(M)'
-                subprocess.run(["cmd.exe", "/c", cmd_d], capture_output=True, check=False, creationflags=0x08000000)
-        except Exception:
-            pass
+    # 3. Canal de logs
+    try:
+        if logs_dir.exists():
+            l_str = str(logs_dir)
+            cmd_l = f'icacls "{l_str}" /inheritance:r /grant:r "*S-1-5-18:(OI)(CI)(F)" "*S-1-5-32-544:(OI)(CI)(R)"'
+            subprocess.run(["cmd.exe", "/c", cmd_l], capture_output=True, check=False, creationflags=0x08000000)
+    except Exception:
+        pass
+
+    # 4. Canal de fila para envio de solicitacoes pelo usuario
+    try:
+        if queue_dir.exists():
+            q_str = str(queue_dir)
+            cmd_q = f'icacls "{q_str}" /inheritance:r /grant:r "*S-1-5-18:(OI)(CI)(F)" "*S-1-5-32-544:(OI)(CI)(M)" "*S-1-5-32-545:(OI)(CI)(M)"'
+            subprocess.run(["cmd.exe", "/c", cmd_q], capture_output=True, check=False, creationflags=0x08000000)
+    except Exception:
+        pass
 
 
 def check_forensic_integrity(config_file: Path) -> Tuple[bool, str]:

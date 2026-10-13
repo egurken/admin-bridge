@@ -19,6 +19,7 @@ from hotp_crypto import (
     apply_system_only_ntfs_acls,
     check_integrity_mac,
     compute_integrity_mac,
+    create_detached_signature_file,
     dpapi_protect,
     dpapi_unprotect,
     generate_physical_challenge,
@@ -154,20 +155,28 @@ class HOTPAuth:
                 return False
 
     def _save_config_raw(self, config_data: dict):
-        """Salva a configuração atomicamente com assinatura de integridade e permissões SYSTEM."""
+        """Salva a configuracao atomicamente com assinatura de integridade e permissoes SYSTEM."""
         # 1. Calcula a assinatura de integridade protegida por DPAPI
         config_data["integrity_mac"] = compute_integrity_mac(config_data)
 
-        # 2. Gravação atômica
+        # 2. Desbloqueia atributo somente leitura se o arquivo ja existir
+        if self.config_file.exists():
+            try:
+                subprocess.run(["attrib", "-r", str(self.config_file)], capture_output=True, check=False, creationflags=0x08000000)
+            except Exception:
+                pass
+
+        # 3. Gravacao atomica
         tmp_file = self.config_file.with_suffix(".tmp")
         with open(tmp_file, "w", encoding="utf-8") as f:
             json.dump(config_data, f, indent=2, ensure_ascii=False)
         tmp_file.replace(self.config_file)
 
-        # 3. Aplica permissões restritas exclusivas a SYSTEM e Administradores
+        # 4. Aplica permissoes restritas exclusivas a SYSTEM e gera assinatura digital desanexada
         apply_isolated_bridge_ntfs_acls(BASE_DIR)
+        create_detached_signature_file(self.config_file, config_data)
 
-        # 4. Atualiza o snapshot público para o Dashboard
+        # 5. Atualiza o snapshot publico para o Dashboard
         self._update_public_status(config_data)
 
     def _update_public_status(self, cfg: dict):
@@ -846,6 +855,7 @@ class HOTPAuth:
     def diagnose_otp_sync(
         self,
         provided_otp: str,
+        allow_lookahead: bool = False,
         max_lookahead: int = 10,
         max_lookback: Optional[int] = None
     ) -> dict:
@@ -920,7 +930,22 @@ class HOTPAuth:
                                 "message": f"Seu autenticador esta no OTP #{c}, abaixo do contador do computador que esta no #{current_counter}. O proximo OTP necessario no computador continua sendo o #{current_counter}."
                             }
 
-                # 2. Fase 2: Busca sequencial para frente - estritamente ate 10 posicoes acima
+                if not allow_lookahead:
+                    # Nao pesquisa a frente sem autorizacao previa do usuario. Contador permanece intacto.
+                    return {
+                        "success": False,
+                        "matched_counter": None,
+                        "current_counter": current_counter,
+                        "next_counter": current_counter,
+                        "diff": None,
+                        "status": "prompt_lookahead",
+                        "status_label": "Busca a Frente Necessaria",
+                        "summary": "Codigo nao localizado no contador atual nem nos anteriores.",
+                        "action_instruction": "Deseja pesquisar as proximas 10 posicoes futuras? Se nao encontrar, o contador saltara 10 posicoes para alinhar.",
+                        "message": "Codigo nao coincide com a posicao atual. Confirmacao necessaria para buscar a frente."
+                    }
+
+                # 2. Fase 2: Busca sequencial para frente sob autorizacao expressa - ate 10 posicoes
                 max_c = current_counter + 10
                 for c in range(current_counter + 1, max_c + 1):
                     code = self._compute_hotp_internal(secret_ba, c, DEFAULT_DIGITS)
@@ -951,8 +976,8 @@ class HOTPAuth:
                             "message": f"Seu autenticador esta no OTP #{c}. O contador do computador pulou para #{new_c} e este sera o proximo aceito."
                         }
 
-                # 3. Esgotamento das 10 posicoes acima sem correspondencia: o contador salta para current_counter + 11
-                exhausted_c = current_counter + 11
+                # 3. Esgotamento das 10 posicoes acima sem correspondencia: o contador salta exatamente 10 posicoes
+                exhausted_c = current_counter + 10
                 cfg["counter"] = exhausted_c
                 self._save_config_raw(cfg)
                 self._log_audit(
@@ -960,7 +985,7 @@ class HOTPAuth:
                     current_counter,
                     exhausted_c,
                     False,
-                    f"10 posicoes acima testadas sem correspondencia. Contador saltou para {exhausted_c}.",
+                    f"10 posicoes acima testadas sem correspondencia. Contador saltou 10 posicoes para {exhausted_c}.",
                     clean_otp
                 )
                 return {
@@ -972,8 +997,8 @@ class HOTPAuth:
                     "status": "not_found",
                     "status_label": "Nao Reconhecido",
                     "summary": "O codigo digitado nao correspondeu as 10 posicoes testadas.",
-                    "action_instruction": f"Foram testadas 10 posicoes acima do computador #{current_counter} e o contador agora saltou para aguardar o OTP #{exhausted_c}.",
-                    "message": f"Codigo OTP nao encontrado apos testar 10 posicoes acima. O contador do sistema agora saltou para #{exhausted_c}."
+                    "action_instruction": f"Foram testadas 10 posicoes acima do computador #{current_counter} e o contador saltou para o OTP #{exhausted_c}.",
+                    "message": f"Codigo OTP nao encontrado apos testar 10 posicoes acima. O contador do sistema saltou para #{exhausted_c}."
                 }
 
             finally:
