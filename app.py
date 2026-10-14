@@ -61,7 +61,8 @@ from hotp_crypto import (
     verify_caller_origin, generate_physical_challenge, read_passive_metadata, check_forensic_integrity,
     configure_anti_dump_mitigations, harden_process_dacl, append_ledger_block, verify_ledger_integrity,
     check_config_acl_isolation, protect_transit_token, unprotect_transit_token, verify_owner_anchor,
-    KernelFileGuard, verify_scheduled_task_integrity
+    KernelFileGuard, verify_scheduled_task_integrity, get_os_process_username, ensure_transit_keypair,
+    inspect_script_3_layers
 )
 
 LOCAL_SERVER_NAME = f"AdminBridge_GUI_{os.getenv('USERNAME', 'default')}"
@@ -228,8 +229,8 @@ def ensure_environment_installed():
         except Exception as e:
             logging.warning(f"Aviso ao copiar executavel para C:\\Utilitario: {e}")
 
-    # Aplica permissoes restritas exclusivas apenas na instalacao inicial (quando .acl_seal ainda nao existe), mantendo abertura instantanea
-    if is_admin() and not (CONFIG_DIR / ".acl_seal").exists():
+    # Aplica permissoes restritas se .acl_seal nao existir ou se check_config_acl_isolation detectar heranca aberta
+    if is_admin() and (not (CONFIG_DIR / ".acl_seal").exists() or not check_config_acl_isolation(BASE_DIR)):
         try:
             apply_isolated_bridge_ntfs_acls(BASE_DIR)
         except Exception:
@@ -239,15 +240,24 @@ def ensure_environment_installed():
 
 
 def is_self_targeting_command(cmd_text: str, _depth: int = 0) -> bool:
-    r"""Verifica se uma linha de comando tenta inspecionar, alterar ou afetar a pasta C:\Utilitario, seus arquivos ou processos."""
+    r"""Verifica se uma linha de comando tenta inspecionar, alterar ou afetar a pasta C:\Utilitario, seus arquivos, tarefas ou processos.
+    Inclui resolução de variáveis inline (%VAR% e $var), colapso de concatenação de strings (+ / Join-Path), curingas e Base64.
+    """
     if not cmd_text or _depth > 3:
         return False
 
     raw = cmd_text.lower()
-    # Remove caracteres de escape/ofuscação de shell (aspas, circunflexo do CMD, crase do PowerShell)
-    deobfuscated = raw.translate(str.maketrans("", "", "\"\x27^`"))
 
-    # 1. Alvos diretos, arquivos internos e nomes de tarefas/serviços
+    # 1. Resolve variáveis definidas na própria linha de comando (ex: set X=Utilitario && dir C:\%X%)
+    for m_var in re.finditer(r"\bset\s+([a-z0-9_]+)\s*=\s*([^\s&|;\"']+)", raw):
+        v_name, v_val = m_var.group(1), m_var.group(2)
+        raw = raw.replace(f"%{v_name}%", v_val).replace(f"!{v_name}!", v_val)
+
+    # 2. Remove operadores de concatenação entre strings (ex: 'C:\' + 'Utili' + 'tario' -> 'c:\utilitario')
+    collapsed = re.sub(r"[\"\']\s*\+\s*[\"\']", "", raw)
+    deobfuscated = re.sub(r"[\"\'\^`+()]", "", collapsed)
+
+    # 3. Alvos diretos, arquivos internos e nomes de tarefas/serviços
     forbidden_targets = [
         "c:\\utilitario",
         "c:/utilitario",
@@ -262,28 +272,40 @@ def is_self_targeting_command(cmd_text: str, _depth: int = 0) -> bool:
         "owner_anchor",
         "preauth_ticket",
         "hw_salt",
+        "transit_priv",
         "canary.bin",
         "ledger.jsonl",
         "ledger.anchor",
-        "system32\\tasks\\adminbridge",
-        "system32/tasks/adminbridge",
+        "system32\\tasks\\admin",
+        "system32/tasks/admin",
+        "taskcache\\tree\\admin",
+        "taskcache/tree/admin",
+        "join-path",
     ]
 
-    for candidate in (raw, deobfuscated):
+    # 4. Padrões regex para curingas (C:\U*, cd Ut*, Admin*, WMI like 'Admin%', Stop-Process/taskkill/schtasks com Admin*)
+    forbidden_regexes = [
+        r"c:[\\/]+u[a-z0-9*?~]*",
+        r"\bcd\s+ut[a-z0-9*?~]*",
+        r"(?:^|[\s;&|><(])(config|queue|scripts)[\\/]",
+        r"\b(?:schtasks|taskkill|get-process|stop-process|wmic)\b[^\n]*\badmin[a-z0-9*?%]*",
+        r"\bname\s+like\s+[\"\'\s]*admin",
+        r"taskcache[\\/]+tree[\\/]+admin",
+    ]
+
+    for candidate in (raw, collapsed, deobfuscated):
         for target in forbidden_targets:
             if target in candidate:
                 return True
+        for rx in forbidden_regexes:
+            if re.search(rx, candidate):
+                return True
 
-        # 2. Bloqueia curingas apontando para C:\Utilitario (ex: C:\Uti*, C:/Util?)
-        if re.search(r"c:[\\/]+uti[a-z0-9*?~]*", candidate):
-            return True
-
-        # 3. Bloqueia acesso por caminho relativo às subpastas críticas (ex: type config\*.json)
-        if re.search(r"(?:^|[\s;&|><(])(config|queue|scripts)[\\/]", candidate):
-            return True
-
-    # 4. Desofuscação de comandos PowerShell codificados em Base64 (-e, -en, -enc, -encodedcommand, FromBase64String)
-    b64_tokens = re.findall(r"(?:-[eE][nN]?[cC]?[oO]?[dD]?[eE]?[dD]?[cC]?[oO]?[mM]?[mM]?[aA]?[nN]?[dD]?\s+|frombase64string\s*\(\s*[\"\x27]?)([A-Za-z0-9+/=]{12,})", cmd_text)
+    # 5. Desofuscação de comandos PowerShell codificados em Base64 (-e, -en, -enc, -encodedcommand, FromBase64String)
+    b64_tokens = re.findall(
+        r"(?:-[eE][nN]?[cC]?[oO]?[dD]?[eE]?[dD]?[cC]?[oO]?[mM]?[mM]?[aA]?[nN]?[dD]?\s+|frombase64string\s*\(\s*[\"\']?)([A-Za-z0-9+/=]{12,})",
+        cmd_text
+    )
     for b64_str in b64_tokens:
         for enc_name in ("utf-16le", "utf-8", "latin-1"):
             try:
@@ -1686,6 +1708,10 @@ class AdminBridgeWindow(QMainWindow):
         act_sync.triggered.connect(self.show_sync_test_dialog)
         self.settings_menu.addAction(act_sync)
 
+        act_install_ai = QAction("🤖 Instalar / Ativar Mini-IA Local (Qwen 0.5B)...", self)
+        act_install_ai.triggered.connect(self.install_local_ai_assistant)
+        self.settings_menu.addAction(act_install_ai)
+
         act_status = QAction("📋 Status Detalhado do Contador", self)
         act_status.triggered.connect(self.show_counter_status_dialog)
         self.settings_menu.addAction(act_status)
@@ -1804,24 +1830,47 @@ class AdminBridgeWindow(QMainWindow):
         pending_layout.addWidget(self.code_viewer)
 
         self.btn_box_widget = QWidget()
-        btn_box = QHBoxLayout(self.btn_box_widget)
-        btn_box.setContentsMargins(0, 4, 0, 0)
+        btn_box_main = QVBoxLayout(self.btn_box_widget)
+        btn_box_main.setContentsMargins(0, 4, 0, 0)
+        btn_box_main.setSpacing(8)
+
+        # Linha 1: Autorização rápida com NOVO código OTP de 6 dígitos (para scripts pausados pela IA / Camada 3)
+        otp_stepup_row = QHBoxLayout()
+        otp_stepup_row.setSpacing(8)
+        self.txt_stepup_otp = QLineEdit()
+        self.txt_stepup_otp.setMaxLength(6)
+        self.txt_stepup_otp.setPlaceholderText("Novo OTP (6 dígitos)")
+        self.txt_stepup_otp.setFixedWidth(180)
+        self.txt_stepup_otp.setStyleSheet("background-color: #1e1e2e; color: #a6e3a1; font-family: Consolas, monospace; font-size: 14px; font-weight: bold; padding: 6px 10px; border: 1px solid #45475a; border-radius: 6px;")
+        self.txt_stepup_otp.returnPressed.connect(self.approve_request_with_new_otp)
+        otp_stepup_row.addWidget(self.txt_stepup_otp)
+
+        self.btn_approve_otp = QPushButton("🔑 Autorizar Mesmo Assim com Novo OTP")
+        self.btn_approve_otp.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+        self.btn_approve_otp.setStyleSheet("background-color: #89b4fa; color: #11111b; font-weight: bold; border-radius: 6px; padding: 8px 14px;")
+        self.btn_approve_otp.clicked.connect(self.approve_request_with_new_otp)
+        otp_stepup_row.addWidget(self.btn_approve_otp, 1)
+        btn_box_main.addLayout(otp_stepup_row)
+
+        # Linha 2: Rejeitar ou Autorizar via clique UAC na tela
+        btn_box = QHBoxLayout()
         btn_box.setSpacing(10)
 
-        self.btn_reject = QPushButton("✖ Rejeitar Solicitação")
+        self.btn_reject = QPushButton("✖ Rejeitar e Bloquear Script")
         self.btn_reject.setObjectName("btnReject")
         self.btn_reject.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
         self.btn_reject.clicked.connect(self.reject_request)
         self.btn_reject.setEnabled(False)
         btn_box.addWidget(self.btn_reject)
 
-        self.btn_approve = QPushButton("✔ Aprovar & Executar via UAC")
+        self.btn_approve = QPushButton("✔ Autorizar Mesmo Assim via UAC")
         self.btn_approve.setObjectName("btnApprove")
         self.btn_approve.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
         self.btn_approve.clicked.connect(self.approve_request)
         self.btn_approve.setEnabled(False)
         btn_box.addWidget(self.btn_approve)
 
+        btn_box_main.addLayout(btn_box)
         self.btn_box_widget.hide()
         pending_layout.addWidget(self.btn_box_widget)
 
@@ -2035,16 +2084,18 @@ class AdminBridgeWindow(QMainWindow):
                 peek_req = json.load(f)
             if peek_req.get("script_type") in ("sync_probe", "control_rpc"):
                 return
-            has_auth_payload = bool(
-                peek_req.get("otp")
-                or peek_req.get("otp_dpapi")
-                or peek_req.get("preauth_token")
-                or peek_req.get("preauth_token_dpapi")
-            )
-            # Se a requisição possui OTP/Token e a GUI não está rodando como Administrador/SYSTEM,
-            # deixa exclusivamente o serviço SYSTEM processar para evitar falha de permissão ou disputa na fila.
-            if has_auth_payload and not is_admin():
-                return
+            if peek_req.get("step_up_gui_pending"):
+                # O daemon SYSTEM pausou este script sensível (Camada 3) e encaminhou para aprovação visual na tela do usuário!
+                pass
+            else:
+                has_auth_payload = bool(
+                    peek_req.get("otp")
+                    or peek_req.get("otp_dpapi")
+                    or peek_req.get("preauth_token")
+                    or peek_req.get("preauth_token_dpapi")
+                )
+                if has_auth_payload and not is_admin():
+                    return
         except Exception:
             return
 
@@ -2076,6 +2127,11 @@ class AdminBridgeWindow(QMainWindow):
         if data.get("preauth_token_dpapi") and not data.get("preauth_token"):
             data["preauth_token"] = unprotect_transit_token(data["preauth_token_dpapi"], req_id, actual_code_hash)
         caller_info = data.get("caller")
+
+        if data.get("step_up_gui_pending"):
+            logging.warning(f"[CAMADA 3 STEP-UP] Req: {req_id} pausada para revisao de risco pelo usuario na tela.")
+            self.display_manual_uac_request(data, processing_file, data.get("step_up_report"))
+            return
 
         if provided_otp:
             is_valid, auth_msg, used_counter = self.hotp_auth.verify_and_advance(provided_otp, caller_info)
@@ -2130,7 +2186,7 @@ class AdminBridgeWindow(QMainWindow):
             logging.info(f"[MODO HÍBRIDO] Req: {req_id} sem OTP nem ticket prévio. Exigindo confirmação.")
             self.display_manual_uac_request(data, processing_file)
 
-    def display_manual_uac_request(self, data, processing_file: Path):
+    def display_manual_uac_request(self, data, processing_file: Path, risk_report: Optional[dict] = None):
         self.current_request = data
         self.current_processing_file = processing_file
 
@@ -2138,14 +2194,28 @@ class AdminBridgeWindow(QMainWindow):
         desc = data.get("description", "Sem descrição informada.")
         script_type = data.get("script_type", "bat").upper()
         code = data.get("code", "")
+        if risk_report is None:
+            risk_report = data.get("step_up_report") or inspect_script_3_layers(code)
 
-        self.lbl_req_title.setText(title)
-        self.lbl_req_sub.setText(f"[Sem OTP] Confirmação manual requerida via UAC • {desc}")
-        self.lbl_badge.setText(f"UAC REQUERIDO - {script_type}")
-        self.lbl_badge.setStyleSheet("background-color: #f9e2af; color: #11111b; padding: 4px 10px; border-radius: 4px;")
+        if risk_report and risk_report.get("requires_step_up"):
+            score = risk_report.get("risk_score", 50)
+            self.lbl_req_title.setText(f"⚠️ Alerta de Script Sensível (Risco {score}/100): {title}")
+            self.lbl_req_sub.setText("A Camada 3 pausou este comando para você revisar o que ele faz antes de liberar:")
+            self.lbl_badge.setText(f"REVISÃO DE RISCO • {script_type}")
+            self.lbl_badge.setStyleSheet("background-color: #f38ba8; color: #11111b; padding: 4px 10px; border-radius: 4px; font-weight: bold;")
+            viewer_text = f"{risk_report.get('explanation', '')}\n\n--- CÓDIGO DO SCRIPT SUBMETIDO ---\n{code}"
+            self.code_viewer.setFixedHeight(170)
+        else:
+            self.lbl_req_title.setText(title)
+            self.lbl_req_sub.setText(f"[Sem OTP] Confirmação manual requerida • {desc}")
+            self.lbl_badge.setText(f"UAC REQUERIDO - {script_type}")
+            self.lbl_badge.setStyleSheet("background-color: #f9e2af; color: #11111b; padding: 4px 10px; border-radius: 4px;")
+            viewer_text = code
+            self.code_viewer.setFixedHeight(110)
 
-        self.code_viewer.setPlainText(code)
+        self.code_viewer.setPlainText(viewer_text)
         self.code_viewer.show()
+        self.txt_stepup_otp.clear()
         self.btn_box_widget.show()
         self.btn_reject.setEnabled(True)
         self.btn_approve.setEnabled(True)
@@ -2190,6 +2260,48 @@ class AdminBridgeWindow(QMainWindow):
         self.exec_thread = ExecutionThread(self.current_request, int(self.winId()), force_uac=False)
         self.exec_thread.finished_signal.connect(self.on_execution_finished)
         self.exec_thread.start()
+
+    def approve_request_with_new_otp(self):
+        """Permite ao usuário autorizar um script pausado pela Camada 3 digitando um NOVO código OTP de 6 dígitos na tela."""
+        if not self.current_request:
+            return
+        new_otp = self.txt_stepup_otp.text().strip()
+        if len(new_otp) != 6 or not new_otp.isdigit():
+            QMessageBox.warning(self, "Código OTP Necessário", "Digite um novo código de 6 dígitos gerado no seu celular ou clique em 'Autorizar via UAC'.")
+            return
+        code = self.current_request.get("code", "")
+        if is_self_targeting_command(code):
+            trigger_incident_lockdown(self.current_request.get("id"), "Tentativa de comando auto-direcionado a C:\\Utilitario detectada")
+            if hasattr(self, "current_processing_file") and self.current_processing_file:
+                self.current_processing_file.unlink(missing_ok=True)
+            self.reset_ui()
+            self.refresh_dashboard()
+            return
+
+        req_id = self.current_request["id"]
+        code_hash = self.current_request.get("code_hash") or hashlib.sha256(code.encode("utf-8")).hexdigest()
+        if not is_admin():
+            # Reencaminha para o daemon SYSTEM com o novo OTP criptografado via X25519 e confirm_risk=True
+            self.current_request["step_up_gui_pending"] = False
+            self.current_request["confirm_risk"] = True
+            self.current_request["otp_dpapi"] = protect_transit_token(new_otp, req_id, code_hash)
+            req_back = REQUESTS_DIR / f"{req_id}.json"
+            with open(req_back, "w", encoding="utf-8") as f:
+                json.dump(self.current_request, f, indent=2, ensure_ascii=False)
+            if hasattr(self, "current_processing_file") and self.current_processing_file:
+                self.current_processing_file.unlink(missing_ok=True)
+            self.lbl_badge.setText("ENVIADO AO DAEMON SYSTEM...")
+            QTimer.singleShot(1200, self.reset_ui)
+            return
+
+        caller_info = self.current_request.get("caller") or {"pid": os.getpid(), "exe": sys.executable, "user": os.getenv("USERNAME", "unknown")}
+        is_valid, auth_msg, used_counter = self.hotp_auth.verify_and_advance(new_otp, caller_info)
+        if not is_valid:
+            QMessageBox.critical(self, "OTP Recusado", f"Falha na validação do novo OTP: {auth_msg}")
+            self.refresh_dashboard()
+            return
+
+        self.execute_authenticated_request(self.current_request, used_counter - 1, self.current_processing_file)
 
     def approve_request(self):
         if not self.current_request:
@@ -2423,6 +2535,35 @@ class AdminBridgeWindow(QMainWindow):
             f"Falhas Recentes: {fails} / 3"
         )
 
+    def install_local_ai_assistant(self):
+        """Instala e baixa automaticamente o mini-modelo local qwen2.5:0.5b (~350 MB) com 1 clique."""
+        ask = QMessageBox.question(
+            self,
+            "Instalar Mini-IA Local (Qwen 2.5 • 0.5B)",
+            "Deseja instalar e ativar automaticamente o mini-modelo de IA local (qwen2.5:0.5b - ~350 MB)?\n\n"
+            "• Otimizado para processadores Intel Core i5 (sem precisar de placa de vídeo).\n"
+            "• Consome 0 MB de RAM quando parado (usa 'keep_alive: 0s', carregando apenas por 1 segundo quando um script suspeito é detectado).\n\n"
+            "Iniciar instalação automática agora?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.Yes
+        )
+        if ask != QMessageBox.StandardButton.Yes:
+            return
+        try:
+            bat_path = BASE_DIR / "instalar_ia_local.bat"
+            if not bat_path.exists():
+                bat_path = Path(__file__).parent / "instalar_ia_local.bat"
+            if bat_path.exists():
+                subprocess.Popen(["cmd.exe", "/c", "start", "cmd.exe", "/c", str(bat_path)])
+            else:
+                subprocess.Popen([
+                    "powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command",
+                    "winget install --id Ollama.Ollama -e --accept-package-agreements --accept-source-agreements; "
+                    r"& '$env:LOCALAPPDATA\Programs\Ollama\ollama.exe' pull qwen2.5:0.5b; Read-Host 'Concluido! Pressione Enter para sair'"
+                ])
+        except Exception as e:
+            QMessageBox.warning(self, "Aviso", f"Não foi possível iniciar o instalador automático: {e}")
+
     def show_sync_test_dialog(self):
         try:
             dlg = SyncTestDialog(self.hotp_auth, self)
@@ -2464,14 +2605,22 @@ def run_daemon_loop(hotp_auth: HOTPAuth):
                     json.dump({"timestamp": now_ts, "status": "online", "mode": "daemon", "pid": os.getpid()}, f)
                 last_hb_write = now_ts
 
-            req_files = list(REQUESTS_DIR.glob("*.json"))
+            req_files = sorted(
+                REQUESTS_DIR.glob("*.json"),
+                key=lambda p: p.stat().st_ctime_ns if p.exists() else 0
+            )
             if req_files:
                 target = req_files[0]
                 try:
                     with open(target, "r", encoding="utf-8") as f:
                         peek_data = json.load(f)
                 except Exception:
-                    time.sleep(0.5)
+                    time.sleep(0.2)
+                    continue
+
+                if peek_data.get("step_up_gui_pending"):
+                    # Aguardando decisão visual do usuário na GUI (Novo OTP ou UAC)
+                    time.sleep(0.3)
                     continue
 
                 is_rpc = peek_data.get("script_type") == "control_rpc"
@@ -2480,7 +2629,7 @@ def run_daemon_loop(hotp_auth: HOTPAuth):
                 has_ticket = PREAUTH_TICKET_FILE.exists()
 
                 if not (is_rpc or has_otp or has_token or has_ticket):
-                    time.sleep(1.0)
+                    time.sleep(0.3)
                     continue
 
                 req_id = target.stem
@@ -2586,7 +2735,29 @@ def run_daemon_loop(hotp_auth: HOTPAuth):
                     preauth_token = unprotect_transit_token(data["preauth_token_dpapi"], req_id, actual_code_hash)
 
                 caller_info = data.get("caller") or {}
+                real_os_user = get_os_process_username(caller_info.get("pid", 0))
+                if real_os_user and real_os_user.lower() not in ("system", "sistema"):
+                    caller_info["user"] = real_os_user
                 caller_user = caller_info.get("user")
+
+                # INSPETOR DE SCRIPTS EM 3 CAMADAS (AMSI + Classificador de Risco + IA Explicadora Sob Demanda)
+                risk_report = inspect_script_3_layers(code)
+                if risk_report.get("requires_step_up") and not data.get("confirm_risk"):
+                    # Pausa a execução silenciosa, anexa a explicação da Camada 3 e encaminha para a GUI na tela do usuário
+                    # para que ele leia o que o script faz e autorize com um NOVO código OTP ou clicando em Autorizar via UAC!
+                    data["step_up_gui_pending"] = True
+                    data["step_up_report"] = risk_report
+                    data["otp"] = None
+                    data["otp_dpapi"] = None
+                    data["preauth_token"] = None
+                    data["preauth_token_dpapi"] = None
+                    try:
+                        with open(target, "w", encoding="utf-8") as f:
+                            json.dump(data, f, indent=2, ensure_ascii=False)
+                        proc_file.unlink(missing_ok=True)
+                    except Exception:
+                        proc_file.unlink(missing_ok=True)
+                    continue
 
                 auth_approved = False
                 auth_msg = ""
@@ -3013,6 +3184,7 @@ def run_cli_client(args, hotp_auth: HOTPAuth):
             "code_hash": code_hash,
             "otp": None,
             "otp_dpapi": otp_dpapi,
+            "confirm_risk": bool(getattr(args, "confirm_risk", False) and args.otp),
             "preauth_token": None,
             "preauth_token_dpapi": preauth_dpapi,
             "timeout": args.timeout or 120,
@@ -3202,6 +3374,7 @@ def main():
     p_run.add_argument("--code", required=True, help="Comando ou código a executar")
     p_run.add_argument("--otp", default=None, help="Código OTP de 6 dígitos (modo legado imediato)")
     p_run.add_argument("--preauth-token", default=None, help="Token de pré-autorização opcional")
+    p_run.add_argument("--confirm-risk", action="store_true", help="Confirma execução de script sensível mediante novo OTP")
     p_run.add_argument("--timeout", type=int, default=120, help="Tempo limite em segundos")
 
     args, unknown = parser.parse_known_args()

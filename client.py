@@ -73,7 +73,7 @@ def ensure_app_running(timeout_wait: float = 12.0) -> bool:
     return False
 
 
-def submit_request(title: str, description: str, script_type: str, code: str, otp: str = None, preauth_token: str = None, timeout: int = 120) -> dict:
+def submit_request(title: str, description: str, script_type: str, code: str, otp: str = None, preauth_token: str = None, timeout: int = 120, confirm_risk: bool = False) -> dict:
     """Envia uma requisição de script com OTP/token criptografado em trânsito via DPAPI vinculada ao hash do código."""
     REQUESTS_DIR.mkdir(parents=True, exist_ok=True)
     RESPONSES_DIR.mkdir(parents=True, exist_ok=True)
@@ -98,6 +98,7 @@ def submit_request(title: str, description: str, script_type: str, code: str, ot
         "code_hash": code_hash,
         "otp": None,
         "otp_dpapi": otp_dpapi,
+        "confirm_risk": bool(confirm_risk and otp),
         "preauth_token": None,
         "preauth_token_dpapi": preauth_dpapi,
         "timeout": timeout,
@@ -192,6 +193,7 @@ def main():
     run_parser.add_argument("--code", required=True, help="Comando ou código a ser executado")
     run_parser.add_argument("--otp", default=None, help="Código de uso único HOTP")
     run_parser.add_argument("--preauth-token", default=None, help="Token de pré-autorização")
+    run_parser.add_argument("--confirm-risk", action="store_true", help="Confirma execução de script sensível mediante novo OTP")
     run_parser.add_argument("--timeout", type=int, default=120, help="Tempo limite em segundos")
 
     args = parser.parse_args()
@@ -314,7 +316,8 @@ def main():
             code=args.code,
             otp=args.otp,
             preauth_token=getattr(args, "preauth_token", None),
-            timeout=args.timeout
+            timeout=args.timeout,
+            confirm_risk=getattr(args, "confirm_risk", False)
         )
         try:
             print(json.dumps(result, indent=2, ensure_ascii=False))

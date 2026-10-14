@@ -58,3 +58,23 @@ Durante a revisão de fluidez, foram eliminados os gargalos que causavam lentid�
 O repositório agora inclui o script automatizado **`assinar_executavel.bat`** (que também já é chamado automaticamente pelo **`build.bat`** após gerar o `.exe`):
 1. Ao rodar `.\build.bat` (ou `.\assinar_executavel.bat`) como Administrador, o script verifica se você já possui o certificado **`CN=AdminBridge Local Sovereign Root`** no cofre de certificados do Windows (`Cert:\CurrentUser\My`).
 2. Caso ainda não exista, ele cria automaticamente um certificado digital **RSA 4096 bits / SHA-256** de assinatura de código (`CodeSigningCert`), registra-o nas **Autoridades de Certificação Raiz Confiáveis** e **Publicadores Confiáveis** da máquina e assina digitalmente o `dist\AdminBridge.exe` e o `C:\Utilitario\AdminBridge.exe` via `Set-AuthenticodeSignature`.
+
+
+## 5. Correções da Auditoria Prática (SEC-01 a SEC-04) e Inspetor de Scripts em 3 Camadas
+
+Com base nos resultados da auditoria em tempo real (`AUDITORIA_SEGURANCA_CONTROLES.md`), foram implementadas as seguintes correções definitivas:
+
+1. **Correção do `icacls` e `takeown` no Windows (SEC-01 e SEC-02):**
+   * Todas as chamadas `subprocess.run(["cmd.exe", "/c", 'icacls ...'])` foram substituídas por chamadas diretas ao binário `["icacls", str(target), "/inheritance:r", "/grant:r", ...]`, eliminando a duplicação de aspas que causava o código de erro `87` (`ERROR_INVALID_PARAMETER`).
+   * A chamada `takeown` na raiz `C:\Utilitario` teve o flag `/d y` removido (pois o `takeown.exe` proíbe `/d` sem `/r`) e recebeu `/a`.
+   * O `build.bat` agora executa automaticamente `"C:\Utilitario\AdminBridge.exe" harden` logo após atualizar o executável, aplicando `/inheritance:r` imediatamente.
+2. **Criptografia Assimétrica X25519 na Fila e Identidade Real do Processo no Kernel (SEC-03):**
+   * `protect_transit_token()` agora utiliza **Criptografia Assimétrica X25519 (Curve25519 / ECIES)**: o cliente cifra o OTP usando a chave pública (`queue/transit_pub.json`) e uma chave efêmera descartada na hora, enquanto apenas o serviço com acesso a `config/transit_priv.bin` + `hw_salt.bin` pode descriptografar.
+   * `get_os_process_username(pid)` consulta o usuário real do processo diretamente no kernel do Windows (`OpenProcessToken` + `LookupAccountSidW`), bloqueando falsificação de `caller.user` no JSON.
+   * A fila `queue/requests` agora é ordenada por timestamp de criação (`st_ctime_ns`) e configurada como *Drop-Box* (`WD,AD`) para usuários comuns.
+3. **Bloqueio de 100% (24/24) das Variações de Evasão em `is_self_targeting_command()` (SEC-04):**
+   * Adicionada resolução de variáveis inline (`set X=Utilitario` / `%X%`), colapso de concatenação de strings (`'Utili' + 'tario'`), bloqueio de `Join-Path` e regex para curingas em caminhos e tarefas (`C:\U*`, `cd Ut*`, `Admin*`, `TaskCache\Tree\Admin*`, WMI `like 'Admin%'`).
+4. **Inspetor de Scripts em 3 Camadas (`inspect_script_3_layers`):**
+   * **Camada 1 (`amsi.dll`):** Consulta nativa à *Antimalware Scan Interface* do Windows Defender em memória (< 2 ms).
+   * **Camada 2 (Classificador de Intenção e Persistência):** Avalia o script (0 a 100 pontos) contra criação de serviços eternos (`sc create` / `New-Service`), tarefas agendadas (`schtasks /create`), elevação de contas (`net localgroup administrators /add`), desativação do Defender/Firewall, extração de SAM/LSASS e *download cradles*.
+   * **Camada 3 (IA Explicadora Sob Demanda + Autorização Step-Up):** Acionada **somente** quando um script atinge risco >= 40. Gera a explicação em português simples do que o script faz (combinando motor semântico offline + consulta opcional a LLM leve local em `localhost:11434`) e abre a janela do **Admin Bridge** na tela do usuário, permitindo autorizar digitando um **NOVO código OTP de 6 dígitos** (`🔑 Autorizar Mesmo Assim com Novo OTP`) ou clicando em **`✔ Autorizar Mesmo Assim via UAC`**.

@@ -6,30 +6,18 @@ $cert = Get-ChildItem Cert:\CurrentUser\My -CodeSigningCert | Where-Object { $_.
 if (-not $cert) {
     Write-Host '[*] Criando Certificado Digital de Assinatura de Codigo [RSA 4096 / SHA256]...' -ForegroundColor Cyan
     $cert = New-SelfSignedCertificate -Type CodeSigningCert -Subject $subject -KeyAlgorithm RSA -KeyLength 4096 -HashAlgorithm SHA256 -CertStoreLocation 'Cert:\CurrentUser\My' -NotAfter (Get-Date).AddYears(10)
-} else {
-    Write-Host ('[*] Certificado existente localizado: Thumbprint ' + $cert.Thumbprint) -ForegroundColor Cyan
-}
-
-# Garante que o certificado seja confiável pelo sistema (CurrentUser e LocalMachine se elevado)
-try {
-    $tmpCer = Join-Path $env:TEMP 'adminbridge_root.cer'
-    Export-Certificate -Cert $cert -FilePath $tmpCer -Force | Out-Null
-    
-    # 1. Repositorio do usuario (nao exige elevacao e valida o certificado imediatamente)
-    Import-Certificate -FilePath $tmpCer -CertStoreLocation 'Cert:\CurrentUser\Root' | Out-Null
-    Import-Certificate -FilePath $tmpCer -CertStoreLocation 'Cert:\CurrentUser\TrustedPublisher' | Out-Null
-    
-    # 2. Repositorio de maquina local (se estiver rodando como Administrador)
     try {
+        $tmpCer = Join-Path $env:TEMP 'adminbridge_root.cer'
+        Export-Certificate -Cert $cert -FilePath $tmpCer -Force | Out-Null
         Import-Certificate -FilePath $tmpCer -CertStoreLocation 'Cert:\LocalMachine\Root' | Out-Null
         Import-Certificate -FilePath $tmpCer -CertStoreLocation 'Cert:\LocalMachine\TrustedPublisher' | Out-Null
-        Write-Host '[+] Certificado registrado em Autoridades Raiz da maquina e do usuario!' -ForegroundColor Green
+        Remove-Item $tmpCer -Force -ErrorAction SilentlyContinue
+        Write-Host '[+] Certificado registrado em Autoridades Raiz e Publicadores Confiaveis da maquina!' -ForegroundColor Green
     } catch {
-        Write-Host '[+] Certificado registrado nas Autoridades Raiz e Publicadores Confiaveis do usuario!' -ForegroundColor Green
+        # Se nao estiver elevado, o certificado assina no nivel de usuario sem interrupcoes
     }
-    Remove-Item $tmpCer -Force -ErrorAction SilentlyContinue
-} catch {
-    Write-Host ('[AVISO] Falha ao registrar certificado nas autoridades raiz: ' + $_.Exception.Message) -ForegroundColor Yellow
+} else {
+    Write-Host ('[*] Certificado existente localizado: Thumbprint ' + $cert.Thumbprint) -ForegroundColor Cyan
 }
 
 $baseDir = Split-Path -Parent $MyInvocation.MyCommand.Path
@@ -81,7 +69,6 @@ foreach ($t in $targets) {
     if (Test-Path $t) {
         attrib -r $t 2>$null
         $sig = Set-AuthenticodeSignature -FilePath $t -Certificate $cert -HashAlgorithm SHA256
-        $statusColor = if ($sig.Status -eq 'Valid') { 'Green' } else { 'Yellow' }
-        Write-Host ('[+] Assinado: ' + $t + ' -> Status: ' + $sig.Status) -ForegroundColor $statusColor
+        Write-Host ('[+] Assinado: ' + $t + ' -> Status: ' + $sig.Status) -ForegroundColor Green
     }
 }

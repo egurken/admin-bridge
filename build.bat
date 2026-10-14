@@ -57,6 +57,23 @@ if %ERRORLEVEL% EQU 0 (
     copy /y "%~dp0dist\AdminBridge.exe" "C:\Utilitario\AdminBridge.exe" >nul
     copy /y "%~dp0dist\AdminBridge.exe" "C:\Utilitario\AntigravityBridge.exe" >nul
     echo Executavel copiado para C:\Utilitario com sucesso!
+    copy /y "%~dp0instalar_ia_local.bat" "C:\Utilitario\instalar_ia_local.bat" >nul 2>&1
+
+    echo Aplicando blindagem de permissoes NTFS (harden) em C:\Utilitario...
+    "C:\Utilitario\AdminBridge.exe" harden
+
+    echo.
+    if "%1"=="--with-llm" (
+        echo [Instalacao da Mini-IA Local solicitada via argumento]
+        call "%~dp0instalar_ia_local.bat" --nopause
+    ) else if "%1"=="--install-llm" (
+        echo [Instalacao da Mini-IA Local solicitada via argumento]
+        call "%~dp0instalar_ia_local.bat" --nopause
+    ) else (
+        echo [Opcional] A Mini-IA Local pode ser instalada a qualquer momento pelo menu de configuracoes do programa ou via instalar_ia_local.bat.
+    )
+
+    echo.
     echo [IMPORTANTE] Se o utilitario ja estava provisionado, abra o painel e clique em 'Corrigir' com sua Senha Mestra para re-ancorar o novo hash do executavel.
 
     set "DESK_DIR="

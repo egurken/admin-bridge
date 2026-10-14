@@ -14,9 +14,9 @@ from hotp_crypto import (
     protect_transit_token,
     unprotect_transit_token,
     verify_scheduled_task_integrity,
-    KernelFileGuard,
 )
 from app import is_self_targeting_command
+from hotp_crypto import inspect_script_3_layers
 
 
 def test_all_security_rules():
@@ -44,14 +44,14 @@ def test_all_security_rules():
             print(f"  -> PASSOU: Bloqueado conforme esperado! - {e}")
 
         print("[*] 3. Testando Assinatura de Integridade - Detecção de Adulteração Manual...")
+        with open(cfg_path, "r", encoding="utf-8") as f:
+            tampered_data = json.load(f)
+        tampered_data["counter"] = 999
         if hasattr(ctypes, "windll"):
             try:
                 ctypes.windll.kernel32.SetFileAttributesW(str(cfg_path), 0x80)
             except Exception:
                 pass
-        with open(cfg_path, "r", encoding="utf-8") as f:
-            tampered_data = json.load(f)
-        tampered_data["counter"] = 999
         with open(cfg_path, "w", encoding="utf-8") as f:
             json.dump(tampered_data, f, indent=2)
 
@@ -224,14 +224,14 @@ def test_all_security_rules():
         print("  -> PASSOU: Pareamento inicial exige e valida OTP com sucesso!")
 
         print("[*] 12. Testando Reparo de Adulteração Protegido por Senha Mestra...")
+        with open(cfg_path, "r", encoding="utf-8") as f:
+            tampered_data2 = json.load(f)
+        tampered_data2["counter"] = 777
         if hasattr(ctypes, "windll"):
             try:
                 ctypes.windll.kernel32.SetFileAttributesW(str(cfg_path), 0x80)
             except Exception:
                 pass
-        with open(cfg_path, "r", encoding="utf-8") as f:
-            tampered_data2 = json.load(f)
-        tampered_data2["counter"] = 777
         with open(cfg_path, "w", encoding="utf-8") as f:
             json.dump(tampered_data2, f, indent=2)
 
@@ -245,24 +245,38 @@ def test_all_security_rules():
         assert ok_rep_good
         print("  -> PASSOU: Status Bloqueado por adulteração limpo e reparo protegido por senha mestra!")
 
-        print("[*] 13. Testando Bloqueio de Comandos Auto-Direcionados (Incluindo Evasões Avançadas)...")
-        assert is_self_targeting_command(r"dir C:\Utilitario")
-        assert is_self_targeting_command(r"cat c:/utilitario/config/hotp_config.json")
-        assert is_self_targeting_command(r"cd UTILIT~1")
-        assert is_self_targeting_command(r"schtasks /delete /tn AdminBridge /f")
-        assert is_self_targeting_command(r"powershell -ExecutionPolicy Bypass -File C:\Utilitario\AdminBridge.exe")
-        # Novas evasões bloqueadas:
-        assert is_self_targeting_command(r'dir C:\Util"i"tario')
-        assert is_self_targeting_command(r"dir C:\Util^itario")
-        assert is_self_targeting_command(r"Get-ChildItem C:\Uti*\config")
-        assert is_self_targeting_command(r"type config\*.json")
-        assert is_self_targeting_command(r"del queue\requests\*.json")
-        b64_evil = b64_mod.b64encode(r"Get-ChildItem C:\Utilitario".encode("utf-16le")).decode("ascii")
-        assert is_self_targeting_command(f"powershell.exe -enc {b64_evil}")
-        assert is_self_targeting_command(f"powershell.exe -e {b64_evil}")
+        print("[*] 13. Testando Bloqueio de Comandos Auto-Direcionados (16/16 Variações de Auditoria SEC-04)...")
+        evasion_vectors = [
+            r"dir C:\Utilitario",
+            r"cat c:/utilitario/config/hotp_config.json",
+            r"cd UTILIT~1",
+            r"schtasks /delete /tn AdminBridge /f",
+            r"schtasks /delete /tn Admin* /f",
+            r"taskkill /f /im Admin* /t",
+            r'powershell -Command "Get-Process Admin* | Stop-Process -Force"',
+            r"dir C:\U* /s",
+            r'cmd.exe /c "cd \ && cd Ut* && cd con* && dir"',
+            r'cmd.exe /c "set X=Utilitario" && cmd.exe /c "dir C:\%X%"',
+            r"""powershell -Command \"$p = 'C:\\' + 'Utili' + 'tario'; Get-ChildItem $p\"""",
+            r"icacls C:\U* /grant Everyone:F",
+            r'reg delete "HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Schedule\TaskCache\Tree\Admin*" /f',
+            r"""wmic process where \"name like 'Admin%'\" delete""",
+            r"powershell -enc RwBlAHQALQBQAHIAbwBjAGUAcwBzACAALQBOAGEAbQBlACAAQQBkAG0AaQBuACoA",
+            r"powershell -e RwBlAHQALQBDAGgAaQBsAGQASQB0AGUAbQAgACIASgBvAGkAbgAtAFAAYQB0AGgAIgA=",
+            r"""powershell -Command \"Get-Content (Join-Path 'C:\\' ('Uti'+'litario\\config\\hotp_config.json'))\"""",
+            r"type \\?\C:\Utilitario\config\hotp_config.json",
+            r"""powershell -Command \"Get-Content -LiteralPath '\\\\?\\C:\\Utilitario\\config\\hotp_config.json'\"""",
+            r'reg query "HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\AdminBridge.exe"',
+            r'dir C:\Util"i"tario',
+            r"dir C:\Util^itario",
+            r"type config\*.json",
+            r"del queue\requests\*.json",
+        ]
+        for vec in evasion_vectors:
+            assert is_self_targeting_command(vec), f"Falha ao bloquear vetor de evasao SEC-04: {vec}"
         assert not is_self_targeting_command("ipconfig /all")
         assert not is_self_targeting_command("netstat -ano")
-        print("  -> PASSOU: Comandos auto-direcionados, curingas, caminhos relativos e ofuscações bloqueados!")
+        print(f"  -> PASSOU: {len(evasion_vectors)}/{len(evasion_vectors)} (100%) variações de auto-ataque e evasão bloqueadas!")
 
         print("[*] 14. Testando Âncora Soberana Ed25519 e Detecção de Adulteração de Binário...")
         fake_exe = Path(tmpdir) / "AdminBridge.exe"
@@ -279,7 +293,10 @@ def test_all_security_rules():
 
         # Simula um Administrador alterando o executável AdminBridge.exe na pasta
         if hasattr(ctypes, "windll"):
-            ctypes.windll.kernel32.SetFileAttributesW(str(fake_exe), 0x80)
+            try:
+                ctypes.windll.kernel32.SetFileAttributesW(str(fake_exe), 0x80)
+            except Exception:
+                pass
         fake_exe.write_bytes(b"MZ_MODIFIED_MALICIOUS_BINARY_V2")
         ok_anc_tampered, msg_anc_tampered = verify_owner_anchor(anchor_file, auth.config_dir)
         assert not ok_anc_tampered, "Deveria detectar modificação do executável AdminBridge.exe!"
@@ -294,7 +311,10 @@ def test_all_security_rules():
 
         # Restaura o binário original e verifica que volta a ser aceito
         if hasattr(ctypes, "windll"):
-            ctypes.windll.kernel32.SetFileAttributesW(str(fake_exe), 0x80)
+            try:
+                ctypes.windll.kernel32.SetFileAttributesW(str(fake_exe), 0x80)
+            except Exception:
+                pass
         fake_exe.write_bytes(b"MZ_ORIGINAL_SIGNED_BINARY_V1")
         ok_anc_restored, _ = verify_owner_anchor(anchor_file, auth.config_dir)
         assert ok_anc_restored
@@ -423,24 +443,22 @@ def test_all_security_rules():
         assert ok_rep_salt
         print("  -> PASSOU: Qualquer toque ou alteração de permissão/USN em hw_salt.bin bloqueia o sistema até reparo com Senha Mestra!")
 
-        # Libera todas as travas de arquivo e restaura permissões do tmpdir para limpeza limpa
-        KernelFileGuard.release_all_locks()
-        if hasattr(ctypes, "windll"):
-            import subprocess, os
-            for root, dirs, files in os.walk(tmpdir):
-                for f in files:
-                    try:
-                        ctypes.windll.kernel32.SetFileAttributesW(str(Path(root) / f), 0x80)
-                    except Exception:
-                        pass
-                for d in dirs:
-                    try:
-                        subprocess.run(["cmd.exe", "/c", f'icacls "{Path(root) / d}" /grant "*S-1-5-32-545:(OI)(CI)(F)" /c /q'], capture_output=True, check=False, creationflags=0x08000000)
-                    except Exception:
-                        pass
+        print("[*] 21. Testando Inspetor de Scripts em 3 Camadas (AMSI + Classificador + Explicador IA)...")
+        # Script benigno -> Risco baixo, sem step-up
+        rep_safe = inspect_script_3_layers("ipconfig /flushdns")
+        assert not rep_safe["requires_step_up"]
+        assert rep_safe["risk_level"] == "low"
+
+        # Script tentando criar serviço eterno + desativar Windows Defender -> Alto/Crítico, exige step-up e gera explicação em português!
+        evil_script = "sc create MeuServicoEterno binPath= C:\\Temp\\backdoor.exe start= auto && powershell Set-MpPreference -DisableRealtimeMonitoring $true"
+        rep_risk = inspect_script_3_layers(evil_script)
+        assert rep_risk["requires_step_up"], "Script que cria serviço eterno e desativa Defender deveria exigir Step-Up!"
+        assert rep_risk["risk_score"] >= 75
+        assert "Serviço" in rep_risk["explanation"] and "Antivírus" in rep_risk["explanation"]
+        print("  -> PASSOU: Inspetor de 3 Camadas identifica risco, pausa execução e explica o que o script faz em português!")
 
     print("\n=======================================================")
-    print("TODOS OS 20 REQUISITOS DE SEGURANÇA FORAM TESTADOS E APROVADOS!")
+    print("TODOS OS 21 REQUISITOS DE SEGURANÇA FORAM TESTADOS E APROVADOS!")
     print("=======================================================")
 
 
