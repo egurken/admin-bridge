@@ -13,6 +13,8 @@ from hotp_crypto import (
     generate_mutual_confirmation_code,
     protect_transit_token,
     unprotect_transit_token,
+    verify_scheduled_task_integrity,
+    KernelFileGuard,
 )
 from app import is_self_targeting_command
 
@@ -276,6 +278,8 @@ def test_all_security_rules():
         assert not verify_owner_password("SenhaIncorreta@123", anchor_file, auth.config_dir)
 
         # Simula um Administrador alterando o executável AdminBridge.exe na pasta
+        if hasattr(ctypes, "windll"):
+            ctypes.windll.kernel32.SetFileAttributesW(str(fake_exe), 0x80)
         fake_exe.write_bytes(b"MZ_MODIFIED_MALICIOUS_BINARY_V2")
         ok_anc_tampered, msg_anc_tampered = verify_owner_anchor(anchor_file, auth.config_dir)
         assert not ok_anc_tampered, "Deveria detectar modificação do executável AdminBridge.exe!"
@@ -289,6 +293,8 @@ def test_all_security_rules():
             pass
 
         # Restaura o binário original e verifica que volta a ser aceito
+        if hasattr(ctypes, "windll"):
+            ctypes.windll.kernel32.SetFileAttributesW(str(fake_exe), 0x80)
         fake_exe.write_bytes(b"MZ_ORIGINAL_SIGNED_BINARY_V1")
         ok_anc_restored, _ = verify_owner_anchor(anchor_file, auth.config_dir)
         assert ok_anc_restored
@@ -348,8 +354,93 @@ def test_all_security_rules():
         assert unprotect_transit_token(enc_otp, req_id, evil_hash) is None
         print("  -> PASSOU: OTP protegido em trânsito e vinculado criptograficamente ao comando!")
 
+        print("[*] 18. Testando Bloqueio de Desinstalação sem Senha e Autorização com Senha Mestra...")
+        # Sem senha deve bloquear
+        ok_uninst_empty, _ = auth.authorize_and_prepare_uninstall("", caller_info=caller)
+        assert not ok_uninst_empty, "Desinstalacao sem senha deveria ser bloqueada!"
+
+        # Com senha errada deve bloquear
+        ok_uninst_bad, _ = auth.authorize_and_prepare_uninstall("SenhaErrada999", caller_info=caller)
+        assert not ok_uninst_bad, "Desinstalacao com senha incorreta deveria ser bloqueada!"
+
+        # Com a Senha Mestra legítima deve autorizar e destravar os arquivos
+        ok_uninst_good, msg_uninst_good = auth.authorize_and_prepare_uninstall("SenhaSoberana@2026", caller_info=caller)
+        assert ok_uninst_good, f"Desinstalacao com senha correta deveria passar: {msg_uninst_good}"
+        print("  -> PASSOU: Desinstalação exige Senha de Recuperação e destrava arquivos somente para o proprietário!")
+
+        print("[*] 19. Testando Auditoria Anti-Mascaramento da Tarefa Agendada (verify_scheduled_task_integrity)...")
+        legit_task_xml = Path(tmpdir) / "AdminBridge_LegitTask.xml"
+        legit_task_xml.write_text(
+            '<?xml version="1.0" encoding="UTF-16"?>\n'
+            '<Task><Actions><Exec>\n'
+            '  <Command>"C:\\Utilitario\\AdminBridge.exe"</Command>\n'
+            '  <Arguments>--daemon</Arguments>\n'
+            '</Exec></Actions></Task>',
+            encoding="utf-16"
+        )
+        ok_task_legit, msg_task_legit = verify_scheduled_task_integrity(Path("C:/Utilitario"), [legit_task_xml])
+        assert ok_task_legit, f"Tarefa legitima deveria passar: {msg_task_legit}"
+
+        # Simula um invasor alterando a tarefa AdminBridge para mascarar um script malicioso
+        masquerade_task_xml = Path(tmpdir) / "AdminBridge_EvilTask.xml"
+        masquerade_task_xml.write_text(
+            '<?xml version="1.0" encoding="UTF-16"?>\n'
+            '<Task><Actions><Exec>\n'
+            '  <Command>powershell.exe</Command>\n'
+            '  <Arguments>-ExecutionPolicy Bypass -File C:\\Temp\\backdoor.ps1</Arguments>\n'
+            '</Exec></Actions></Task>',
+            encoding="utf-16"
+        )
+        ok_task_evil, msg_task_evil = verify_scheduled_task_integrity(Path("C:/Utilitario"), [masquerade_task_xml])
+        assert not ok_task_evil, "Tarefa mascarando script externo deveria ser bloqueada!"
+        assert "Mascaramento" in msg_task_evil
+        print("  -> PASSOU: Tentativa de mascarar script malicioso na Tarefa Agendada detectada e bloqueada!")
+
+        print("[*] 20. Testando Cofre Dividido (hw_salt.bin) e Armadilha Forense contra Leitura Offline...")
+        salt_path = auth.config_dir / "hw_salt.bin"
+        assert salt_path.exists() and salt_path.stat().st_size == 32
+        orig_salt = salt_path.read_bytes()
+
+        # Simula um Administrador tentando tocar/substituir hw_salt.bin enquanto o software está desligado
+        salt_path.write_bytes(b"A" * 32)
+        try:
+            auth._load_config_raw()
+            assert False, "Deveria detectar violacao do hw_salt.bin!"
+        except SecurityError:
+            pass
+
+        # Restaura os bytes originais, mas como o mtime/USN de hw_salt.bin mudou pelo toque, o sistema ainda detecta!
+        time.sleep(0.01)
+        salt_path.write_bytes(orig_salt)
+        try:
+            auth._load_config_raw()
+            assert False, "Deveria detectar mudanca de USN/mtime em hw_salt.bin mesmo restaurando os bytes!"
+        except SecurityError:
+            pass
+
+        # Somente o proprietário com a Senha Mestra consegue re-ancorar a instalação após o alerta
+        ok_rep_salt, _ = auth.repair_corrupted_installation("SenhaSoberana@2026")
+        assert ok_rep_salt
+        print("  -> PASSOU: Qualquer toque ou alteração de permissão/USN em hw_salt.bin bloqueia o sistema até reparo com Senha Mestra!")
+
+        # Libera todas as travas de arquivo e restaura permissões do tmpdir para limpeza limpa
+        KernelFileGuard.release_all_locks()
+        if hasattr(ctypes, "windll"):
+            import subprocess, os
+            for root, dirs, files in os.walk(tmpdir):
+                for f in files:
+                    try:
+                        ctypes.windll.kernel32.SetFileAttributesW(str(Path(root) / f), 0x80)
+                    except Exception:
+                        pass
+                for d in dirs:
+                    try:
+                        subprocess.run(["cmd.exe", "/c", f'icacls "{Path(root) / d}" /grant "*S-1-5-32-545:(OI)(CI)(F)" /c /q'], capture_output=True, check=False, creationflags=0x08000000)
+                    except Exception:
+                        pass
+
     print("\n=======================================================")
-    print("TODOS OS 17 REQUISITOS DE SEGURANÇA FORAM TESTADOS E APROVADOS!")
+    print("TODOS OS 20 REQUISITOS DE SEGURANÇA FORAM TESTADOS E APROVADOS!")
     print("=======================================================")
 
 

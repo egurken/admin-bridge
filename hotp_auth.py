@@ -25,9 +25,15 @@ from hotp_crypto import (
     compute_integrity_mac,
     create_detached_signature_file,
     create_owner_anchor,
+    clear_external_system_vault,
     dpapi_protect,
+    KernelFileGuard,
+    protect_transit_token,
+    unprotect_transit_token,
+    verify_scheduled_task_integrity,
     dpapi_unprotect,
     ensure_hw_salt,
+    get_composite_entropy,
     generate_mutual_confirmation_code,
     generate_physical_challenge,
     get_file_usn,
@@ -85,6 +91,20 @@ class HOTPAuth:
     # -------------------------------------------------------------------------
     # OPERAÇÕES DE ARQUIVO E INTEGRIDADE (DPAPI MAC + OWNER ANCHOR)
     # -------------------------------------------------------------------------
+    def _protect_secret(self, plaintext: bytes) -> bytes:
+        """Criptografa segredo via DPAPI combinando entropia da aplicação + MachineGuid + hw_salt.bin."""
+        ensure_hw_salt(self.config_dir)
+        comp_ent = get_composite_entropy(DPAPI_ENTROPY, self.config_dir)
+        return dpapi_protect(plaintext, entropy=comp_ent)
+
+    def _unprotect_secret(self, ciphertext: bytes) -> bytearray:
+        """Descriptografa segredo via DPAPI exigindo o hw_salt.bin íntegro (com fallback para migração)."""
+        comp_ent = get_composite_entropy(DPAPI_ENTROPY, self.config_dir)
+        try:
+            return dpapi_unprotect(ciphertext, entropy=comp_ent)
+        except Exception:
+            return dpapi_unprotect(ciphertext, entropy=DPAPI_ENTROPY)
+
     def _load_config_raw(self) -> dict:
         """Carrega a configuração bruta e valida a assinatura de integridade HMAC/DPAPI, USN e Âncora Ed25519."""
         try:
@@ -412,7 +432,7 @@ class HOTPAuth:
                     if not salt_b64 or not hash_dpapi_b64:
                         return False
                     hash_raw = base64.b64decode(hash_dpapi_b64)
-                    expected_hash_ba = dpapi_unprotect(hash_raw)
+                    expected_hash_ba = self._unprotect_secret(hash_raw)
                     expected_hash = bytes(expected_hash_ba).decode("ascii")
                     wipe_buffer(expected_hash_ba)
                     if not verify_recovery_password(password, expected_hash, salt_b64):
@@ -467,7 +487,8 @@ class HOTPAuth:
             try:
                 self.config_dir.mkdir(parents=True, exist_ok=True)
                 ensure_hw_salt(self.config_dir)
-                apply_isolated_bridge_ntfs_acls(self.config_dir.parent)
+                base_root = self.config_dir.parent if self.config_dir.name == "config" else self.config_dir
+                apply_isolated_bridge_ntfs_acls(base_root)
             except Exception:
                 pass
 
@@ -483,7 +504,7 @@ class HOTPAuth:
             lock_memory_page(raw_secret_ba)
             try:
                 secret_b32 = base64.b32encode(bytes(raw_secret_ba)).decode("ascii")
-                secret_dpapi = dpapi_protect(bytes(raw_secret_ba))
+                secret_dpapi = self._protect_secret(bytes(raw_secret_ba))
                 secret_dpapi_b64 = base64.b64encode(secret_dpapi).decode("ascii")
             finally:
                 wipe_buffer(raw_secret_ba)
@@ -492,7 +513,7 @@ class HOTPAuth:
 
             # 3. Hash da senha de recuperação PBKDF2 (600.000 iterações) e proteção DPAPI
             pw_hash_b64, salt_b64 = hash_recovery_password(recovery_password)
-            pw_hash_dpapi = dpapi_protect(pw_hash_b64.encode("ascii"))
+            pw_hash_dpapi = self._protect_secret(pw_hash_b64.encode("ascii"))
             pw_hash_dpapi_b64 = base64.b64encode(pw_hash_dpapi).decode("ascii")
 
             # 4. Gera a URI para o autenticador do celular com counter=0
@@ -517,7 +538,8 @@ class HOTPAuth:
             self._save_config_raw(new_config)
 
             try:
-                apply_isolated_bridge_ntfs_acls(self.config_dir.parent)
+                base_root = self.config_dir.parent if self.config_dir.name == "config" else self.config_dir
+                apply_isolated_bridge_ntfs_acls(base_root)
             except Exception:
                 pass
 
@@ -543,14 +565,33 @@ class HOTPAuth:
         if not clean_otp.isdigit() or len(clean_otp) != DEFAULT_DIGITS:
             return False, f"O codigo OTP deve conter exatamente {DEFAULT_DIGITS} digitos numericos."
 
+        if self._is_daemon_alive_other_process():
+            rpc_res = self._delegate_rpc_to_daemon(
+                "sync",
+                {"otp": clean_otp, "allow_lookahead": allow_lookahead, "max_lookahead": max_lookahead, "max_lookback": max_lookback},
+                timeout=12.0
+            )
+            if rpc_res is not None and "result" in rpc_res:
+                return rpc_res["result"]
+
         with AtomicLock():
-            cfg = self._load_config_raw()
+            try:
+                cfg = self._load_config_raw()
+            except PermissionError:
+                rpc_res = self._delegate_rpc_to_daemon(
+                    "sync",
+                    {"otp": clean_otp, "allow_lookahead": allow_lookahead, "max_lookahead": max_lookahead, "max_lookback": max_lookback},
+                    timeout=12.0
+                )
+                if rpc_res is not None and "result" in rpc_res:
+                    return rpc_res["result"]
+                raise
             if not cfg:
                 return False, "Configuracao nao encontrada para validacao inicial."
 
             secret_dpapi_b64 = cfg.get("secret_dpapi")
             secret_enc = base64.b64decode(secret_dpapi_b64)
-            secret_ba = dpapi_unprotect(secret_enc)
+            secret_ba = self._unprotect_secret(secret_enc)
             try:
                 matched = None
                 for test_c in range(0, 3):
@@ -608,7 +649,7 @@ class HOTPAuth:
                     hash_dpapi_b64 = raw_data.get("recovery_hash_dpapi")
                     if salt_b64 and hash_dpapi_b64:
                         hash_raw = base64.b64decode(hash_dpapi_b64)
-                        expected_hash_ba = dpapi_unprotect(hash_raw)
+                        expected_hash_ba = self._unprotect_secret(hash_raw)
                         expected_hash = bytes(expected_hash_ba).decode("ascii")
                         wipe_buffer(expected_hash_ba)
                         if not verify_recovery_password(recovery_password, expected_hash, salt_b64):
@@ -659,6 +700,7 @@ class HOTPAuth:
                 LOGS_DIR.mkdir(parents=True, exist_ok=True)
                 (BASE_DIR / "scripts").mkdir(parents=True, exist_ok=True)
 
+                clear_external_system_vault()
                 self._log_audit("REPAIR_SUCCESS", 0, 0, True, "Reparo do sistema executado pelo proprietario com sucesso.")
                 return True, "Estrutura do sistema reparada com sucesso. Pronto para reinicializacao."
             except Exception as e:
@@ -690,7 +732,7 @@ class HOTPAuth:
 
             try:
                 enc_hash = base64.b64decode(cfg["recovery_hash_dpapi"])
-                expected_hash_ba = dpapi_unprotect(enc_hash)
+                expected_hash_ba = self._unprotect_secret(enc_hash)
                 expected_hash_b64 = expected_hash_ba.decode("ascii")
                 wipe_buffer(expected_hash_ba)
                 del expected_hash_ba
@@ -707,6 +749,8 @@ class HOTPAuth:
             cfg["secret_dpapi"] = ""
             cfg["counter"] = 0
             cfg["failures"] = []
+            KernelFileGuard.release_all_locks()
+            clear_external_system_vault()
             self._save_config_raw(cfg)
 
             if sys.platform == "win32":
@@ -733,6 +777,176 @@ class HOTPAuth:
     # -------------------------------------------------------------------------
     # VALIDAÇÃO CEGA COM ISOLAMENTO DE MEMÓRIA E FAIL-SAFE
     # -------------------------------------------------------------------------
+
+    # -------------------------------------------------------------------------
+    # DELEGAÇÃO RPC SEGURA PARA O DAEMON SYSTEM (EVITA CONFLITO DE LOCK / ACL)
+    # -------------------------------------------------------------------------
+    def _is_daemon_alive_other_process(self) -> bool:
+        """Verifica se o daemon SYSTEM está ativo em outro processo."""
+        if self.config_file != CONFIG_FILE:
+            return False
+        hb_file = QUEUE_DIR / "heartbeat.json"
+        if not hb_file.exists():
+            return False
+        try:
+            with open(hb_file, "r", encoding="utf-8") as f:
+                hb = json.load(f)
+            if hb.get("mode") == "daemon" and hb.get("pid") != os.getpid():
+                return (time.time() - float(hb.get("timestamp", 0))) <= 10.0
+        except Exception:
+            pass
+        return False
+
+    def _delegate_rpc_to_daemon(self, rpc_action: str, params: dict, timeout: float = 15.0) -> Optional[dict]:
+        """Envia operação administrativa/HOTP criptografada via DPAPI para o daemon SYSTEM processar em memória."""
+        req_dir = QUEUE_DIR / "requests"
+        resp_dir = QUEUE_DIR / "responses"
+        try:
+            req_dir.mkdir(parents=True, exist_ok=True)
+            resp_dir.mkdir(parents=True, exist_ok=True)
+            req_id = f"rpc-{secrets.token_hex(12)}"
+            action_hash = hashlib.sha256(rpc_action.encode("utf-8")).hexdigest()
+
+            safe_params = dict(params)
+            if "otp" in safe_params and safe_params["otp"]:
+                safe_params["otp_dpapi"] = protect_transit_token(str(safe_params.pop("otp")), req_id, action_hash)
+            if "password" in safe_params and safe_params["password"]:
+                safe_params["password_dpapi"] = protect_transit_token(str(safe_params.pop("password")), req_id, action_hash)
+
+            payload = {
+                "id": req_id,
+                "script_type": "control_rpc",
+                "rpc_action": rpc_action,
+                "code_hash": action_hash,
+                "params": safe_params,
+                "created_at": datetime.now().astimezone().isoformat(),
+                "caller": {
+                    "pid": os.getpid(),
+                    "exe": sys.executable,
+                    "user": os.getenv("USERNAME") or os.getenv("USER") or "unknown"
+                }
+            }
+            req_file = req_dir / f"{req_id}.json"
+            tmp_req = req_file.with_suffix(".tmp")
+            with open(tmp_req, "w", encoding="utf-8") as f:
+                json.dump(payload, f, indent=2, ensure_ascii=False)
+            tmp_req.replace(req_file)
+
+            res_file = resp_dir / f"{req_id}.json"
+            start_t = time.time()
+            while (time.time() - start_t) < timeout:
+                if res_file.exists():
+                    try:
+                        with open(res_file, "r", encoding="utf-8") as rf:
+                            resp = json.load(rf)
+                        res_file.unlink(missing_ok=True)
+                        return resp
+                    except Exception:
+                        time.sleep(0.1)
+                        continue
+                time.sleep(0.15)
+            req_file.unlink(missing_ok=True)
+        except Exception:
+            pass
+        return None
+
+    # -------------------------------------------------------------------------
+    # AUTORIZAÇÃO DE DESINSTALAÇÃO COM SENHA MESTRA E DESTRAVAMENTO DE KERNEL
+    # -------------------------------------------------------------------------
+    def authorize_and_prepare_uninstall(
+        self,
+        recovery_password: str,
+        caller_info: Optional[dict] = None
+    ) -> Tuple[bool, str]:
+        """Exige a Palavra-passe de Recuperação (Senha Mestra) para autorizar a desinstalação.
+
+        1. Se a senha estiver incorreta ou ausente, bloqueia a desinstalação e mantém os arquivos travados.
+        2. Se a senha estiver correta, instrui o daemon SYSTEM a soltar todos os locks de kernel (KernelFileGuard),
+           limpa o cofre externo (HKLM\\SECURITY e System Volume Information) e libera as ACLs para remoção limpa.
+        """
+        anchor_file = self.config_dir / "owner_anchor.json"
+        has_active_install = self.config_file.exists() or anchor_file.exists()
+
+        if not has_active_install:
+            KernelFileGuard.release_all_locks()
+            clear_external_system_vault()
+            return True, "Utilitario nao provisionado. Pronto para remocao."
+
+        if not recovery_password or len(str(recovery_password).strip()) < 8:
+            self._log_audit("UNINSTALL_DENIED", 0, 0, False, "Tentativa de desinstalacao sem fornecer a Senha de Recuperacao.", caller_info=caller_info)
+            return False, "A Palavra-passe de Recuperacao (minimo 8 caracteres) e obrigatoria para desinstalar."
+
+        pw = str(recovery_password).strip()
+
+        # Se o daemon SYSTEM estiver ativo em outro processo e segurando os locks de arquivo, delega a validação e o destravamento a ele
+        if self._is_daemon_alive_other_process():
+            rpc_res = self._delegate_rpc_to_daemon("uninstall_unlock", {"password": pw}, timeout=10.0)
+            if rpc_res is not None:
+                return bool(rpc_res.get("ok")), str(rpc_res.get("message", ""))
+
+        with AtomicLock():
+            verified = False
+            # 1. Verifica contra a âncora Ed25519 do proprietário
+            if anchor_file.exists():
+                if verify_owner_password(pw, anchor_file, self.config_dir):
+                    verified = True
+                else:
+                    self._log_audit("UNINSTALL_DENIED", 0, 0, False, "Tentativa de desinstalacao com Senha Mestra incorreta (ancora).", caller_info=caller_info)
+                    return False, "Palavra-passe de Recuperacao incorreta. Desinstalacao bloqueada."
+
+            # 2. Verifica contra o hash PBKDF2 protegido por DPAPI no hotp_config.json
+            if self.config_file.exists():
+                try:
+                    with open(self.config_file, "r", encoding="utf-8") as f:
+                        cfg = json.load(f)
+                    salt_b64 = cfg.get("recovery_salt")
+                    hash_dpapi_b64 = cfg.get("recovery_hash_dpapi")
+                    if salt_b64 and hash_dpapi_b64:
+                        enc_hash = base64.b64decode(hash_dpapi_b64)
+                        expected_hash_ba = self._unprotect_secret(enc_hash)
+                        expected_hash_b64 = expected_hash_ba.decode("ascii")
+                        wipe_buffer(expected_hash_ba)
+                        if not verify_recovery_password(pw, expected_hash_b64, salt_b64):
+                            self._log_audit("UNINSTALL_DENIED", cfg.get("counter", 0), cfg.get("counter", 0), False, "Tentativa de desinstalacao com Senha de Recuperacao incorreta.", caller_info=caller_info)
+                            return False, "Palavra-passe de Recuperacao incorreta. Desinstalacao bloqueada."
+                        verified = True
+                except PermissionError:
+                    # Se o arquivo estiver travado pelo daemon SYSTEM, tenta via RPC
+                    rpc_res = self._delegate_rpc_to_daemon("uninstall_unlock", {"password": pw}, timeout=10.0)
+                    if rpc_res is not None:
+                        return bool(rpc_res.get("ok")), str(rpc_res.get("message", ""))
+                    if not verified:
+                        return False, "Arquivo de configuracao bloqueado pelo servico SYSTEM. Tente novamente."
+                except Exception as e:
+                    if not verified:
+                        return False, f"Erro ao validar credenciais para desinstalacao: {e}"
+
+            if not verified:
+                return False, "Nao foi possivel validar a Palavra-passe de Recuperacao."
+
+            # SENHA VALIDADA: Destrava todos os handles de kernel, limpa cofre externo e restaura ACLs
+            KernelFileGuard.release_all_locks()
+            clear_external_system_vault()
+            base_root = self.config_dir.parent if self.config_dir.name == "config" else self.config_dir
+            restore_ntfs_acls_for_removal(base_root)
+
+            for f in (self.config_file, self.config_file.with_name(self.config_file.name + ".sig"), anchor_file, self.ticket_file):
+                if f.exists() and hasattr(ctypes, "windll"):
+                    try:
+                        ctypes.windll.kernel32.SetFileAttributesW(str(f), 0x80)
+                    except Exception:
+                        pass
+
+            self._log_audit(
+                "UNINSTALL_AUTHORIZED",
+                0,
+                0,
+                True,
+                "Desinstalacao autenticada pelo proprietario. Travas de kernel e cofres externos liberados.",
+                caller_info=caller_info
+            )
+            return True, "Desinstalacao autorizada com sucesso. Travas de seguranca liberadas."
+
     def verify_and_advance(self, provided_otp: Optional[str], caller_info: Optional[dict] = None) -> Tuple[bool, str, int]:
         """Validação cega atômica do token HOTP com higiene estrita de memória e Fail-Safe."""
         with AtomicLock():
@@ -785,7 +999,7 @@ class HOTPAuth:
             match_counter = None
             try:
                 secret_raw = base64.b64decode(cfg["secret_dpapi"])
-                secret_ba = dpapi_unprotect(secret_raw)
+                secret_ba = self._unprotect_secret(secret_raw)
 
                 for test_counter in range(current_counter, current_counter + look_ahead + 1):
                     expected = self._compute_hotp_internal(secret_ba, test_counter, digits)
@@ -919,7 +1133,17 @@ class HOTPAuth:
     ) -> Tuple[bool, str, dict]:
         """Consome o OTP imediatamente, avança o contador (+1) e gera ticket temporário válido por até 45 minutos."""
         caller = caller_info or {"pid": os.getpid(), "user": os.getenv("USERNAME") or os.getenv("USER") or "unknown"}
-        is_valid, auth_msg, used_counter = self.verify_and_advance(otp, caller)
+        if self._is_daemon_alive_other_process():
+            rpc_res = self._delegate_rpc_to_daemon("preauth", {"otp": otp, "lifetime": lifetime_seconds}, timeout=12.0)
+            if rpc_res is not None:
+                return bool(rpc_res.get("ok")), str(rpc_res.get("message", "")), rpc_res.get("data", {})
+        try:
+            is_valid, auth_msg, used_counter = self.verify_and_advance(otp, caller)
+        except PermissionError:
+            rpc_res = self._delegate_rpc_to_daemon("preauth", {"otp": otp, "lifetime": lifetime_seconds}, timeout=12.0)
+            if rpc_res is not None:
+                return bool(rpc_res.get("ok")), str(rpc_res.get("message", "")), rpc_res.get("data", {})
+            raise
         if not is_valid:
             return False, auth_msg, {}
 
@@ -928,7 +1152,7 @@ class HOTPAuth:
         try:
             cfg = self._load_config_raw()
             sec_raw = base64.b64decode(cfg["secret_dpapi"])
-            sec_ba = dpapi_unprotect(sec_raw)
+            sec_ba = self._unprotect_secret(sec_raw)
             mutual_code = generate_mutual_confirmation_code(bytes(sec_ba), otp)
         except Exception:
             pass
@@ -1028,6 +1252,10 @@ class HOTPAuth:
 
     def revoke_preauth_ticket(self) -> Tuple[bool, str]:
         """Revoga e encerra imediatamente o Modo Auth ativo [fecha a porta de 45 minutos]."""
+        if self._is_daemon_alive_other_process():
+            rpc_res = self._delegate_rpc_to_daemon("revoke_preauth", {}, timeout=8.0)
+            if rpc_res is not None:
+                return bool(rpc_res.get("ok")), str(rpc_res.get("message", ""))
         with AtomicLock():
             if not self.ticket_file.exists():
                 return True, "Nenhum Modo Auth ativo para revogar."
@@ -1080,7 +1308,7 @@ class HOTPAuth:
 
             secret_dpapi_b64 = cfg.get("secret_dpapi")
             secret_enc = base64.b64decode(secret_dpapi_b64)
-            secret_ba = dpapi_unprotect(secret_enc)
+            secret_ba = self._unprotect_secret(secret_enc)
 
             try:
                 # 1. Fase 1: Busca sequencial de trás para frente dentro do limite seguro

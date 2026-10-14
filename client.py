@@ -65,7 +65,7 @@ def ensure_app_running(timeout_wait: float = 12.0) -> bool:
 
     start = time.time()
     while time.time() - start < timeout_wait:
-        time.sleep(0.5)
+        time.sleep(0.15)
         if check_heartbeat(5.0):
             print("[*] Central iniciada e pronta!", file=sys.stderr)
             return True
@@ -138,10 +138,10 @@ def submit_request(title: str, description: str, script_type: str, code: str, ot
 
                 return response
             except (json.JSONDecodeError, PermissionError):
-                time.sleep(0.3)
+                time.sleep(0.08)
                 continue
 
-        time.sleep(0.5)
+        time.sleep(0.08)
 
     try:
         req_file.unlink(missing_ok=True)
@@ -175,8 +175,9 @@ def main():
 
     subparsers.add_parser("reset", help="Executa o reset e revogação de privilégios via terminal")
 
-    p_uninst = subparsers.add_parser("uninstall", help="Desinstala o utilitário completamente")
-    p_uninst.add_argument("--force", action="store_true", help="Força desinstalação sem confirmação")
+    p_uninst = subparsers.add_parser("uninstall", help="Desinstala o utilitário completamente (exige Senha de Recuperação)")
+    p_uninst.add_argument("--force", action="store_true", help="Pula pergunta de confirmação S/N")
+    p_uninst.add_argument("--password", help="Palavra-passe de recuperação do proprietário")
 
     subparsers.add_parser("harden", help="Aplica blindagem estrita de permissões NTFS nativas na pasta config e arquivos")
 
@@ -282,6 +283,8 @@ def main():
             cmd = [sys.executable, str(BASE_DIR / "app.py"), "uninstall"]
         if getattr(args, "force", False):
             cmd.append("--force")
+        if getattr(args, "password", None):
+            cmd.extend(["--password", args.password])
         res = subprocess.run(cmd)
         sys.exit(res.returncode)
 

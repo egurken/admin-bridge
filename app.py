@@ -60,7 +60,8 @@ from hotp_crypto import (
     wipe_buffer, apply_isolated_bridge_ntfs_acls, apply_system_only_ntfs_acls, restore_ntfs_acls_for_removal,
     verify_caller_origin, generate_physical_challenge, read_passive_metadata, check_forensic_integrity,
     configure_anti_dump_mitigations, harden_process_dacl, append_ledger_block, verify_ledger_integrity,
-    check_config_acl_isolation, protect_transit_token, unprotect_transit_token, verify_owner_anchor
+    check_config_acl_isolation, protect_transit_token, unprotect_transit_token, verify_owner_anchor,
+    KernelFileGuard, verify_scheduled_task_integrity
 )
 
 LOCAL_SERVER_NAME = f"AdminBridge_GUI_{os.getenv('USERNAME', 'default')}"
@@ -227,8 +228,8 @@ def ensure_environment_installed():
         except Exception as e:
             logging.warning(f"Aviso ao copiar executavel para C:\\Utilitario: {e}")
 
-    # Aplica permissoes restritas exclusivas para SYSTEM/Admin sempre que for Administrador
-    if is_admin():
+    # Aplica permissoes restritas exclusivas apenas na instalacao inicial (quando .acl_seal ainda nao existe), mantendo abertura instantanea
+    if is_admin() and not (CONFIG_DIR / ".acl_seal").exists():
         try:
             apply_isolated_bridge_ntfs_acls(BASE_DIR)
         except Exception:
@@ -302,7 +303,7 @@ def trigger_incident_lockdown(req_id: Optional[str] = None, reason: str = "Adult
 
     # 1. Desarma a tarefa agendada imediatamente
     try:
-        for tn in ("AdminBridge", "AntigravityAdminBridge"):
+        for tn in ("AdminBridge", "AdminBridgeWatchdog", "AntigravityAdminBridge"):
             subprocess.run(["schtasks", "/delete", "/tn", tn, "/f"], capture_output=True, check=False, creationflags=0x08000000)
     except Exception as e:
         logging.error(f"Erro ao desarmar tarefa agendada: {e}")
@@ -357,6 +358,18 @@ def register_scheduled_task() -> bool:
     res = subprocess.run(cmd, capture_output=True, text=True, check=False, creationflags=0x08000000)
     if res.returncode == 0:
         logging.info("Tarefa agendada registrada sob conta SYSTEM com sucesso.")
+        # Registra tarefa Watchdog secundária (a cada 1 minuto) para manter o daemon e os locks de kernel sempre ativos
+        cmd_wd = [
+            "schtasks", "/create",
+            "/tn", "AdminBridgeWatchdog",
+            "/tr", f'"{exe_path}" --daemon',
+            "/rl", "HIGHEST",
+            "/ru", "SYSTEM",
+            "/sc", "MINUTE",
+            "/mo", "1",
+            "/f"
+        ]
+        subprocess.run(cmd_wd, capture_output=True, text=True, check=False, creationflags=0x08000000)
         subprocess.run(["schtasks", "/run", "/tn", "AdminBridge"], capture_output=True, check=False, creationflags=0x08000000)
         return True
     else:
@@ -377,7 +390,7 @@ def register_scheduled_task() -> bool:
 def unregister_scheduled_task() -> bool:
     """Remove a tarefa agendada do Windows."""
     ok = True
-    for tn in ("AdminBridge", "AntigravityAdminBridge"):
+    for tn in ("AdminBridge", "AdminBridgeWatchdog", "AntigravityAdminBridge"):
         cmd = ["schtasks", "/delete", "/tn", tn, "/f"]
         res = subprocess.run(cmd, capture_output=True, check=False, creationflags=0x08000000)
         if res.returncode == 0:
@@ -468,8 +481,9 @@ class UninstallProgressDialog(QDialog):
         QApplication.processEvents()
 
     def run_uninstall(self) -> bool:
+        KernelFileGuard.release_all_locks()
         self.set_step(15, "1/5 Encerrando tarefas agendadas do Windows...")
-        for tn in ("AdminBridge", "AntigravityAdminBridge"):
+        for tn in ("AdminBridge", "AdminBridgeWatchdog", "AntigravityAdminBridge"):
             subprocess.run(["schtasks", "/end", "/tn", tn], capture_output=True, check=False, creationflags=0x08000000)
             subprocess.run(["schtasks", "/delete", "/tn", tn, "/f"], capture_output=True, check=False, creationflags=0x08000000)
         time.sleep(0.5)
@@ -1469,10 +1483,13 @@ class AdminBridgeWindow(QMainWindow):
         self.init_ui()
         self.init_tray()
 
-        # Timer de verificação da fila de comandos (1 segundo)
+        self._last_history_sig = None
+        self._last_metrics_sig = None
+
+        # Timer de verificação rápida da fila de comandos (350ms para resposta imediata na UI)
         self.timer_queue = QTimer(self)
         self.timer_queue.timeout.connect(self.check_requests)
-        self.timer_queue.start(1000)
+        self.timer_queue.start(350)
 
         # Timer de heartbeat
         self.timer_heartbeat = QTimer(self)
@@ -1961,26 +1978,40 @@ class AdminBridgeWindow(QMainWindow):
             self.lbl_status_val.setStyleSheet("color: #a6e3a1;")
             self.btn_repair.hide()
 
-        # 2. Popula a tabela de histórico
-        history_items = load_recent_history(50)
-        self.table_history.setRowCount(len(history_items))
-        for row, item in enumerate(history_items):
-            it_date = QTableWidgetItem(item["datetime"])
-            it_cmd = QTableWidgetItem(item["command"])
-            it_status = QTableWidgetItem(item["status"])
-            it_otp = QTableWidgetItem(item["otp"])
+        # 2. Popula a tabela de histórico apenas quando auth.log realmente mudou (preserva rolagem, seleção e zero uso de CPU)
+        curr_log_sig = None
+        if AUTH_LOG_FILE.exists():
+            try:
+                st_log = AUTH_LOG_FILE.stat()
+                curr_log_sig = (int(st_log.st_mtime_ns), int(st_log.st_size))
+            except Exception:
+                curr_log_sig = None
 
-            if item["status"] == "Aprovado":
-                it_status.setForeground(QColor("#a6e3a1"))
-            else:
-                it_status.setForeground(QColor("#f38ba8"))
+        if curr_log_sig != getattr(self, "_last_history_sig", object()):
+            self._last_history_sig = curr_log_sig
+            history_items = load_recent_history(50)
+            self.table_history.setUpdatesEnabled(False)
+            try:
+                self.table_history.setRowCount(len(history_items))
+                for row, item in enumerate(history_items):
+                    it_date = QTableWidgetItem(item["datetime"])
+                    it_cmd = QTableWidgetItem(item["command"])
+                    it_status = QTableWidgetItem(item["status"])
+                    it_otp = QTableWidgetItem(item["otp"])
 
-            it_otp.setForeground(QColor("#fab387"))
+                    if item["status"] == "Aprovado":
+                        it_status.setForeground(QColor("#a6e3a1"))
+                    else:
+                        it_status.setForeground(QColor("#f38ba8"))
 
-            self.table_history.setItem(row, 0, it_date)
-            self.table_history.setItem(row, 1, it_cmd)
-            self.table_history.setItem(row, 2, it_status)
-            self.table_history.setItem(row, 3, it_otp)
+                    it_otp.setForeground(QColor("#fab387"))
+
+                    self.table_history.setItem(row, 0, it_date)
+                    self.table_history.setItem(row, 1, it_cmd)
+                    self.table_history.setItem(row, 2, it_status)
+                    self.table_history.setItem(row, 3, it_otp)
+            finally:
+                self.table_history.setUpdatesEnabled(True)
 
     # -------------------------------------------------------------
     # PROCESSAMENTO ATÔMICO DA FILA DE REQUISIÇÕES
@@ -2002,7 +2033,7 @@ class AdminBridgeWindow(QMainWindow):
         try:
             with open(target_file, "r", encoding="utf-8") as f:
                 peek_req = json.load(f)
-            if peek_req.get("script_type") == "sync_probe":
+            if peek_req.get("script_type") in ("sync_probe", "control_rpc"):
                 return
             has_auth_payload = bool(
                 peek_req.get("otp")
@@ -2321,8 +2352,9 @@ class AdminBridgeWindow(QMainWindow):
             "Desinstalar Utilitário",
             "Tem certeza que deseja desinstalar completamente o Admin Bridge?\n\n"
             "Esta ação irá:\n"
-            "• Remover a tarefa agendada do Windows schtasks\n"
-            "• Restaurar as permissões de acesso NTFS\n"
+            "• Exigir sua Palavra-passe de Recuperação para liberar as travas de kernel\n"
+            "• Remover as tarefas agendadas do Windows (schtasks)\n"
+            "• Limpar os cofres externos e restaurar as permissões NTFS\n"
             "• Apagar todos os arquivos e pastas de C:\\Utilitario\n"
             "• Remover os atalhos da Área de Trabalho\n\n"
             "Deseja prosseguir?",
@@ -2332,9 +2364,32 @@ class AdminBridgeWindow(QMainWindow):
         if res != QMessageBox.StandardButton.Yes:
             return
 
+        pwd = ""
+        if self.hotp_auth.is_provisioned():
+            pwd, ok_pw = QInputDialog.getText(
+                self,
+                "Autenticação Obrigatória • Desinstalação",
+                "Digite sua Palavra-passe de Recuperação para destravar os arquivos e desinstalar:",
+                QLineEdit.EchoMode.Password
+            )
+            if not ok_pw or not pwd.strip():
+                return
+            pwd = pwd.strip()
+
+        ok_auth, auth_msg = self.hotp_auth.authorize_and_prepare_uninstall(
+            pwd,
+            caller_info={"pid": os.getpid(), "exe": sys.executable, "user": os.getenv("USERNAME", "unknown")}
+        )
+        if not ok_auth:
+            QMessageBox.critical(self, "Desinstalação Bloqueada", auth_msg)
+            return
+
         if not is_admin():
             try:
-                request_elevation_with_args(["uninstall", "--force"])
+                elev_args = ["uninstall", "--force"]
+                if pwd:
+                    elev_args.extend(["--password", pwd])
+                request_elevation_with_args(elev_args)
                 return
             except Exception as e:
                 QMessageBox.critical(self, "Permissão Necessária", f"Privilégios de Administrador são necessários: {e}")
@@ -2385,6 +2440,8 @@ def run_daemon_loop(hotp_auth: HOTPAuth):
     logging.info("[DAEMON] Admin Bridge daemon iniciado sob conta de servico.")
     harden_process_dacl()
     apply_isolated_bridge_ntfs_acls()
+    KernelFileGuard.lock_executable_file(BASE_DIR / "AdminBridge.exe")
+    KernelFileGuard.acquire_exclusive_config_locks(CONFIG_DIR)
 
     ok_forensic, forensic_msg = check_forensic_integrity(CONFIG_FILE)
     if not ok_forensic:
@@ -2398,11 +2455,14 @@ def run_daemon_loop(hotp_auth: HOTPAuth):
     RESPONSES_DIR.mkdir(parents=True, exist_ok=True)
     SCRIPTS_DIR.mkdir(parents=True, exist_ok=True)
 
+    last_hb_write = 0.0
     while True:
         try:
-            # Atualiza heartbeat
-            with open(HEARTBEAT_FILE, "w", encoding="utf-8") as f:
-                json.dump({"timestamp": time.time(), "status": "online", "mode": "daemon", "pid": os.getpid()}, f)
+            now_ts = time.time()
+            if (now_ts - last_hb_write) >= 2.5:
+                with open(HEARTBEAT_FILE, "w", encoding="utf-8") as f:
+                    json.dump({"timestamp": now_ts, "status": "online", "mode": "daemon", "pid": os.getpid()}, f)
+                last_hb_write = now_ts
 
             req_files = list(REQUESTS_DIR.glob("*.json"))
             if req_files:
@@ -2414,11 +2474,12 @@ def run_daemon_loop(hotp_auth: HOTPAuth):
                     time.sleep(0.5)
                     continue
 
+                is_rpc = peek_data.get("script_type") == "control_rpc"
                 has_otp = bool(peek_data.get("otp") or peek_data.get("otp_dpapi"))
                 has_token = bool(peek_data.get("preauth_token") or peek_data.get("preauth_token_dpapi"))
                 has_ticket = PREAUTH_TICKET_FILE.exists()
 
-                if not (has_otp or has_token or has_ticket):
+                if not (is_rpc or has_otp or has_token or has_ticket):
                     time.sleep(1.0)
                     continue
 
@@ -2431,6 +2492,51 @@ def run_daemon_loop(hotp_auth: HOTPAuth):
                     continue
 
                 data = peek_data
+
+                # Tratamento de operações administrativas internas (control_rpc) em memória pelo daemon SYSTEM
+                if is_rpc:
+                    rpc_action = str(data.get("rpc_action", ""))
+                    expected_hash = data.get("code_hash", "")
+                    actual_hash = hashlib.sha256(rpc_action.encode("utf-8")).hexdigest()
+                    params = data.get("params") or {}
+                    caller_rpc = data.get("caller") or {}
+                    rpc_resp = {"id": req_id, "ok": False, "message": "Operacao RPC invalida."}
+
+                    if hmac.compare_digest(actual_hash, expected_hash):
+                        otp_val = unprotect_transit_token(params["otp_dpapi"], req_id, actual_hash) if params.get("otp_dpapi") else None
+                        pw_val = unprotect_transit_token(params["password_dpapi"], req_id, actual_hash) if params.get("password_dpapi") else None
+
+                        if rpc_action == "preauth":
+                            ok_p, msg_p, res_p = hotp_auth.create_preauth_ticket(otp_val or "", caller_rpc, int(params.get("lifetime", 2700)))
+                            rpc_resp = {"id": req_id, "ok": ok_p, "message": msg_p, "data": res_p}
+                        elif rpc_action == "sync":
+                            res_s = hotp_auth.diagnose_otp_sync(
+                                otp_val or "",
+                                allow_lookahead=bool(params.get("allow_lookahead", False)),
+                                max_lookahead=int(params.get("max_lookahead", 10)),
+                                max_lookback=params.get("max_lookback", 50)
+                            )
+                            rpc_resp = {"id": req_id, "ok": bool(res_s.get("success")), "result": res_s}
+                        elif rpc_action == "revoke_preauth":
+                            ok_r, msg_r = hotp_auth.revoke_preauth_ticket()
+                            rpc_resp = {"id": req_id, "ok": ok_r, "message": msg_r}
+                        elif rpc_action == "uninstall_unlock":
+                            ok_u, msg_u = hotp_auth.authorize_and_prepare_uninstall(pw_val or "", caller_rpc)
+                            rpc_resp = {"id": req_id, "ok": ok_u, "message": msg_u}
+                            with open(RESPONSES_DIR / f"{req_id}.json", "w", encoding="utf-8") as rf:
+                                json.dump(rpc_resp, rf, indent=2, ensure_ascii=False)
+                            proc_file.unlink(missing_ok=True)
+                            if ok_u:
+                                # Proprietário autenticado para desinstalar: libera locks, remove tarefas e encerra o daemon
+                                KernelFileGuard.release_all_locks()
+                                unregister_scheduled_task()
+                                return
+                            continue
+
+                    with open(RESPONSES_DIR / f"{req_id}.json", "w", encoding="utf-8") as rf:
+                        json.dump(rpc_resp, rf, indent=2, ensure_ascii=False)
+                    proc_file.unlink(missing_ok=True)
+                    continue
 
                 # 0. Verifica integridade forense e âncora do proprietário antes de processar
                 ok_for, for_msg = check_forensic_integrity(CONFIG_FILE)
@@ -2536,6 +2642,17 @@ def run_daemon_loop(hotp_auth: HOTPAuth):
                     out_txt += ("\n[STDERR]:\n" if out_txt else "") + proc.stderr
                 ec = proc.returncode
 
+                # AUDITORIA PÓS-COMANDO (ANTI-MASCARAMENTO):
+                # Verifica imediatamente após o comando terminar se houve tentativa de adulterar a Tarefa Agendada
+                # AdminBridge ou os arquivos de C:\Utilitario durante a janela do prompt elevado!
+                ok_post_for, post_for_msg = check_forensic_integrity(CONFIG_FILE)
+                ok_post_task, post_task_msg = verify_scheduled_task_integrity(BASE_DIR)
+                if not ok_post_for or not ok_post_task:
+                    violation_reason = post_for_msg if not ok_post_for else post_task_msg
+                    trigger_incident_lockdown(req_id, f"Violacao detectada apos execucao de comando: {violation_reason}")
+                    proc_file.unlink(missing_ok=True)
+                    return
+
                 res = {
                     "id": req_id,
                     "status": "approved",
@@ -2560,7 +2677,7 @@ def run_daemon_loop(hotp_auth: HOTPAuth):
         except Exception as e:
             logging.error(f"[DAEMON ERROR]: {e}")
 
-        time.sleep(1.0)
+        time.sleep(0.15)
 
 
 def safe_input(prompt: str = "") -> str:
@@ -2734,7 +2851,23 @@ def run_cli_client(args, hotp_auth: HOTPAuth):
                 print("Operação cancelada.")
                 sys.exit(0)
 
-        print("[*] Removendo tarefas agendadas, filas e restaurando permissões...")
+        pw = getattr(args, "password", None)
+        if hotp_auth.is_provisioned() and not pw:
+            try:
+                import getpass
+                pw = getpass.getpass("Digite sua Palavra-passe de Recuperação para autorizar a desinstalação: ").strip()
+            except Exception:
+                pw = safe_input("Digite sua Palavra-passe de Recuperação para autorizar a desinstalação: ").strip()
+
+        ok_auth, auth_msg = hotp_auth.authorize_and_prepare_uninstall(
+            pw or "",
+            caller_info={"pid": os.getpid(), "exe": sys.executable, "user": os.getenv("USERNAME", "unknown")}
+        )
+        if not ok_auth:
+            print(f"[ERRO CRÍTICO]: {auth_msg}", file=sys.stderr)
+            sys.exit(1)
+
+        print("[*] Senha validada! Destravando arquivos, removendo tarefas agendadas e limpando C:\\Utilitario...")
         ok = perform_full_uninstall()
         if ok:
             print("[SUCESSO]: Admin Bridge desinstalado com sucesso.")
@@ -2913,7 +3046,7 @@ def run_cli_client(args, hotp_auth: HOTPAuth):
                     sys.exit(0 if response_data.get("status") == "approved" and ec == 0 else 1)
                 except Exception:
                     pass
-            time.sleep(0.5)
+            time.sleep(0.08)
 
         print("[ERRO]: Tempo limite esgotado ao aguardar execução.", file=sys.stderr)
         sys.exit(1)
@@ -3052,8 +3185,9 @@ def main():
     subparsers.add_parser("harden", help="Aplica blindagem estrita de permissões NTFS na pasta config e arquivos")
 
     # Comando uninstall
-    p_uninst = subparsers.add_parser("uninstall", help="Desinstala o utilitário completamente")
-    p_uninst.add_argument("--force", action="store_true", help="Força desinstalação sem confirmação")
+    p_uninst = subparsers.add_parser("uninstall", help="Desinstala o utilitário completamente (exige Senha de Recuperação)")
+    p_uninst.add_argument("--force", action="store_true", help="Pula pergunta de confirmação S/N")
+    p_uninst.add_argument("--password", help="Palavra-passe de recuperação do proprietário")
 
     # Comando preauth (consome OTP imediatamente e gera ticket de pré-autorização)
     p_preauth = subparsers.add_parser("preauth", help="Consome o OTP imediatamente no início da interação e gera ticket válido por até 45 minutos")

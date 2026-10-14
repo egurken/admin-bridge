@@ -352,6 +352,20 @@ def _canonical_payload(cfg: dict) -> bytes:
 
 _static_mesh_cache = {}
 _usn_cache = {}
+_integrity_mac_cache = {}
+_owner_anchor_cache = {}
+_forensic_cache = {}
+
+
+def _file_stat_sig(p: Optional[Path]) -> Tuple[int, int]:
+    """Retorna (mtime_ns, size) rápido de um arquivo para invalidação instantânea de cache."""
+    if p is None:
+        return (0, 0)
+    try:
+        st = p.stat()
+        return (int(st.st_mtime_ns), int(st.st_size))
+    except Exception:
+        return (-1, -1)
 
 
 def get_file_usn(file_path: Path) -> str:
@@ -390,22 +404,23 @@ def get_file_usn(file_path: Path) -> str:
     return usn_val
 
 
+_mesh_root_cache = {}
+
+
 def _resolve_mesh_root(base_dir: Path = BASE_DIR) -> Path:
     """Normaliza o diretório raiz do aplicativo para cálculo consistente do hash da malha estática."""
     b = Path(base_dir)
+    if b.name == "config":
+        return b.parent
     if (b / "AdminBridge.exe").exists():
         return b
-    if b.name == "config" and (b.parent / "AdminBridge.exe").exists():
-        return b.parent
     if (b.parent / "AdminBridge.exe").exists():
         return b.parent
-    if (BASE_DIR / "AdminBridge.exe").exists():
-        return BASE_DIR
-    return b.parent if b.name == "config" else b
+    return b
 
 
 def get_static_mesh_hash(base_dir: Path = BASE_DIR) -> str:
-    """Calcula a âncora estática unindo o executável e a tarefa agendada com cache invalidado por mtime/size."""
+    """Calcula a impressão digital (SHA-256) estática do executável AdminBridge.exe e da entropia da máquina."""
     root_dir = _resolve_mesh_root(base_dir)
     exe_file = root_dir / "AdminBridge.exe"
     exe_mtime = 0
@@ -418,15 +433,7 @@ def get_static_mesh_hash(base_dir: Path = BASE_DIR) -> str:
         except Exception:
             pass
 
-    task_xml = Path("C:/Windows/System32/Tasks/AdminBridge")
-    task_mtime = 0
-    try:
-        if task_xml.exists():
-            task_mtime = int(task_xml.stat().st_mtime_ns)
-    except Exception:
-        pass
-
-    cache_key = (str(root_dir), exe_mtime, exe_size, task_mtime)
+    cache_key = (str(root_dir), exe_mtime, exe_size)
     if cache_key in _static_mesh_cache:
         return _static_mesh_cache[cache_key]
 
@@ -441,25 +448,78 @@ def get_static_mesh_hash(base_dir: Path = BASE_DIR) -> str:
     else:
         components.append("exe_not_installed")
 
-    # 2. XML da Tarefa Agendada no Windows
-    try:
-        if task_xml.exists():
-            with open(task_xml, "rb") as tf:
-                components.append(hashlib.sha256(tf.read()).hexdigest())
-        else:
-            components.append("task_not_registered")
-    except PermissionError:
-        components.append("task_protected")
-    except Exception:
-        components.append("task_read_error")
-
-    # 3. Entropia de máquina
+    # 2. Entropia de máquina
     components.append(hashlib.sha256(DPAPI_ENTROPY).hexdigest())
 
     combined = "|".join(components).encode("utf-8")
     result = hashlib.sha256(combined).hexdigest()
     _static_mesh_cache[cache_key] = result
     return result
+
+
+def verify_scheduled_task_integrity(base_dir: Path = BASE_DIR, custom_task_files: Optional[list] = None) -> Tuple[bool, str]:
+    r"""Verifica se as Tarefas Agendadas (AdminBridge / AdminBridgeWatchdog) apontam EXCLUSIVAMENTE
+    para o executável oficial em C:\Utilitario\AdminBridge.exe --daemon, impedindo que um invasor
+    mascare scripts maliciosos (.bat, .ps1, .vbs, cmd, powershell) dentro da tarefa do sistema.
+    """
+    task_files = custom_task_files if custom_task_files is not None else [
+        Path("C:/Windows/System32/Tasks/AdminBridge"),
+        Path("C:/Windows/System32/Tasks/AdminBridgeWatchdog"),
+    ]
+    expected_exe = str((base_dir / "AdminBridge.exe")).lower().replace("/", "\\")
+    forbidden_masquerade_tokens = [
+        ".bat", ".cmd", ".ps1", ".vbs", ".js", ".hta", ".scr",
+        "powershell", "pwsh", "wscript", "cscript", "mshta",
+        "rundll32", "regsvr32", "certutil", "bitsadmin", "curl", "wget"
+    ]
+
+    for tf_path in task_files:
+        if not tf_path.exists():
+            continue
+        try:
+            raw_bytes = tf_path.read_bytes()
+            # O Agendador de Tarefas do Windows salva XML em UTF-16 (com BOM) ou UTF-8
+            xml_text = ""
+            for enc in ("utf-16", "utf-16le", "utf-8", "latin-1"):
+                try:
+                    decoded = raw_bytes.decode(enc)
+                    if "<Task" in decoded or "<Command>" in decoded or "AdminBridge" in decoded:
+                        xml_text = decoded.lower()
+                        break
+                except Exception:
+                    continue
+            if not xml_text:
+                continue
+
+            # Extrai todos os blocos <Command>...</Command> e <Arguments>...</Arguments>
+            cmds = re.findall(r"<command>(.*?)</command>", xml_text, flags=re.DOTALL)
+            args = re.findall(r"<arguments>(.*?)</arguments>", xml_text, flags=re.DOTALL)
+
+            if not cmds:
+                return False, f"Tarefa agendada {tf_path.name} corrompida ou sem tag <Command>."
+
+            for c in cmds:
+                c_clean = c.strip().strip('"').strip("'").replace("/", "\\")
+                if c_clean != expected_exe and not c_clean.endswith("\\utilitario\\adminbridge.exe"):
+                    return False, f"Alerta de Mascaramento: Tarefa {tf_path.name} aponta para executavel estranho ({c_clean})."
+                for bad_tok in forbidden_masquerade_tokens:
+                    if bad_tok in c_clean:
+                        return False, f"Alerta de Mascaramento: Comando proibido ({bad_tok}) detectado na tarefa {tf_path.name}."
+
+            for a in args:
+                a_clean = a.strip()
+                if a_clean and a_clean != "--daemon":
+                    return False, f"Alerta de Mascaramento: Argumentos adulterados ({a_clean}) na tarefa {tf_path.name}."
+                for bad_tok in forbidden_masquerade_tokens:
+                    if bad_tok in a_clean:
+                        return False, f"Alerta de Mascaramento: Script externo ({bad_tok}) injetado nos argumentos da tarefa {tf_path.name}."
+        except PermissionError:
+            # Se um processo de usuário comum não puder ler System32\Tasks, ignora (o daemon SYSTEM fará a leitura)
+            continue
+        except Exception as e:
+            return False, f"Erro ao auditar tarefa agendada {tf_path.name}: {e}"
+
+    return True, "Integridade da tarefa agendada confirmada." 
 
 
 def compute_integrity_mac(cfg: dict) -> str:
@@ -474,7 +534,7 @@ def compute_integrity_mac(cfg: dict) -> str:
 
 
 def check_integrity_mac(cfg: dict, config_path: Optional[Path] = None) -> Tuple[bool, str]:
-    """Valida a assinatura de integridade, o arquivo .sig acompanhante, o USN e a malha estática.
+    """Valida a assinatura de integridade, o arquivo .sig acompanhante, o USN e a malha estática (com cache reativo por mtime/size).
 
     Retorna [True, 'ok'] se íntegro.
     Retorna [False, motivo] se o arquivo, assinatura, USN ou executável foi adulterado.
@@ -482,6 +542,25 @@ def check_integrity_mac(cfg: dict, config_path: Optional[Path] = None) -> Tuple[
     mac_b64 = cfg.get("integrity_mac")
     if not mac_b64:
         return False, "missing_mac"
+
+    cache_key = None
+    if config_path:
+        cp_obj = Path(config_path)
+        sig_obj = cp_obj.with_name(cp_obj.name + ".sig")
+        salt_obj = cp_obj.parent / "hw_salt.bin"
+        exe_obj = _resolve_mesh_root(cp_obj.parent) / "AdminBridge.exe"
+        payload_hash = hashlib.sha256(_canonical_payload(cfg)).hexdigest()
+        cache_key = (
+            str(cp_obj),
+            payload_hash,
+            mac_b64,
+            _file_stat_sig(cp_obj),
+            _file_stat_sig(sig_obj),
+            _file_stat_sig(salt_obj),
+            _file_stat_sig(exe_obj),
+        )
+        if cache_key in _integrity_mac_cache:
+            return _integrity_mac_cache[cache_key]
     try:
         raw_mac = base64.b64decode(mac_b64)
         expected_digest_ba = dpapi_unprotect(raw_mac, entropy=DPAPI_MAC_ENTROPY)
@@ -522,11 +601,28 @@ def check_integrity_mac(cfg: dict, config_path: Optional[Path] = None) -> Tuple[
                     curr_mesh = get_static_mesh_hash(cp.parent)
                     if not hmac.compare_digest(recorded_mesh, curr_mesh):
                         return False, "static_mesh_tampered"
+                salt_file = cp.parent / "hw_salt.bin"
+                rec_salt_hash = sig_data.get("hw_salt_sha256")
+                if rec_salt_hash:
+                    if not salt_file.exists():
+                        return False, "hw_salt_missing"
+                    curr_salt_hash = hashlib.sha256(salt_file.read_bytes()).hexdigest()
+                    if not hmac.compare_digest(rec_salt_hash, curr_salt_hash):
+                        return False, "hw_salt_tampered"
+                rec_salt_usn = sig_data.get("hw_salt_usn")
+                if rec_salt_usn and rec_salt_usn != "0x0" and salt_file.exists():
+                    curr_salt_usn = get_file_usn(salt_file)
+                    if curr_salt_usn != "0x0" and curr_salt_usn != rec_salt_usn:
+                        return False, "hw_salt_usn_tampered"
             except PermissionError:
                 pass
             except Exception:
                 return False, "sig_read_error"
 
+    if cache_key is not None:
+        if len(_integrity_mac_cache) > 64:
+            _integrity_mac_cache.clear()
+        _integrity_mac_cache[cache_key] = (True, "ok")
     return True, "ok"
 
 
@@ -636,10 +732,15 @@ def create_detached_signature_file(config_file: Path, cfg: dict) -> Path:
             file_usn = "0x0"
 
         static_mesh = get_static_mesh_hash(config_file.parent)
+        salt_file = config_file.parent / "hw_salt.bin"
+        salt_usn = get_file_usn(salt_file) if salt_file.exists() else "0x0"
+        salt_hash = hashlib.sha256(salt_file.read_bytes()).hexdigest() if salt_file.exists() else ""
         sig_payload = {
             "file": config_file.name,
             "sha256": file_hash,
             "usn": file_usn,
+            "hw_salt_usn": salt_usn,
+            "hw_salt_sha256": salt_hash,
             "static_mesh_hash": static_mesh,
             "integrity_mac": cfg.get("integrity_mac", ""),
             "signed_at": time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime()),
@@ -671,6 +772,230 @@ def _resolve_anchor_file(base_dir: Path = BASE_DIR, anchor_path: Optional[Path] 
     if b.name == "config" or (b / "hotp_config.json").exists() or any(b.glob("*config*.json")):
         return b / "owner_anchor.json"
     return b / "config" / "owner_anchor.json"
+
+
+
+# -----------------------------------------------------------------------------
+# CAMADA ANTI-CHEAT: BLOQUEIO DE KERNEL (CreateFileW ShareMode=0), DACL DE PROCESSO E COFRE EXTERNO SYSTEM
+# -----------------------------------------------------------------------------
+EXTERNAL_VAULT_DIRS = [
+    Path("C:/System Volume Information/AdminBridgeVault"),
+    Path("C:/Windows/System32/config/systemprofile/AppData/Local/AdminBridgeVault"),
+]
+
+
+class KernelFileGuard:
+    """Mantém handles nativos abertos no kernel do Windows (ntoskrnl/Ntfs.sys) para impedir:
+    1. Sobrescrita, renomeação ou exclusão de AdminBridge.exe (dwShareMode = FILE_SHARE_READ).
+    2. Leitura, cópia ou modificação de hotp_config.json e owner_anchor.json (dwShareMode = 0 - Exclusivo Total).
+    Integra-se ao AtomicLock para liberar o handle de config por 2ms apenas quando o próprio daemon SYSTEM atualiza o contador.
+    """
+    _exe_handles = {}
+    _cfg_handles = {}
+    _guarded_cfg_paths = set()
+    _active = False
+
+    @classmethod
+    def lock_executable_file(cls, exe_path: Path = BASE_DIR / "AdminBridge.exe") -> bool:
+        """Trava o executável no kernel permitindo apenas leitura/execução (bloqueia escrita/delete até para Admin)."""
+        if sys.platform != "win32" or kernel32 is None:
+            return True
+        p_str = str(exe_path)
+        if p_str in cls._exe_handles and cls._exe_handles[p_str] not in (None, -1, 0):
+            return True
+        if not exe_path.exists():
+            return False
+        GENERIC_READ = 0x80000000
+        FILE_SHARE_READ = 0x00000001  # Permite execução/leitura, mas PROÍBE escrita (FILE_SHARE_WRITE) e exclusão (FILE_SHARE_DELETE)
+        OPEN_EXISTING = 3
+        FILE_ATTRIBUTE_NORMAL = 0x80
+        h = kernel32.CreateFileW(p_str, GENERIC_READ, FILE_SHARE_READ, None, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, None)
+        if h and h != -1 and h != 0xFFFFFFFFFFFFFFFF:
+            cls._exe_handles[p_str] = h
+            return True
+        return False
+
+    @classmethod
+    def acquire_exclusive_config_locks(cls, config_dir: Path = CONFIG_DIR):
+        """Aplica trava de kernel diferenciada:
+        - hw_salt.bin (chave de desencriptação DPAPI): dwShareMode = 0 (ZERO leitura, escrita ou exclusão por outros processos).
+        - hotp_config.json, .sig e owner_anchor.json: dwShareMode = FILE_SHARE_READ (permite leitura passiva de status pela GUI sem WinError 32, mas BLOQUEIA escrita, sobrescrita, renomeação e exclusão no kernel).
+        """
+        cls._active = True
+        if sys.platform != "win32" or kernel32 is None:
+            return
+        GENERIC_READ = 0x80000000
+        NO_SHARING = 0x00000000       # Bloqueio total de leitura, escrita e exclusão para hw_salt.bin
+        FILE_SHARE_READ = 0x00000001  # Bloqueio total de escrita, sobrescrita e exclusão para metadados
+        OPEN_EXISTING = 3
+        FILE_ATTRIBUTE_NORMAL = 0x80
+        for fname in ("hw_salt.bin", "hotp_config.json", "hotp_config.json.sig", "owner_anchor.json"):
+            fpath = config_dir / fname
+            cls._guarded_cfg_paths.add(fpath)
+            p_str = str(fpath)
+            if p_str in cls._cfg_handles and cls._cfg_handles[p_str] not in (None, -1, 0):
+                continue
+            if fpath.exists():
+                share_mode = NO_SHARING if fname == "hw_salt.bin" else FILE_SHARE_READ
+                h = kernel32.CreateFileW(p_str, GENERIC_READ, share_mode, None, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, None)
+                if h and h != -1 and h != 0xFFFFFFFFFFFFFFFF:
+                    cls._cfg_handles[p_str] = h
+
+    @classmethod
+    def suspend_config_locks_for_atomic_io(cls):
+        """Libera temporariamente os handles exclusivos de config durante uma operação interna do próprio daemon dentro do AtomicLock."""
+        if sys.platform != "win32" or kernel32 is None:
+            return
+        for p_str, h in list(cls._cfg_handles.items()):
+            if h and h not in (-1, 0):
+                try:
+                    kernel32.CloseHandle(h)
+                except Exception:
+                    pass
+            cls._cfg_handles.pop(p_str, None)
+
+    @classmethod
+    def release_all_locks(cls):
+        """Libera todos os handles de kernel (executável e configuração) após autorização de reset ou desinstalação."""
+        cls._active = False
+        if sys.platform != "win32" or kernel32 is None:
+            cls._exe_handles.clear()
+            cls._cfg_handles.clear()
+            return
+        for handle_dict in (cls._exe_handles, cls._cfg_handles):
+            for p_str, h in list(handle_dict.items()):
+                if h and h not in (-1, 0):
+                    try:
+                        kernel32.CloseHandle(h)
+                    except Exception:
+                        pass
+                handle_dict.pop(p_str, None)
+
+    @classmethod
+    def resume_config_locks_after_atomic_io(cls):
+        """Re-adquire imediatamente os bloqueios de kernel após concluir a operação interna."""
+        if not cls._active or sys.platform != "win32" or kernel32 is None:
+            return
+        GENERIC_READ = 0x80000000
+        NO_SHARING = 0x00000000
+        FILE_SHARE_READ = 0x00000001
+        OPEN_EXISTING = 3
+        FILE_ATTRIBUTE_NORMAL = 0x80
+        for fpath in list(cls._guarded_cfg_paths):
+            p_str = str(fpath)
+            if p_str not in cls._cfg_handles and fpath.exists():
+                share_mode = NO_SHARING if fpath.name == "hw_salt.bin" else FILE_SHARE_READ
+                h = kernel32.CreateFileW(p_str, GENERIC_READ, share_mode, None, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, None)
+                if h and h != -1 and h != 0xFFFFFFFFFFFFFFFF:
+                    cls._cfg_handles[p_str] = h
+
+
+def sync_external_system_vault(anchor_data: dict) -> bool:
+    """Espelha a âncora soberana em áreas exclusivas do SYSTEM fora de C:\\Utilitario:
+    1. Registro HKLM\\SECURITY\\Policy\\Secrets\\AdminBridgeAnchor (acessível apenas a SYSTEM).
+    2. C:\\System Volume Information\\AdminBridgeVault (partição/diretório oculto do sistema onde Admin tem Acesso Negado).
+    Impede que um Admin temporário apague a pasta C:\\Utilitario inteira e substitua por arquivos novos.
+    """
+    if sys.platform != "win32":
+        return True
+    payload_str = json.dumps({
+        "public_key_b64": anchor_data.get("public_key_b64", ""),
+        "static_mesh_hash": anchor_data.get("static_mesh_hash", ""),
+        "signature_b64": anchor_data.get("signature_b64", "")
+    }, sort_keys=True)
+
+    # 1. Tenta gravar em HKLM\SECURITY (acessível apenas quando rodando como SYSTEM)
+    try:
+        import winreg
+        with winreg.CreateKeyEx(
+            winreg.HKEY_LOCAL_MACHINE,
+            r"SECURITY\Policy\Secrets\AdminBridgeAnchor",
+            0,
+            winreg.KEY_WRITE | winreg.KEY_WOW64_64KEY
+        ) as key:
+            winreg.SetValueEx(key, "AnchorSeal", 0, winreg.REG_SZ, payload_str)
+    except Exception:
+        pass
+
+    # 2. Tenta gravar nos cofres externos de sistema fora de C:\Utilitario
+    for ext_dir in EXTERNAL_VAULT_DIRS:
+        try:
+            ext_dir.mkdir(parents=True, exist_ok=True)
+            subprocess.run(
+                ["cmd.exe", "/c", f'icacls "{ext_dir}" /inheritance:r /grant:r "*S-1-5-18:(OI)(CI)(F)" /c /q'],
+                capture_output=True, check=False, creationflags=0x08000000
+            )
+            seal_file = ext_dir / "anchor_seal.json"
+            with open(seal_file, "w", encoding="utf-8") as sf:
+                sf.write(payload_str)
+        except Exception:
+            pass
+    return True
+
+
+def clear_external_system_vault():
+    """Limpa a âncora externa exclusivamente durante um reset ou reparo autenticado pelo proprietário."""
+    if sys.platform != "win32":
+        return
+    try:
+        import winreg
+        winreg.DeleteKeyEx(
+            winreg.HKEY_LOCAL_MACHINE,
+            r"SECURITY\Policy\Secrets\AdminBridgeAnchor",
+            winreg.KEY_WOW64_64KEY,
+            0
+        )
+    except Exception:
+        pass
+    for ext_dir in EXTERNAL_VAULT_DIRS:
+        try:
+            seal_file = ext_dir / "anchor_seal.json"
+            if seal_file.exists():
+                seal_file.unlink(missing_ok=True)
+        except Exception:
+            pass
+
+
+def verify_external_system_vault(local_anchor: dict) -> Tuple[bool, str]:
+    """Compara o owner_anchor.json de C:\\Utilitario com o cofre externo do SYSTEM (HKLM\\SECURITY e System Volume Information).
+    Se um Admin temporário tiver substituído a pasta C:\\Utilitario inteira por novos arquivos, a chave pública divergirá do cofre externo!
+    """
+    if sys.platform != "win32":
+        return True, "ok"
+
+    ext_seals = []
+    try:
+        import winreg
+        with winreg.OpenKey(
+            winreg.HKEY_LOCAL_MACHINE,
+            r"SECURITY\Policy\Secrets\AdminBridgeAnchor",
+            0,
+            winreg.KEY_READ | winreg.KEY_WOW64_64KEY
+        ) as key:
+            val, _ = winreg.QueryValueEx(key, "AnchorSeal")
+            if val:
+                ext_seals.append(json.loads(val))
+    except Exception:
+        pass
+
+    for ext_dir in EXTERNAL_VAULT_DIRS:
+        try:
+            seal_file = ext_dir / "anchor_seal.json"
+            if seal_file.exists():
+                with open(seal_file, "r", encoding="utf-8") as sf:
+                    ext_seals.append(json.load(sf))
+        except Exception:
+            pass
+
+    for seal in ext_seals:
+        ext_pub = seal.get("public_key_b64", "")
+        ext_sig = seal.get("signature_b64", "")
+        if ext_pub and ext_pub != local_anchor.get("public_key_b64", ""):
+            return False, "external_vault_mismatch: A pasta C:\\Utilitario foi substituida por uma nova instalacao nao autorizada"
+        if ext_sig and ext_sig != local_anchor.get("signature_b64", ""):
+            return False, "external_vault_signature_mismatch: Assinatura da pasta C:\\Utilitario diverge do cofre externo SYSTEM"
+
+    return True, "ok"
 
 
 def create_owner_anchor(password: str, base_dir: Path = BASE_DIR, anchor_path: Optional[Path] = None) -> dict:
@@ -718,6 +1043,8 @@ def create_owner_anchor(password: str, base_dir: Path = BASE_DIR, anchor_path: O
                 check=False,
                 creationflags=0x08000000
             )
+        if base_dir == BASE_DIR or Path(base_dir).resolve() == BASE_DIR.resolve() or Path(base_dir).parent.resolve() == BASE_DIR.resolve():
+            sync_external_system_vault(anchor_data)
         return anchor_data
     finally:
         wipe_buffer(derived_ba)
@@ -725,12 +1052,17 @@ def create_owner_anchor(password: str, base_dir: Path = BASE_DIR, anchor_path: O
 
 
 def verify_owner_anchor(anchor_path: Optional[Path] = None, base_dir: Path = BASE_DIR) -> Tuple[bool, str]:
-    """Valida a assinatura Ed25519 da âncora do proprietário CONTRA a malha estática real em disco."""
+    """Valida a assinatura Ed25519 da âncora do proprietário CONTRA a malha estática real em disco (com cache reativo)."""
     from cryptography.hazmat.primitives.asymmetric import ed25519
 
     target_anchor = _resolve_anchor_file(base_dir, anchor_path)
     if not target_anchor.exists():
         return False, "owner_anchor_missing: arquivo owner_anchor.json ausente ou removido"
+
+    exe_obj = _resolve_mesh_root(base_dir) / "AdminBridge.exe"
+    anc_cache_key = (str(target_anchor), _file_stat_sig(target_anchor), _file_stat_sig(exe_obj))
+    if anc_cache_key in _owner_anchor_cache:
+        return _owner_anchor_cache[anc_cache_key]
 
     try:
         with open(target_anchor, "r", encoding="utf-8") as af:
@@ -748,6 +1080,15 @@ def verify_owner_anchor(anchor_path: Optional[Path] = None, base_dir: Path = BAS
         pub_key = ed25519.Ed25519PublicKey.from_public_bytes(pub_bytes)
         sign_payload = f"AdminBridge_OwnerAnchor_v1|{actual_mesh}".encode("utf-8")
         pub_key.verify(signature, sign_payload)
+
+        if base_dir == BASE_DIR or Path(base_dir).resolve() == BASE_DIR.resolve() or Path(base_dir).parent.resolve() == BASE_DIR.resolve():
+            ok_ext, ext_msg = verify_external_system_vault(anchor_data)
+            if not ok_ext:
+                return False, ext_msg
+
+        if len(_owner_anchor_cache) > 64:
+            _owner_anchor_cache.clear()
+        _owner_anchor_cache[anc_cache_key] = (True, "ok")
         return True, "ok"
     except Exception as e:
         return False, f"owner_anchor_invalid: {e}"
@@ -796,9 +1137,23 @@ def generate_mutual_confirmation_code(secret_bytes: bytes, otp_code: str) -> str
 
 
 def harden_process_dacl() -> bool:
-    """Endurece a segurança do processo atual (mitigações anti-dump, anti-DLL hijacking e proteção de processo)."""
+    """Endurece a DACL do processo no kernel do Windows (estilo Anti-Cheat):
+    Nega PROCESS_TERMINATE (0x0001), PROCESS_VM_READ (0x0010), PROCESS_VM_WRITE (0x0020) e PROCESS_SUSPEND_RESUME (0x0800)
+    para Usuários Comuns (BU) e Administradores (BA), concedendo controle total apenas ao próprio SYSTEM (SY).
+    """
     try:
         configure_anti_dump_mitigations()
+        if sys.platform == "win32" and advapi32 is not None and kernel32 is not None:
+            # SDDL: DACL Protegida que nega Terminate/VM_Read/VM_Write/Suspend para Admins (BA) e Users (BU), e permite tudo para SYSTEM (SY)
+            sddl = "D:P(D;;0x0831;;;BA)(D;;0x0831;;;BU)(A;;0x1fffff;;;SY)"
+            p_sd = ctypes.c_void_p()
+            if advapi32.ConvertStringSecurityDescriptorToSecurityDescriptorW(sddl, 1, ctypes.byref(p_sd), None):
+                try:
+                    DACL_SECURITY_INFORMATION = 0x00000004
+                    h_proc = kernel32.GetCurrentProcess()
+                    advapi32.SetKernelObjectSecurity(h_proc, DACL_SECURITY_INFORMATION, p_sd)
+                finally:
+                    kernel32.LocalFree(p_sd)
         return True
     except Exception:
         return False
@@ -843,6 +1198,10 @@ def apply_isolated_bridge_ntfs_acls(base_dir: Path = BASE_DIR) -> bool:
     if sys.platform != "win32":
         return True
 
+    b_str = str(base_dir).lower()
+    if "temp" in b_str or "tmp" in b_str or "appdata" in b_str:
+        return True
+
     config_dir = base_dir / "config"
     scripts_dir = base_dir / "scripts"
     queue_dir = base_dir / "queue"
@@ -862,7 +1221,7 @@ def apply_isolated_bridge_ntfs_acls(base_dir: Path = BASE_DIR) -> bool:
 
     # 1. Blindagem da pasta raiz C:\Utilitario (Remove herança de C:\ para impedir plantio de DLLs ou substituição de binários)
     try:
-        if base_dir.exists():
+        if base_dir.exists() and (base_dir == BASE_DIR or "temp" not in str(base_dir).lower()):
             subprocess.run(["takeown", "/f", str(base_dir), "/d", "y"], capture_output=True, check=False, creationflags=0x08000000)
             subprocess.run(
                 ["cmd.exe", "/c", f'icacls "{base_dir}" /inheritance:r /grant:r "*S-1-5-18:(OI)(CI)(F)" "*S-1-5-32-544:(RX)" "*S-1-5-32-545:(RX)" /c /q'],
@@ -884,15 +1243,29 @@ def apply_isolated_bridge_ntfs_acls(base_dir: Path = BASE_DIR) -> bool:
                 check=False,
                 creationflags=0x08000000
             )
+            is_system_account = os.getenv("USERNAME", "").upper() in ("SYSTEM", "SISTEMA") or os.getenv("USERPROFILE", "").lower().endswith("systemprofile")
             for specific_file in ("hotp_config.json", "hotp_config.json.sig", "owner_anchor.json", "preauth_ticket.json", "hw_salt.bin", "canary.bin"):
                 sp = config_dir / specific_file
                 if sp.exists():
-                    subprocess.run(
-                        ["cmd.exe", "/c", f'icacls "{sp}" /inheritance:r /grant:r "*S-1-5-18:(F)" "*S-1-5-32-544:(F)" /c /q'],
-                        capture_output=True,
-                        check=False,
-                        creationflags=0x08000000
-                    )
+                    if is_system_account and specific_file in ("hw_salt.bin", "canary.bin"):
+                        # ARMADILHA DE LEITURA OFFLINE (SYSTEM-ONLY):
+                        # A chave de entropia hw_salt.bin e o canário ficam restritos EXCLUSIVAMENTE a SYSTEM (*S-1-5-18).
+                        # Sem hw_salt.bin, é impossível descriptografar secret_dpapi. Se um Administrador tentar ler hw_salt.bin
+                        # com o software desligado, tomará Acesso Negado e será forçado a rodar takeown/icacls, o que avança
+                        # o USN de hw_salt.bin no NTFS e aciona Lockdown imediato!
+                        subprocess.run(
+                            ["cmd.exe", "/c", f'icacls "{sp}" /inheritance:r /grant:r "*S-1-5-18:(F)" /c /q'],
+                            capture_output=True,
+                            check=False,
+                            creationflags=0x08000000
+                        )
+                    else:
+                        subprocess.run(
+                            ["cmd.exe", "/c", f'icacls "{sp}" /inheritance:r /grant:r "*S-1-5-18:(F)" "*S-1-5-32-544:(F)" /c /q'],
+                            capture_output=True,
+                            check=False,
+                            creationflags=0x08000000
+                        )
     except Exception:
         pass
 
@@ -956,16 +1329,34 @@ def apply_isolated_bridge_ntfs_acls(base_dir: Path = BASE_DIR) -> bool:
         except Exception:
             pass
 
-    return check_config_acl_isolation(base_dir)
+    ok_iso = check_config_acl_isolation(base_dir)
+    if ok_iso:
+        try:
+            (config_dir / ".acl_seal").write_text(str(int(time.time())), encoding="utf-8")
+        except Exception:
+            pass
+    return ok_iso
 
 
 def check_forensic_integrity(config_file: Path) -> Tuple[bool, str]:
-    """Verifica se a posse, o arquivo canário ou a âncora soberana foram violados durante a inatividade."""
+    """Verifica se a posse, o arquivo canário ou a âncora soberana foram violados (com cache de USN/mtime para zero lag)."""
     if not config_file.exists():
         return True, "Configuracao ainda nao existe."
 
+    canary_file = config_file.parent / "canary.bin"
+    anchor_file = config_file.parent / "owner_anchor.json"
+    exe_file = _resolve_mesh_root(config_file.parent) / "AdminBridge.exe"
+    for_cache_key = (
+        str(config_file),
+        _file_stat_sig(config_file),
+        get_file_usn(config_file),
+        _file_stat_sig(canary_file),
+        _file_stat_sig(anchor_file),
+        _file_stat_sig(exe_file),
+    )
+
     try:
-        if sys.platform == "win32":
+        if sys.platform == "win32" and for_cache_key not in _forensic_cache:
             ps_cmd = f"(Get-Acl -LiteralPath '{config_file}').Owner"
             res = subprocess.run(
                 ["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", ps_cmd],
@@ -1008,6 +1399,14 @@ def check_forensic_integrity(config_file: Path) -> Tuple[bool, str]:
             if not ok_anc:
                 return False, f"Alerta forense: Violacao da ancora do proprietario ({msg_anc})."
 
+        # Verifica se a Tarefa Agendada do Windows não foi adulterada para mascarar outro script
+        ok_task, msg_task = verify_scheduled_task_integrity(_resolve_mesh_root(config_file.parent))
+        if not ok_task:
+            return False, f"Alerta forense: {msg_task}"
+
+        if len(_forensic_cache) > 32:
+            _forensic_cache.clear()
+        _forensic_cache[for_cache_key] = True
         return True, "Integridade forense confirmada."
     except Exception as e:
         return True, f"Verificacao forense ignorada por erro de ambiente: {e}"
@@ -1021,6 +1420,8 @@ def apply_system_only_ntfs_acls(target_path: Path):
 def restore_ntfs_acls_for_removal(target_path: Path):
     """Assume posse (takeown) e restaura permissões para Administradores para permitir remoção/desinstalação."""
     if sys.platform != "win32" or not target_path.exists():
+        return
+    if "temp" in str(target_path).lower() or target_path.name.lower() in ("temp", "appdata", "local"):
         return
 
     try:
@@ -1093,6 +1494,7 @@ class AtomicLock:
                 _lock_local.mutex_handle = None
             raise
 
+        KernelFileGuard.suspend_config_locks_for_atomic_io()
         _lock_local.depth = 1
         return self
 
@@ -1104,6 +1506,7 @@ class AtomicLock:
         if _lock_local.depth > 0:
             return
 
+        KernelFileGuard.resume_config_locks_after_atomic_io()
         if _lock_local.lock_file_fd is not None:
             try:
                 if msvcrt is not None:

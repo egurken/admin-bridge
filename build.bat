@@ -43,6 +43,10 @@ if %ERRORLEVEL% EQU 0 (
     echo %~dp0dist\AdminBridge.exe
     echo ========================================================
 
+    echo.
+    echo [Assinatura Digital] Assinando dist\AdminBridge.exe com Certificado Authenticode...
+    call "%~dp0assinar_executavel.bat" --nopause
+
     echo Atualizando C:\Utilitario...
     if exist "C:\Utilitario\AdminBridge.exe" (
         attrib -r "C:\Utilitario\AdminBridge.exe" >nul 2>&1
