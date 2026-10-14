@@ -457,8 +457,27 @@ def test_all_security_rules():
         assert "Serviço" in rep_risk["explanation"] and "Antivírus" in rep_risk["explanation"]
         print("  -> PASSOU: Inspetor de 3 Camadas identifica risco, pausa execução e explica o que o script faz em português!")
 
+        print("[*] 22. Testando Desenrolamento Recursivo de Scripts Externos (Script que chama outro Script)...")
+        ext_self_attack = Path(tmpdir) / "inocente_por_fora.ps1"
+        ext_self_attack.write_text("Get-Content C:\\Utilitario\\config\\hotp_config.json", encoding="utf-8")
+        cmd_calling_ext_attack = f"powershell.exe -ExecutionPolicy Bypass -File \"{ext_self_attack}\""
+        assert is_self_targeting_command(cmd_calling_ext_attack), "Deveria ler dentro do .ps1 externo e bloquear o ataque a C:\\Utilitario!"
+
+        nivel2_ps1 = Path(tmpdir) / "nivel2_oculto.ps1"
+        nivel2_ps1.write_text("sc.exe create ServicoEscondido binPath= C:\\Temp\\malware.exe start= auto", encoding="utf-8")
+        nivel1_bat = Path(tmpdir) / "nivel1_wrapper.bat"
+        nivel1_bat.write_text(f"powershell -File \"{nivel2_ps1}\"", encoding="utf-8")
+
+        rep_nested = inspect_script_3_layers(f"call \"{nivel1_bat}\"")
+        assert rep_nested["requires_step_up"], "Deveria desenrolar nivel1.bat -> nivel2.ps1 e detectar criação de serviço eterno!"
+        assert rep_nested["risk_score"] >= 65
+        assert len(rep_nested.get("referenced_files", [])) == 2
+        assert "Serviço Permanente" in rep_nested["explanation"]
+        assert "sc.exe create ServicoEscondido" in rep_nested["unrolled_code"]
+        print("  -> PASSOU: Scripts externos aninhados (.bat -> .ps1) são abertos e inspecionados recursivamente!")
+
     print("\n=======================================================")
-    print("TODOS OS 21 REQUISITOS DE SEGURANÇA FORAM TESTADOS E APROVADOS!")
+    print("TODOS OS 22 REQUISITOS DE SEGURANÇA FORAM TESTADOS E APROVADOS!")
     print("=======================================================")
 
 

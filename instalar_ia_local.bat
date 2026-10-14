@@ -2,55 +2,36 @@
 setlocal enabledelayedexpansion
 
 echo ========================================================
-echo   INSTALADOR AUTOMATICO DA MINI-IA LOCAL (QWEN 0.5B)
-echo   Otimizado para Intel Core i5 (Apenas ~350 MB)
+echo   ATIVANDO E TESTANDO MINI-IA LOCAL (QWEN 2.5 - 0.5B)
+echo   Download direto via API Local do Ollama (127.0.0.1:11434)
 echo ========================================================
 echo.
 
-where ollama >nul 2>&1
-if %ERRORLEVEL% NEQ 0 (
-    if exist "%LOCALAPPDATA%\Programs\Ollama\ollama.exe" (
-        set "PATH=%PATH%;%LOCALAPPDATA%\Programs\Ollama"
-    )
-)
+powershell -NoProfile -ExecutionPolicy Bypass -Command ^
+    "$ErrorActionPreference = 'Continue'; " ^
+    "try { " ^
+    "    $tags = Invoke-RestMethod -Uri 'http://127.0.0.1:11434/api/tags' -Method Get -TimeoutSec 2; " ^
+    "    Write-Host '[*] Servidor Ollama detectado em http://127.0.0.1:11434!' -ForegroundColor Cyan; " ^
+    "} catch { " ^
+    "    $ollamaExe = Join-Path $env:LOCALAPPDATA 'Programs\Ollama\ollama.exe'; " ^
+    "    if (Test-Path $ollamaExe) { " ^
+    "        Write-Host '[*] Iniciando servidor Ollama local...' -ForegroundColor Cyan; " ^
+    "        Start-Process -FilePath $ollamaExe -ArgumentList 'serve' -WindowStyle Hidden; " ^
+    "        Start-Sleep -Seconds 2; " ^
+    "    } " ^
+    "} " ^
+    "Write-Host '[*] Baixando modelo ultraleve qwen2.5:0.5b (~350 MB) via API HTTP do Ollama...' -ForegroundColor Yellow; " ^
+    "try { " ^
+    "    $res = Invoke-RestMethod -Uri 'http://127.0.0.1:11434/api/pull' -Method Post -ContentType 'application/json' -Body '{\"name\":\"qwen2.5:0.5b\",\"stream\":false}' -TimeoutSec 600; " ^
+    "    Write-Host '[+] Modelo qwen2.5:0.5b baixado com sucesso!' -ForegroundColor Green; " ^
+    "    Write-Host '[*] Realizando teste de verificacao e liberando RAM (keep_alive=0s)...' -ForegroundColor Cyan; " ^
+    "    $testBody = '{\"model\":\"qwen2.5:0.5b\",\"prompt\":\"Responda apenas OK\",\"stream\":false,\"keep_alive\":\"0s\"}'; " ^
+    "    $testRes = Invoke-RestMethod -Uri 'http://127.0.0.1:11434/api/generate' -Method Post -ContentType 'application/json' -Body $testBody -TimeoutSec 30; " ^
+    "    New-Item -ItemType Directory -Force -Path 'C:\Utilitario\queue' | Out-Null; " ^
+    "    Set-Content -Path 'C:\Utilitario\queue\ai_ready.json' -Value '{\"verified\":true,\"model\":\"qwen2.5:0.5b\"}' -Encoding UTF8; " ^
+    "    Write-Host '[SUCESSO] Mini-IA testada, validada e pronta (0 MB na RAM em repouso)!' -ForegroundColor Green; " ^
+    "} catch { " ^
+    "    Write-Host ('[AVISO] Nao foi possivel conectar ao Ollama em 127.0.0.1:11434: ' + $_.Exception.Message) -ForegroundColor Yellow; " ^
+    "}"
 
-where ollama >nul 2>&1
-if %ERRORLEVEL% NEQ 0 (
-    echo [*] Motor Ollama nao encontrado. Instalando automaticamente...
-    where winget >nul 2>&1
-    if !ERRORLEVEL! EQU 0 (
-        winget install --id Ollama.Ollama -e --silent --accept-package-agreements --accept-source-agreements
-    ) else (
-        echo [*] Baixando instalador oficial do Ollama via PowerShell...
-        powershell -NoProfile -ExecutionPolicy Bypass -Command ^
-            "$url = 'https://ollama.com/download/OllamaSetup.exe'; " ^
-            "$out = Join-Path $env:TEMP 'OllamaSetup.exe'; " ^
-            "Invoke-WebRequest -Uri $url -OutFile $out -UseBasicParsing; " ^
-            "Start-Process -FilePath $out -ArgumentList '/VERYSILENT /NORESTART' -Wait"
-    )
-    set "PATH=%PATH%;%LOCALAPPDATA%\Programs\Ollama"
-)
-
-where ollama >nul 2>&1
-if %ERRORLEVEL% NEQ 0 (
-    echo [AVISO] Nao foi possivel localizar o executavel do Ollama automaticamente.
-    echo O Admin Bridge continuara usando o Explicador Semantico Embarcado (0 MB) normalmente!
-    if "%1" NEQ "--nopause" pause
-    exit /b 0
-)
-
-echo.
-echo [*] Iniciando motor local em segundo plano para baixar o mini-modelo qwen2.5:0.5b (~350 MB)...
-start "" /b ollama serve >nul 2>&1
-timeout /t 2 /nobreak >nul
-
-echo [*] Baixando modelo ultraleve qwen2.5:0.5b (Roda em CPU Core i5 com keep_alive=0s)...
-ollama pull qwen2.5:0.5b
-
-echo.
-echo ========================================================
-echo   [SUCESSO] Mini-IA Local (qwen2.5:0.5b) pronta!
-echo   NOTA: O modelo fica com 0 MB na RAM em repouso e so
-echo   carrega por 1 segundo quando um script suspeito surgir!
-echo ========================================================
 if "%1" NEQ "--nopause" pause

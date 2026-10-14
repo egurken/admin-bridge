@@ -14,6 +14,7 @@ import secrets
 import shutil
 import subprocess
 import sys
+import threading
 import time
 import uuid
 from datetime import datetime, timezone
@@ -62,7 +63,8 @@ from hotp_crypto import (
     configure_anti_dump_mitigations, harden_process_dacl, append_ledger_block, verify_ledger_integrity,
     check_config_acl_isolation, protect_transit_token, unprotect_transit_token, verify_owner_anchor,
     KernelFileGuard, verify_scheduled_task_integrity, get_os_process_username, ensure_transit_keypair,
-    inspect_script_3_layers
+    inspect_script_3_layers, extract_and_read_referenced_scripts,
+    clear_integrity_caches, is_local_slm_verified, pull_and_test_local_slm
 )
 
 LOCAL_SERVER_NAME = f"AdminBridge_GUI_{os.getenv('USERNAME', 'default')}"
@@ -71,6 +73,7 @@ CONFIG_DIR = BASE_DIR / "config"
 QUEUE_DIR = BASE_DIR / "queue"
 REQUESTS_DIR = QUEUE_DIR / "requests"
 PROCESSING_DIR = QUEUE_DIR / "processing"
+GUI_PENDING_DIR = QUEUE_DIR / "gui_pending"
 RESPONSES_DIR = QUEUE_DIR / "responses"
 SCRIPTS_DIR = BASE_DIR / "scripts"
 LOGS_DIR = BASE_DIR / "logs"
@@ -204,21 +207,27 @@ def create_desktop_shortcut():
 
 
 def ensure_environment_installed():
-    """Garante a estrutura de diretórios e extração dos componentes essenciais."""
-    BASE_DIR.mkdir(parents=True, exist_ok=True)
+    """Garante a estrutura de diretórios sem falhar quando executado por usuário padrão não-elevado."""
+    if not is_admin():
+        # Usuário comum não deve tentar criar/modificar pastas restritas para não sofrer PermissionError
+        for pub_d in (RESPONSES_DIR, GUI_PENDING_DIR):
+            try:
+                pub_d.mkdir(parents=True, exist_ok=True)
+            except Exception:
+                pass
+        create_desktop_shortcut()
+        return
+
+    for d in (BASE_DIR, CONFIG_DIR, LOGS_DIR, QUEUE_DIR, REQUESTS_DIR, PROCESSING_DIR, GUI_PENDING_DIR, RESPONSES_DIR, SCRIPTS_DIR):
+        try:
+            d.mkdir(parents=True, exist_ok=True)
+        except Exception:
+            pass
+
     try:
-        CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+        (BASE_DIR / "runner.ps1").unlink(missing_ok=True)
     except Exception:
         pass
-    LOGS_DIR.mkdir(parents=True, exist_ok=True)
-    QUEUE_DIR.mkdir(parents=True, exist_ok=True)
-    REQUESTS_DIR.mkdir(parents=True, exist_ok=True)
-    PROCESSING_DIR.mkdir(parents=True, exist_ok=True)
-    RESPONSES_DIR.mkdir(parents=True, exist_ok=True)
-    SCRIPTS_DIR.mkdir(parents=True, exist_ok=True)
-
-    # Remove runner.ps1 legado se existir em disco para garantir processo unico
-    (BASE_DIR / "runner.ps1").unlink(missing_ok=True)
 
     target_exe = (BASE_DIR / "AdminBridge.exe").resolve()
     current_exe = Path(sys.executable).resolve()
@@ -315,6 +324,17 @@ def is_self_targeting_command(cmd_text: str, _depth: int = 0) -> bool:
                     return True
             except Exception:
                 pass
+
+    # 6. Se o comando chama um arquivo de script externo (.ps1, .bat, .cmd, .py, .vbs) que existe no disco,
+    # abre o arquivo externo e verifica recursivamente se o conteúdo de dentro dele tenta atacar C:\Utilitario!
+    if _depth == 0:
+        try:
+            _, ref_files = extract_and_read_referenced_scripts(cmd_text)
+            for rf in ref_files:
+                if is_self_targeting_command(rf.get("content", ""), _depth + 1):
+                    return True
+        except Exception:
+            pass
 
     return False
 
@@ -588,9 +608,18 @@ def perform_full_uninstall(parent_widget=None) -> bool:
 
 
 def load_recent_history(max_items: int = 50) -> list:
-    """Carrega o histórico recente de auditoria e comandos a partir de logs/auth.log."""
+    """Carrega o histórico recente de logs/auth.log ou, quando sem Admin, do snapshot público queue/status.json."""
     items = []
-    if not AUTH_LOG_FILE.exists():
+    try:
+        if not AUTH_LOG_FILE.exists():
+            raise FileNotFoundError()
+    except Exception:
+        if STATUS_FILE.exists():
+            try:
+                st = json.loads(STATUS_FILE.read_text(encoding="utf-8"))
+                return (st.get("recent_history") or [])[:max_items]
+            except Exception:
+                pass
         return items
 
     try:
@@ -644,7 +673,12 @@ def load_recent_history(max_items: int = 50) -> list:
                 if len(items) >= max_items:
                     break
     except Exception:
-        pass
+        if STATUS_FILE.exists():
+            try:
+                st = json.loads(STATUS_FILE.read_text(encoding="utf-8"))
+                return (st.get("recent_history") or [])[:max_items]
+            except Exception:
+                pass
 
     return items
 
@@ -792,6 +826,9 @@ class SetupWizardDialog(QDialog):
             QMessageBox.warning(self, "Aviso", "As palavras-passe digitadas não coincidem.")
             return
 
+        self.btn_next.setEnabled(False)
+        self.btn_next.setText("Gerando chave segura...")
+        QApplication.processEvents()
         try:
             caller_info = {
                 "pid": os.getpid(),
@@ -799,9 +836,13 @@ class SetupWizardDialog(QDialog):
                 "script": "SetupWizardDialog",
                 "user": os.getenv("USERNAME", "unknown")
             }
-            res = self.hotp_auth.provision(p1, force=False, caller_info=caller_info)
+            # defer_acls=True exibe o QR Code na tela instantaneamente e aplica o icacls em background enquanto o usuário escaneia!
+            res = self.hotp_auth.provision(p1, force=False, caller_info=caller_info, defer_acls=True)
             self.show_qr_step(res)
+            threading.Thread(target=apply_isolated_bridge_ntfs_acls, args=(BASE_DIR,), daemon=True).start()
         except Exception as e:
+            self.btn_next.setEnabled(True)
+            self.btn_next.setText("Gerar QR Code")
             QMessageBox.critical(self, "Erro no Provisionamento", f"Falha ao gerar chave: {e}")
 
     def show_qr_step(self, res):
@@ -929,7 +970,7 @@ class SetupWizardDialog(QDialog):
             self.raw_qr_buffer = None
         gc.collect()
 
-        register_scheduled_task()
+        threading.Thread(target=register_scheduled_task, daemon=True).start()
         QMessageBox.information(self, "Pareamento Concluído", "Autenticador pareado e sincronizado com sucesso!")
         self.accept()
 
@@ -1488,6 +1529,24 @@ class SyncTestDialog(QDialog):
 # -----------------------------------------------------------------------------
 # JANELA PRINCIPAL DA CENTRAL DE GESTÃO (SYSTEM TRAY & DASHBOARD)
 # -----------------------------------------------------------------------------
+
+def pull_and_test_local_ai_with_ui(parent=None) -> Tuple[bool, str]:
+    """Executa pull_and_test_local_slm mantendo a interface responsiva durante o download."""
+    res_holder = {"done": False, "ok": False, "msg": ""}
+    def _worker():
+        ok, msg = pull_and_test_local_slm()
+        res_holder["ok"] = ok
+        res_holder["msg"] = msg
+        res_holder["done"] = True
+    t = threading.Thread(target=_worker, daemon=True)
+    t.start()
+    while not res_holder["done"]:
+        if QApplication is not None:
+            QApplication.processEvents()
+        time.sleep(0.08)
+    return res_holder["ok"], res_holder["msg"]
+
+
 class AdminBridgeWindow(QMainWindow):
     def __init__(self, hotp_auth: HOTPAuth):
         super().__init__()
@@ -1496,8 +1555,9 @@ class AdminBridgeWindow(QMainWindow):
         self.exec_thread = None
 
         self.setWindowTitle("Admin Bridge • Central de Gestão")
-        self.resize(760, 600)
-        self.setMinimumSize(660, 480)
+        self.resize(1080, 580)
+        self.setMinimumSize(560, 460)
+        self._history_user_hidden = False
 
         app_icon = get_app_icon()
         self.setWindowIcon(app_icon)
@@ -1669,6 +1729,14 @@ class AdminBridgeWindow(QMainWindow):
 
         top_bar.addStretch()
 
+        # Botão Alternar Painel Lateral de Histórico (📜)
+        self.btn_toggle_hist = QPushButton("📜")
+        self.btn_toggle_hist.setObjectName("btnIconAction")
+        self.btn_toggle_hist.setToolTip("Mostrar / Ocultar Painel Lateral de Histórico")
+        self.btn_toggle_hist.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+        self.btn_toggle_hist.clicked.connect(self.toggle_history_panel)
+        top_bar.addWidget(self.btn_toggle_hist)
+
         # Botão Recarregar (apenas a setinha 🔄)
         self.btn_refresh = QPushButton("🔄")
         self.btn_refresh.setObjectName("btnIconAction")
@@ -1708,9 +1776,11 @@ class AdminBridgeWindow(QMainWindow):
         act_sync.triggered.connect(self.show_sync_test_dialog)
         self.settings_menu.addAction(act_sync)
 
-        act_install_ai = QAction("🤖 Instalar / Ativar Mini-IA Local (Qwen 0.5B)...", self)
-        act_install_ai.triggered.connect(self.install_local_ai_assistant)
-        self.settings_menu.addAction(act_install_ai)
+        self.act_install_ai = QAction("🤖 Instalar e Testar Mini-IA Local (Qwen 0.5B)...", self)
+        self.act_install_ai.triggered.connect(self.install_local_ai_assistant)
+        self.settings_menu.addAction(self.act_install_ai)
+        if is_local_slm_verified():
+            self.act_install_ai.setVisible(False)
 
         act_status = QAction("📋 Status Detalhado do Contador", self)
         act_status.triggered.connect(self.show_counter_status_dialog)
@@ -1740,6 +1810,18 @@ class AdminBridgeWindow(QMainWindow):
         top_bar.addWidget(self.btn_settings)
 
         main_layout.addLayout(top_bar)
+
+        # Layout Horizontal de 2 Colunas: Esquerda (Controle/Aprovação) | Direita (Histórico Lateral Auto-Ocultável)
+        body_split_layout = QHBoxLayout()
+        body_split_layout.setContentsMargins(0, 0, 0, 0)
+        body_split_layout.setSpacing(14)
+        main_layout.addLayout(body_split_layout, stretch=1)
+
+        left_panel = QWidget()
+        left_layout = QVBoxLayout(left_panel)
+        left_layout.setContentsMargins(0, 0, 0, 0)
+        left_layout.setSpacing(12)
+        body_split_layout.addWidget(left_panel, stretch=3)
 
         # -------------------------------------------------------------
         # CABEÇALHO & PAINEL SUPERIOR DE MÉTRICAS (REQUISITO 2a)
@@ -1794,7 +1876,7 @@ class AdminBridgeWindow(QMainWindow):
         cf_layout.addWidget(self.lbl_fails_val)
         metrics_layout.addWidget(card_fails, 1)
 
-        main_layout.addLayout(metrics_layout)
+        left_layout.addLayout(metrics_layout)
 
         # -------------------------------------------------------------
         # ÁREA DE COMANDO PENDENTE (MODO HÍBRIDO / UAC)
@@ -1874,25 +1956,34 @@ class AdminBridgeWindow(QMainWindow):
         self.btn_box_widget.hide()
         pending_layout.addWidget(self.btn_box_widget)
 
-        main_layout.addWidget(self.card_pending)
+        left_layout.addWidget(self.card_pending, stretch=1)
 
         # -------------------------------------------------------------
-        # TABELA DE HISTÓRICO RECENTE
+        # PAINEL LATERAL DIREITO DE HISTÓRICO (AUTO-OCULTÁVEL SE FALTAR ESPAÇO)
         # -------------------------------------------------------------
-        lbl_hist_title = QLabel("📜 Histórico Recente de Requisições & Auditoria")
-        lbl_hist_title.setStyleSheet("font-size: 13px; font-weight: bold; color: #a6adc8; margin-top: 4px;")
-        main_layout.addWidget(lbl_hist_title)
+        self.history_panel = QFrame()
+        self.history_panel.setProperty("class", "card")
+        self.history_panel.setMinimumWidth(360)
+        hist_layout = QVBoxLayout(self.history_panel)
+        hist_layout.setContentsMargins(10, 10, 10, 10)
+        hist_layout.setSpacing(8)
+
+        lbl_hist_title = QLabel("📜 Histórico de Auditoria")
+        lbl_hist_title.setStyleSheet("font-size: 13px; font-weight: bold; color: #a6adc8;")
+        hist_layout.addWidget(lbl_hist_title)
 
         self.table_history = QTableWidget()
         self.table_history.setColumnCount(4)
-        self.table_history.setHorizontalHeaderLabels(["Data e Hora", "Comando ou Operação", "Estado", "OTP Mascarado"])
+        self.table_history.setHorizontalHeaderLabels(["Data/Hora", "Operação", "Estado", "OTP"])
         self.table_history.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
         self.table_history.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
         self.table_history.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
         self.table_history.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
         self.table_history.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self.table_history.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
-        main_layout.addWidget(self.table_history, stretch=1)
+        hist_layout.addWidget(self.table_history, stretch=1)
+
+        body_split_layout.addWidget(self.history_panel, stretch=2)
 
     def init_tray(self):
         self.tray_icon = QSystemTrayIcon(self)
@@ -1980,16 +2071,58 @@ class AdminBridgeWindow(QMainWindow):
                 2000
             )
 
-    def quit_app(self):
+    def toggle_history_panel(self):
+        """Alterna manualmente a exibição do painel lateral de histórico."""
+        if self.history_panel.isVisible():
+            self._history_user_hidden = True
+            self.history_panel.hide()
+        else:
+            self._history_user_hidden = False
+            self.history_panel.show()
+
+    def resizeEvent(self, event):
+        """Esconde automaticamente o painel lateral de histórico se a janela ficar estreita (< 880px)."""
+        super().resizeEvent(event)
+        if hasattr(self, "history_panel"):
+            if self.width() < 880:
+                if self.history_panel.isVisible():
+                    self.history_panel.hide()
+            else:
+                if not getattr(self, "_history_user_hidden", False) and not self.history_panel.isVisible():
+                    self.history_panel.show()
+
+    def quit_app(self, force_no_prompt: bool = False):
+        """Exige a Palavra-passe de Recuperação antes de permitir encerrar a Central de Gestão."""
+        if not force_no_prompt and self.hotp_auth.is_provisioned():
+            pwd, ok = QInputDialog.getText(
+                self,
+                "Autenticação Obrigatória • Encerrar Utilitário",
+                "Digite sua Palavra-passe de Recuperação para encerrar o Admin Bridge:",
+                QLineEdit.EchoMode.Password
+            )
+            if not ok or not pwd.strip():
+                return
+            valid_pw, msg_pw = self.hotp_auth.verify_quit_password(pwd.strip())
+            if not valid_pw:
+                QMessageBox.critical(self, "Acesso Negado", f"Não foi possível encerrar o utilitário:\n{msg_pw}")
+                return
         self.tray_icon.hide()
         QApplication.quit()
 
     def write_heartbeat(self):
+        # Somente grava heartbeat da GUI se o daemon SYSTEM não estiver ativo e se tiver permissão
+        if not is_admin():
+            return
         try:
+            if HEARTBEAT_FILE.exists():
+                hb = json.loads(HEARTBEAT_FILE.read_text(encoding="utf-8"))
+                if hb.get("mode") == "daemon" and (time.time() - float(hb.get("timestamp", 0))) < 6.0:
+                    return
             with open(HEARTBEAT_FILE, "w", encoding="utf-8") as f:
                 json.dump({
                     "timestamp": time.time(),
                     "status": "online",
+                    "mode": "gui",
                     "pid": os.getpid()
                 }, f)
         except Exception:
@@ -2069,10 +2202,18 @@ class AdminBridgeWindow(QMainWindow):
         if self.current_request or (self.exec_thread and self.exec_thread.isRunning()):
             return
 
-        if not REQUESTS_DIR.exists():
-            return
-
-        req_files = list(REQUESTS_DIR.glob("*.json"))
+        req_files = []
+        try:
+            if GUI_PENDING_DIR.exists():
+                req_files.extend(sorted(GUI_PENDING_DIR.glob("*.json"), key=lambda p: p.stat().st_ctime_ns if p.exists() else 0))
+        except Exception:
+            pass
+        if not req_files and is_admin():
+            try:
+                if REQUESTS_DIR.exists():
+                    req_files.extend(sorted(REQUESTS_DIR.glob("*.json"), key=lambda p: p.stat().st_ctime_ns if p.exists() else 0))
+            except Exception:
+                pass
         if not req_files:
             return
 
@@ -2099,9 +2240,13 @@ class AdminBridgeWindow(QMainWindow):
         except Exception:
             return
 
-        # Reivindicação atômica: move imediatamente para processing/
-        PROCESSING_DIR.mkdir(parents=True, exist_ok=True)
-        processing_file = PROCESSING_DIR / f"{req_id}.json"
+        # Reivindicação atômica: move para processing/ (se Admin) ou mantém em gui_pending/ (se Usuário padrão)
+        active_proc_dir = PROCESSING_DIR if is_admin() else GUI_PENDING_DIR
+        try:
+            active_proc_dir.mkdir(parents=True, exist_ok=True)
+        except Exception:
+            pass
+        processing_file = active_proc_dir / f"{req_id}.claim.json"
         try:
             target_file.rename(processing_file)
         except Exception:
@@ -2166,7 +2311,7 @@ class AdminBridgeWindow(QMainWindow):
                             QSystemTrayIcon.MessageIcon.Critical,
                             6000
                         )
-                    QTimer.singleShot(1500, self.quit_app)
+                    QTimer.singleShot(1500, lambda: self.quit_app(force_no_prompt=True))
                 return
 
             # Código válido: executa com permissões elevadas
@@ -2203,7 +2348,8 @@ class AdminBridgeWindow(QMainWindow):
             self.lbl_req_sub.setText("A Camada 3 pausou este comando para você revisar o que ele faz antes de liberar:")
             self.lbl_badge.setText(f"REVISÃO DE RISCO • {script_type}")
             self.lbl_badge.setStyleSheet("background-color: #f38ba8; color: #11111b; padding: 4px 10px; border-radius: 4px; font-weight: bold;")
-            viewer_text = f"{risk_report.get('explanation', '')}\n\n--- CÓDIGO DO SCRIPT SUBMETIDO ---\n{code}"
+            shown_code = risk_report.get("unrolled_code") or code
+            viewer_text = f"{risk_report.get('explanation', '')}\n\n--- CÓDIGO DO SCRIPT (INCLUINDO ARQUIVOS EXTERNOS) ---\n{shown_code}"
             self.code_viewer.setFixedHeight(170)
         else:
             self.lbl_req_title.setText(title)
@@ -2400,29 +2546,57 @@ class AdminBridgeWindow(QMainWindow):
         self.btn_approve.setEnabled(False)
 
     def prompt_and_execute_repair(self):
-        if not is_admin():
-            try:
-                request_elevation_with_args(["gui"])
-                return
-            except Exception as e:
-                QMessageBox.critical(self, "Permissão Necessária", f"Privilégios de Administrador são necessários: {e}")
-                return
-
         pwd, ok = QInputDialog.getText(
             self,
-            "Reparo do Sistema",
-            "Digite a sua Palavra-passe de Recuperação para autorizar o reparo:",
+            "Reparo e Re-Ancoragem do Sistema",
+            "Digite a sua Palavra-passe de Recuperação para revalidar a integridade e destravar o sistema:",
             QLineEdit.EchoMode.Password
         )
-        if not ok or not pwd:
+        if not ok or not pwd or not pwd.strip():
             return
+        pwd = pwd.strip()
 
+        # 1. Tenta reparar diretamente ou via RPC para o daemon SYSTEM
         success, msg = self.hotp_auth.repair_corrupted_installation(pwd)
+
+        # 2. Se o daemon estava desligado (ex: após Lockdown) e a janela atual não tem Admin,
+        # executa o subcomando CLI 'repair --password' elevado via UAC e aguarda concluir!
+        if not success and not is_admin() and ("Permissao" in msg or "Acesso" in msg or "nao foi possivel" in msg.lower()):
+            try:
+                sei = SHELLEXECUTEINFO()
+                sei.cbSize = ctypes.sizeof(SHELLEXECUTEINFO)
+                sei.fMask = 0x00000040  # SEE_MASK_NOCLOSEPROCESS
+                sei.hwnd = int(self.winId())
+                sei.lpVerb = "runas"
+                sei.lpFile = sys.executable
+                if getattr(sys, "frozen", False):
+                    sei.lpParameters = f'repair --password "{pwd}"'
+                else:
+                    sei.lpParameters = f'"{Path(__file__).resolve()}" repair --password "{pwd}"'
+                sei.nShow = 0  # SW_HIDE
+                if ctypes.windll.shell32.ShellExecuteExW(ctypes.byref(sei)) and sei.hProcess:
+                    ctypes.windll.kernel32.WaitForSingleObject(sei.hProcess, 15000)
+                    ec = wintypes.DWORD()
+                    ctypes.windll.kernel32.GetExitCodeProcess(sei.hProcess, ctypes.byref(ec))
+                    ctypes.windll.kernel32.CloseHandle(sei.hProcess)
+                    if ec.value == 0:
+                        clear_integrity_caches()
+                        success = True
+                        msg = "Integridade revalidada, assinatura re-ancorada e serviço SYSTEM reativado com sucesso!"
+                    else:
+                        msg = "Palavra-passe de recuperação incorreta ou falha ao re-ancorar."
+            except Exception as e:
+                msg = f"Falha ao elevar privilégios para reparo: {e}"
+
         if success:
+            if is_admin():
+                threading.Thread(target=register_scheduled_task, daemon=True).start()
+            clear_integrity_caches()
+            self.refresh_dashboard()
             QMessageBox.information(
                 self,
                 "Reparo Concluído",
-                f"{msg}\nO painel foi atualizado."
+                f"{msg}\nO painel foi atualizado para o estado Ativo."
             )
             if not self.hotp_auth.is_provisioned():
                 wizard = SetupWizardDialog(self.hotp_auth, self)
@@ -2536,33 +2710,31 @@ class AdminBridgeWindow(QMainWindow):
         )
 
     def install_local_ai_assistant(self):
-        """Instala e baixa automaticamente o mini-modelo local qwen2.5:0.5b (~350 MB) com 1 clique."""
+        """Baixa o modelo qwen2.5:0.5b direto pela API HTTP do Ollama, executa um teste real e oculta a opção do menu quando validado."""
         ask = QMessageBox.question(
             self,
-            "Instalar Mini-IA Local (Qwen 2.5 • 0.5B)",
-            "Deseja instalar e ativar automaticamente o mini-modelo de IA local (qwen2.5:0.5b - ~350 MB)?\n\n"
-            "• Otimizado para processadores Intel Core i5 (sem precisar de placa de vídeo).\n"
-            "• Consome 0 MB de RAM quando parado (usa 'keep_alive: 0s', carregando apenas por 1 segundo quando um script suspeito é detectado).\n\n"
-            "Iniciar instalação automática agora?",
+            "Ativar e Testar Mini-IA Local (Qwen 2.5 • 0.5B)",
+            "O Admin Bridge irá configurar e testar automaticamente o modelo ultraleve 'qwen2.5:0.5b' (~350 MB) no seu Ollama local.\n\n"
+            "• Você NÃO precisa selecionar o modelo na janela do Ollama (o download é feito direto via API local).\n"
+            "• Após o teste passar, esta opção desaparecerá do menu automaticamente.\n\n"
+            "Deseja iniciar o download e teste agora?",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
             QMessageBox.StandardButton.Yes
         )
         if ask != QMessageBox.StandardButton.Yes:
             return
-        try:
-            bat_path = BASE_DIR / "instalar_ia_local.bat"
-            if not bat_path.exists():
-                bat_path = Path(__file__).parent / "instalar_ia_local.bat"
-            if bat_path.exists():
-                subprocess.Popen(["cmd.exe", "/c", "start", "cmd.exe", "/c", str(bat_path)])
-            else:
-                subprocess.Popen([
-                    "powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command",
-                    "winget install --id Ollama.Ollama -e --accept-package-agreements --accept-source-agreements; "
-                    r"& '$env:LOCALAPPDATA\Programs\Ollama\ollama.exe' pull qwen2.5:0.5b; Read-Host 'Concluido! Pressione Enter para sair'"
-                ])
-        except Exception as e:
-            QMessageBox.warning(self, "Aviso", f"Não foi possível iniciar o instalador automático: {e}")
+
+        self.setWindowTitle("Admin Bridge • Baixando e Testando Mini-IA Local (Aguarde)...")
+        QApplication.processEvents()
+        ok_ai, msg_ai = pull_and_test_local_ai_with_ui(self)
+        self.setWindowTitle("Admin Bridge • Central de Gestão")
+
+        if ok_ai:
+            if hasattr(self, "act_install_ai"):
+                self.act_install_ai.setVisible(False)
+            QMessageBox.information(self, "Mini-IA Ativada e Testada!", msg_ai)
+        else:
+            QMessageBox.warning(self, "Aviso na Verificação da Mini-IA", msg_ai)
 
     def show_sync_test_dialog(self):
         try:
@@ -2629,7 +2801,13 @@ def run_daemon_loop(hotp_auth: HOTPAuth):
                 has_ticket = PREAUTH_TICKET_FILE.exists()
 
                 if not (is_rpc or has_otp or has_token or has_ticket):
-                    time.sleep(0.3)
+                    # Solicitação manual sem OTP/ticket: move para GUI_PENDING_DIR para que a GUI (mesmo sem Admin) exiba na tela!
+                    try:
+                        GUI_PENDING_DIR.mkdir(parents=True, exist_ok=True)
+                        target.rename(GUI_PENDING_DIR / target.name)
+                    except Exception:
+                        pass
+                    time.sleep(0.2)
                     continue
 
                 req_id = target.stem
@@ -2669,6 +2847,12 @@ def run_daemon_loop(hotp_auth: HOTPAuth):
                         elif rpc_action == "revoke_preauth":
                             ok_r, msg_r = hotp_auth.revoke_preauth_ticket()
                             rpc_resp = {"id": req_id, "ok": ok_r, "message": msg_r}
+                        elif rpc_action == "repair":
+                            ok_rep, msg_rep = hotp_auth.repair_corrupted_installation(pw_val or "")
+                            rpc_resp = {"id": req_id, "ok": ok_rep, "message": msg_rep}
+                        elif rpc_action == "verify_password":
+                            ok_vp, msg_vp = hotp_auth.verify_quit_password(pw_val or "")
+                            rpc_resp = {"id": req_id, "ok": ok_vp, "message": msg_vp}
                         elif rpc_action == "uninstall_unlock":
                             ok_u, msg_u = hotp_auth.authorize_and_prepare_uninstall(pw_val or "", caller_rpc)
                             rpc_resp = {"id": req_id, "ok": ok_u, "message": msg_u}
@@ -2752,7 +2936,9 @@ def run_daemon_loop(hotp_auth: HOTPAuth):
                     data["preauth_token"] = None
                     data["preauth_token_dpapi"] = None
                     try:
-                        with open(target, "w", encoding="utf-8") as f:
+                        GUI_PENDING_DIR.mkdir(parents=True, exist_ok=True)
+                        gui_target = GUI_PENDING_DIR / f"{req_id}.json"
+                        with open(gui_target, "w", encoding="utf-8") as f:
                             json.dump(data, f, indent=2, ensure_ascii=False)
                         proc_file.unlink(missing_ok=True)
                     except Exception:
@@ -3045,6 +3231,18 @@ def run_cli_client(args, hotp_auth: HOTPAuth):
             sys.exit(0)
         else:
             print("[ERRO]: Falha ao concluir desinstalação.", file=sys.stderr)
+            sys.exit(1)
+
+    elif args.subcommand == "repair":
+        pw = getattr(args, "password", None) or ""
+        ok_rep, msg_rep = hotp_auth.repair_corrupted_installation(pw)
+        if ok_rep:
+            register_scheduled_task()
+            apply_isolated_bridge_ntfs_acls(BASE_DIR)
+            print(f"[SUCESSO] {msg_rep}")
+            sys.exit(0)
+        else:
+            print(f"[ERRO] {msg_rep}", file=sys.stderr)
             sys.exit(1)
 
     elif args.subcommand == "harden":
@@ -3352,6 +3550,10 @@ def main():
     p_reset = subparsers.add_parser("reset", help="Executa revogação de privilégios e reset da chave")
     p_reset.add_argument("--password", help="Palavra-passe de recuperação")
     p_reset.add_argument("--challenge", help="Código de presença física")
+
+    # Comando repair
+    p_repair = subparsers.add_parser("repair", help="Revalida e re-ancora a instalação com a Senha de Recuperação")
+    p_repair.add_argument("--password", required=True, help="Palavra-passe de recuperação do proprietário")
 
     # Comando harden
     subparsers.add_parser("harden", help="Aplica blindagem estrita de permissões NTFS na pasta config e arquivos")

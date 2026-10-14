@@ -154,7 +154,6 @@ def _try_local_slm_explanation(code_text: str, findings: List[dict], timeout_sec
             "model": "qwen2.5:0.5b",
             "prompt": prompt,
             "stream": False,
-            "keep_alive": "0s",
             "options": {"num_predict": 120, "temperature": 0.1}
         }).encode("utf-8")
         req = urllib.request.Request(

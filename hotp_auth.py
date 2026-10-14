@@ -26,6 +26,7 @@ from hotp_crypto import (
     create_detached_signature_file,
     create_owner_anchor,
     clear_external_system_vault,
+    clear_integrity_caches,
     dpapi_protect,
     KernelFileGuard,
     protect_transit_token,
@@ -213,17 +214,18 @@ class HOTPAuth:
             json.dump(config_data, f, indent=2, ensure_ascii=False)
         tmp_file.replace(self.config_file)
 
-        # 4. Gera assinatura digital desanexada imediatamente em sincronia
-        create_detached_signature_file(self.config_file, config_data)
-
-        # 5. Restaura atributo somente-leitura para dificultar edições acidentais
+        # 4. Restaura atributo somente-leitura antes de capturar o USN final
         if hasattr(ctypes, "windll"):
             try:
                 ctypes.windll.kernel32.SetFileAttributesW(str(self.config_file), 0x01)
             except Exception:
                 pass
 
-        # 6. Atualiza o snapshot público para o Dashboard
+        # 5. Gera assinatura digital desanexada imediatamente em sincronia com o USN definitivo
+        create_detached_signature_file(self.config_file, config_data)
+
+        # 6. Limpa caches reativos para refletir o novo estado imediatamente e atualiza snapshot público
+        clear_integrity_caches()
         self._update_public_status(config_data)
 
     def _update_public_status(self, cfg: dict):
@@ -252,10 +254,49 @@ class HOTPAuth:
             except Exception:
                 pass
 
+        tampered = bool(cfg.get("tampered", False))
+        if tampered:
+            status_text = "Bloqueado por adulteração"
+
+        recent_hist = []
+        if AUTH_LOG_FILE.exists():
+            try:
+                with open(AUTH_LOG_FILE, "r", encoding="utf-8", errors="replace") as lf:
+                    lines = lf.readlines()
+                for line in reversed(lines[-40:]):
+                    line = line.strip()
+                    if not line.startswith("["):
+                        continue
+                    parts = line.split("] [")
+                    if len(parts) >= 2:
+                        ts_raw = parts[0].lstrip("[")
+                        st_part = parts[1].split("]")[0]
+                        rest = line[line.find("Action: "):]
+                        act, otp_m, det = "Comando", "******", ""
+                        for tok in rest.split(" | "):
+                            if tok.startswith("Action:"):
+                                act = tok.split(":", 1)[1].strip()
+                            elif tok.startswith("OTP:"):
+                                r_otp = tok.split(":", 1)[1].strip()
+                                otp_m = (r_otp[:2] + "****") if len(r_otp) >= 2 else "******"
+                            elif tok.startswith("Details:"):
+                                det = tok.split(":", 1)[1].strip()
+                        recent_hist.append({
+                            "datetime": ts_raw[:19],
+                            "command": f"{act}: {det}" if det else act,
+                            "status": "Aprovado" if st_part == "SUCCESS" else "Rejeitado",
+                            "otp": otp_m
+                        })
+                        if len(recent_hist) >= 30:
+                            break
+            except Exception:
+                pass
+
         status_payload = {
             "counter": cfg.get("counter", 0),
             "provisioned_flag": cfg.get("provisioned_flag", 0),
-            "lockdown": lockdown,
+            "lockdown": lockdown or tampered,
+            "tampered": tampered,
             "recent_failures": len(failures),
             "max_failures": FAIL_SAFE_MAX_FAILURES,
             "status_text": status_text,
@@ -263,7 +304,8 @@ class HOTPAuth:
             "auth_expires_in": auth_expires_in,
             "last_used_at": cfg.get("last_used_at"),
             "created_at": cfg.get("created_at"),
-            "updated_at": datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S")
+            "updated_at": datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S"),
+            "recent_history": recent_hist
         }
 
         try:
@@ -397,6 +439,7 @@ class HOTPAuth:
                     except Exception:
                         cfg = {}
                     cfg["lockdown"] = True
+                    cfg["tampered"] = ("adultera" in reason.lower() or "viola" in reason.lower() or "forense" in reason.lower())
                     cfg["lockdown_reason"] = reason
                     self._save_config_raw(cfg)
                 else:
@@ -453,7 +496,7 @@ class HOTPAuth:
                 logging.warning(f"Falha ao renovar ciclo de 14 dias: {e}")
                 return False
 
-    def provision(self, recovery_password: str, force: bool = False, caller_info: Optional[dict] = None) -> dict:
+    def provision(self, recovery_password: str, force: bool = False, caller_info: Optional[dict] = None, defer_acls: bool = False) -> dict:
         """Gera a chave secreta inicial em memória, aplica ACL NTFS ANTES de gravar, protege com DPAPI e trava flag=1."""
         with AtomicLock():
             cfg = {}
@@ -483,12 +526,10 @@ class HOTPAuth:
             if not recovery_password or len(recovery_password) < 8:
                 raise ValueError("A palavra-passe de recuperação deve conter pelo menos 8 caracteres.")
 
-            # 0. Blindagem NTFS prévia ANTES de gravar qualquer segredo no disco (elimina Race Condition TOCTOU)
+            # 0. Prepara diretório e salt de hardware (aplica ACLs completas ao final, sem duplicar 30 subprocessos!)
             try:
                 self.config_dir.mkdir(parents=True, exist_ok=True)
                 ensure_hw_salt(self.config_dir)
-                base_root = self.config_dir.parent if self.config_dir.name == "config" else self.config_dir
-                apply_isolated_bridge_ntfs_acls(base_root)
             except Exception:
                 pass
 
@@ -537,11 +578,11 @@ class HOTPAuth:
             }
             self._save_config_raw(new_config)
 
-            try:
-                base_root = self.config_dir.parent if self.config_dir.name == "config" else self.config_dir
-                apply_isolated_bridge_ntfs_acls(base_root)
-            except Exception:
-                pass
+            if not defer_acls:
+                try:
+                    apply_isolated_bridge_ntfs_acls(self.config_dir.parent)
+                except Exception:
+                    pass
 
             self._log_audit(
                 "PROVISION",
@@ -623,24 +664,80 @@ class HOTPAuth:
                 del secret_ba
                 gc.collect()
 
+    def verify_quit_password(self, password: str) -> Tuple[bool, str]:
+        """Valida a Palavra-passe de Recuperação antes de permitir encerrar a Central de Gestão."""
+        if not password or len(str(password).strip()) < 8:
+            return False, "Digite sua Palavra-passe de Recuperação (mínimo 8 caracteres) para encerrar o utilitário."
+        pw = str(password).strip()
+
+        if self._is_daemon_alive_other_process():
+            rpc_res = self._delegate_rpc_to_daemon("verify_password", {"password": pw}, timeout=8.0)
+            if rpc_res is not None:
+                return bool(rpc_res.get("ok")), str(rpc_res.get("message", ""))
+
+        anchor_file = self.config_dir / "owner_anchor.json"
+        try:
+            if anchor_file.exists():
+                if verify_owner_password(pw, anchor_file, self.config_dir):
+                    return True, "Senha validada com sucesso."
+                return False, "Palavra-passe de Recuperação incorreta."
+            if self.config_file.exists():
+                with open(self.config_file, "r", encoding="utf-8") as f:
+                    cfg = json.load(f)
+                salt_b64 = cfg.get("recovery_salt")
+                hash_dpapi_b64 = cfg.get("recovery_hash_dpapi")
+                if salt_b64 and hash_dpapi_b64:
+                    expected_hash_ba = self._unprotect_secret(base64.b64decode(hash_dpapi_b64))
+                    expected_hash = bytes(expected_hash_ba).decode("ascii")
+                    wipe_buffer(expected_hash_ba)
+                    if verify_recovery_password(pw, expected_hash, salt_b64):
+                        return True, "Senha validada com sucesso."
+                return False, "Palavra-passe de Recuperação incorreta."
+        except PermissionError:
+            rpc_res = self._delegate_rpc_to_daemon("verify_password", {"password": pw}, timeout=8.0)
+            if rpc_res is not None:
+                return bool(rpc_res.get("ok")), str(rpc_res.get("message", ""))
+            return False, "Sem permissão para ler o cofre e o serviço SYSTEM não respondeu."
+        except Exception as e:
+            return False, f"Erro ao validar senha: {e}"
+        return True, "Utilitário ainda não provisionado."
+
     def repair_corrupted_installation(self, recovery_password: str) -> Tuple[bool, str]:
-        """Restaura pastas e arquivos após detecção de adulteração exigindo estritamente a palavra-passe do proprietário."""
-        if not recovery_password or len(recovery_password) < 8:
+        """Restaura e re-ancora a instalação após detecção de adulteração exigindo a Senha Mestra do proprietário.
+        Quando a Senha Mestra é validada, re-assina o hotp_config.json, atualiza o .sig (com USN atual e hash do .exe),
+        recria o owner_anchor.json, sincroniza o cofre externo SYSTEM e limpa os caches em memória!
+        """
+        if not recovery_password or len(str(recovery_password).strip()) < 8:
             return False, "A palavra-passe deve conter pelo menos 8 caracteres."
+        pw = str(recovery_password).strip()
+
+        # Se o daemon SYSTEM estiver ativo em outro processo, delega o reparo a ele para evitar conflito de lock
+        if self._is_daemon_alive_other_process():
+            rpc_res = self._delegate_rpc_to_daemon("repair", {"password": pw}, timeout=12.0)
+            if rpc_res is not None:
+                clear_integrity_caches()
+                return bool(rpc_res.get("ok")), str(rpc_res.get("message", ""))
 
         with AtomicLock():
             raw_data = None
             password_verified = False
+            anchor_file = self.config_dir / "owner_anchor.json"
 
             # 1. Valida contra owner_anchor.json se presente
-            anchor_file = self.config_dir / "owner_anchor.json"
             if anchor_file.exists():
-                if verify_owner_password(recovery_password, anchor_file, self.config_dir):
-                    password_verified = True
-                else:
-                    return False, "Palavra-passe de recuperacao incorreta. Apenas o proprietario pode reparar o sistema."
+                try:
+                    if verify_owner_password(pw, anchor_file, self.config_dir):
+                        password_verified = True
+                    else:
+                        return False, "Palavra-passe de recuperacao incorreta. Apenas o proprietario pode reparar o sistema."
+                except PermissionError:
+                    rpc_res = self._delegate_rpc_to_daemon("repair", {"password": pw}, timeout=12.0)
+                    if rpc_res is not None:
+                        clear_integrity_caches()
+                        return bool(rpc_res.get("ok")), str(rpc_res.get("message", ""))
+                    raise
 
-            # 2. Valida contra o hash PBKDF2 protegido por DPAPI no hotp_config.json
+            # 2. Carrega hotp_config.json e valida contra o hash PBKDF2 protegido por DPAPI
             if self.config_file.exists():
                 try:
                     with open(self.config_file, "r", encoding="utf-8") as f:
@@ -648,41 +745,71 @@ class HOTPAuth:
                     salt_b64 = raw_data.get("recovery_salt")
                     hash_dpapi_b64 = raw_data.get("recovery_hash_dpapi")
                     if salt_b64 and hash_dpapi_b64:
-                        hash_raw = base64.b64decode(hash_dpapi_b64)
-                        expected_hash_ba = self._unprotect_secret(hash_raw)
-                        expected_hash = bytes(expected_hash_ba).decode("ascii")
-                        wipe_buffer(expected_hash_ba)
-                        if not verify_recovery_password(recovery_password, expected_hash, salt_b64):
-                            return False, "Palavra-passe de recuperacao incorreta. Apenas o proprietario pode reparar o sistema."
-                        password_verified = True
+                        try:
+                            hash_raw = base64.b64decode(hash_dpapi_b64)
+                            expected_hash_ba = self._unprotect_secret(hash_raw)
+                            expected_hash = bytes(expected_hash_ba).decode("ascii")
+                            wipe_buffer(expected_hash_ba)
+                            if not verify_recovery_password(pw, expected_hash, salt_b64):
+                                return False, "Palavra-passe de recuperacao incorreta. Apenas o proprietario pode reparar o sistema."
+                            password_verified = True
+                        except Exception:
+                            # Se hw_salt.bin foi alterado/recriado mas owner_anchor.json já validou a Senha Mestra (scrypt), prossegue!
+                            if not password_verified:
+                                return False, "Palavra-passe de recuperacao incorreta ou cofre ilegivel."
+                except PermissionError:
+                    rpc_res = self._delegate_rpc_to_daemon("repair", {"password": pw}, timeout=12.0)
+                    if rpc_res is not None:
+                        clear_integrity_caches()
+                        return bool(rpc_res.get("ok")), str(rpc_res.get("message", ""))
+                    return False, "Permissao de Administrador necessaria para reparar a instalacao."
                 except Exception:
                     if not password_verified:
                         return False, "Nao foi possivel validar a palavra-passe de recuperacao."
 
-            # Se os dados internos do hotp_config.json forem autênticos, re-ancora a assinatura
-            if raw_data and isinstance(raw_data, dict):
-                mac_b64 = raw_data.get("integrity_mac")
-                if mac_b64:
-                    try:
-                        raw_mac = base64.b64decode(mac_b64)
-                        expected_digest_ba = dpapi_unprotect(raw_mac, entropy=DPAPI_MAC_ENTROPY)
-                        expected_digest = bytes(expected_digest_ba)
-                        wipe_buffer(expected_digest_ba)
-                        test_cfg = dict(raw_data)
-                        test_cfg["lockdown"] = False
-                        actual_digest = hashlib.sha256(_canonical_payload(test_cfg)).digest()
-                        if hmac.compare_digest(actual_digest, expected_digest):
-                            raw_data["lockdown"] = False
-                            raw_data["failures"] = []
-                            create_owner_anchor(recovery_password, self.config_dir, anchor_path=anchor_file)
-                            self._save_config_raw(raw_data)
-                            self._log_audit("REPAIR_SUCCESS", raw_data.get("counter", 0), raw_data.get("counter", 0), True, "Assinatura digital e integridade re-ancoradas com sucesso pelo proprietario.")
-                            return True, "Integridade revalidada com sucesso pelo proprietario. Configuracao e sincronia mantidas intactas."
-                    except Exception:
-                        pass
+            if not password_verified and (self.config_file.exists() or anchor_file.exists()):
+                return False, "Palavra-passe de recuperacao incorreta."
 
-            # Caso esteja corrompido, limpa os arquivos para permitir novo provisionamento seguro
+            # 3. Se o arquivo de configuração possui a chave secreta, re-ancora TUDO com a autorização do proprietário!
+            if raw_data and isinstance(raw_data, dict) and raw_data.get("secret_dpapi"):
+                try:
+                    ensure_hw_salt(self.config_dir)
+                    # Verifica se secret_dpapi pode ser lido; se hw_salt mudou, migra para o salt atual
+                    sec_raw = base64.b64decode(raw_data["secret_dpapi"])
+                    sec_ba = self._unprotect_secret(sec_raw)
+                    new_sec_enc = self._protect_secret(bytes(sec_ba))
+                    wipe_buffer(sec_ba)
+                    raw_data["secret_dpapi"] = base64.b64encode(new_sec_enc).decode("ascii")
+
+                    pw_hash_b64, new_salt_b64 = hash_recovery_password(pw)
+                    new_pw_dpapi = self._protect_secret(pw_hash_b64.encode("ascii"))
+                    raw_data["recovery_hash_dpapi"] = base64.b64encode(new_pw_dpapi).decode("ascii")
+                    raw_data["recovery_salt"] = new_salt_b64
+
+                    raw_data["lockdown"] = False
+                    raw_data["tampered"] = False
+                    raw_data.pop("lockdown_reason", None)
+                    raw_data["failures"] = []
+                    raw_data["last_owner_password_verified_at"] = time.time()
+
+                    create_owner_anchor(pw, self.config_dir, anchor_path=anchor_file)
+                    self._save_config_raw(raw_data)
+                    clear_integrity_caches()
+                    self._log_audit(
+                        "REPAIR_SUCCESS",
+                        raw_data.get("counter", 0),
+                        raw_data.get("counter", 0),
+                        True,
+                        "Assinatura digital, USN, hw_salt e ancora Ed25519 re-ancorados com sucesso pelo proprietario."
+                    )
+                    return True, "Integridade revalidada e re-ancorada com sucesso! O estado 'Ativo' foi restaurado mantendo seu celular pareado."
+                except Exception as e:
+                    logging.warning(f"Aviso ao tentar preservar segredo durante reparo ({e}), limpando para novo pareamento.")
+
+            # 4. Caso o JSON esteja truncado/irrecuperável, destrava os handles e limpa para novo pareamento
             try:
+                KernelFileGuard.release_all_locks()
+                clear_external_system_vault()
                 for f in [self.config_file, self.config_file.with_name(self.config_file.name + ".sig"), anchor_file, self.ticket_file, STATUS_FILE]:
                     if f.exists():
                         if hasattr(ctypes, "windll"):
@@ -699,10 +826,9 @@ class HOTPAuth:
                 QUEUE_DIR.mkdir(parents=True, exist_ok=True)
                 LOGS_DIR.mkdir(parents=True, exist_ok=True)
                 (BASE_DIR / "scripts").mkdir(parents=True, exist_ok=True)
-
-                clear_external_system_vault()
-                self._log_audit("REPAIR_SUCCESS", 0, 0, True, "Reparo do sistema executado pelo proprietario com sucesso.")
-                return True, "Estrutura do sistema reparada com sucesso. Pronto para reinicializacao."
+                clear_integrity_caches()
+                self._log_audit("REPAIR_SUCCESS", 0, 0, True, "Reparo de estrutura executado pelo proprietario com sucesso.")
+                return True, "Estrutura do sistema reparada com sucesso. Pronto para configurar nova chave."
             except Exception as e:
                 return False, f"Falha ao executar reparo de pastas: {e}"
 
@@ -927,8 +1053,7 @@ class HOTPAuth:
             # SENHA VALIDADA: Destrava todos os handles de kernel, limpa cofre externo e restaura ACLs
             KernelFileGuard.release_all_locks()
             clear_external_system_vault()
-            base_root = self.config_dir.parent if self.config_dir.name == "config" else self.config_dir
-            restore_ntfs_acls_for_removal(base_root)
+            restore_ntfs_acls_for_removal(self.config_dir.parent)
 
             for f in (self.config_file, self.config_file.with_name(self.config_file.name + ".sig"), anchor_file, self.ticket_file):
                 if f.exists() and hasattr(ctypes, "windll"):

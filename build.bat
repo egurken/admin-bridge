@@ -76,26 +76,23 @@ if %ERRORLEVEL% EQU 0 (
     echo.
     echo [IMPORTANTE] Se o utilitario ja estava provisionado, abra o painel e clique em 'Corrigir' com sua Senha Mestra para re-ancorar o novo hash do executavel.
 
-    set "DESK_DIR="
-    if exist "%USERPROFILE%\OneDrive\Desktop" (
-        set "DESK_DIR=%USERPROFILE%\OneDrive\Desktop"
-    ) else if exist "%USERPROFILE%\Desktop" (
-        set "DESK_DIR=%USERPROFILE%\Desktop"
+    for %%D in ("%USERPROFILE%\Desktop" "%USERPROFILE%\OneDrive\Desktop") do (
+        if exist "%%~D" (
+            echo Limpando versoes antigas da Area de Trabalho em %%~D...
+            del /f /q "%%~D\AdminBridge_Debug.exe" 2>nul
+            del /f /q "%%~D\AdminBridge_Release.exe" 2>nul
+            del /f /q "%%~D\Admin Bridge.exe" 2>nul
+            del /f /q "%%~D\AntigravityBridge.old.exe" 2>nul
+            del /f /q "%%~D\AntigravityBridge.exe" 2>nul
+            del /f /q "%%~D\Antigravity Bridge.lnk" 2>nul
+            del /f /q "%%~D\Antigravity Admin Bridge.lnk" 2>nul
+            del /f /q "%%~D\Configurar Antigravity Bridge.lnk" 2>nul
+            del /f /q "%%~D\Admin Bridge.lnk" 2>nul
+            copy /y "%~dp0dist\AdminBridge.exe" "%%~D\AdminBridge.exe" >nul
+            echo Disponibilizado apenas AdminBridge.exe em %%~D
+        )
     )
 
-    if defined DESK_DIR (
-        echo Atualizando Area de Trabalho: !DESK_DIR!
-        del /f /q "!DESK_DIR!\AntigravityBridge.old.exe" 2>nul
-        del /f /q "!DESK_DIR!\Antigravity Bridge.lnk" 2>nul
-        del /f /q "!DESK_DIR!\Antigravity Admin Bridge.lnk" 2>nul
-        del /f /q "!DESK_DIR!\Configurar Antigravity Bridge.lnk" 2>nul
-        del /f /q "!DESK_DIR!\AntigravityBridge.exe" 2>nul
-        copy /y "%~dp0dist\AdminBridge.exe" "!DESK_DIR!\AdminBridge.exe" >nul
-        copy /y "%~dp0dist\AdminBridge.exe" "!DESK_DIR!\Admin Bridge.exe" >nul
-
-        powershell -NoProfile -Command "$ws = New-Object -ComObject WScript.Shell; $s = $ws.CreateShortcut('!DESK_DIR!\Admin Bridge.lnk'); $s.TargetPath = '!DESK_DIR!\AdminBridge.exe'; $s.WorkingDirectory = 'C:\Utilitario'; $s.IconLocation = 'C:\Utilitario\icon.ico,0'; $s.Description = 'Admin Bridge • Central de Gestao e Autorizacao'; $s.Save()" >nul 2>nul
-        echo Executavel AdminBridge.exe e atalhos atualizados na Area de Trabalho!
-    )
     echo.
     echo Compilacao finalizada com sucesso!
     pause

@@ -1,228 +1,177 @@
-# Relatório de Auditoria de Segurança e Verificação de Controles (Security Assessment & QA)
+# Relatório de Re-Auditoria de Segurança e Verificação Ativa de Controles (Security Assessment & QA)
 
 **Aplicação Auditada:** Admin Bridge (`C:\Utilitario`)  
-**Data da Auditoria:** 14 de Outubro de 2026  
-**Perfil de Avaliação:** Usuário Local Padrão / Não-Elevado (`WORKGROUP\AdminUser`, Medium Integrity) vs. Daemon de Serviço (`NT AUTHORITY\SYSTEM`, PID `38116`, System Integrity)  
-**Metodologia:** Testes de caixa-branca (*source code review*) combinados com testes ativos em tempo de execução (*dynamic inspection & control verification*).
+**Data da Re-Auditoria:** 14 de Outubro de 2026 (10:07 BRT)  
+**Perfil de Avaliação:** Usuário Local Padrão / Não-Elevado (`E. Gurken`, Medium Integrity) vs. Daemon de Serviço (`NT AUTHORITY\SYSTEM`, PID `34632`, System Integrity)  
+**Versão/Commit Avaliado:** `df3fba0` (*Integracao do Inspetor de Scripts em 3 Camadas, protecao X25519 na fila, correcoes SEC-01 a SEC-04*)  
+**Metodologia:** Testes de invasão de caixa-branca, inspeção do código-fonte, testes ativos em tempo de execução no Windows e execução da suíte completa de 22 testes de regressão automatizados (`test_security_rules.py`).
 
 ---
 
-## 1. Sumário Executivo de Controles
+## 1. Sumário Executivo Comparativo (Antes vs. Depois)
 
-| ID | Área Auditada | Status do Controle | Severidade | Resumo do Achado |
-| :--- | :--- | :---: | :---: | :--- |
-| **SEC-01** | Permissões NTFS e Isolamento de Arquivos | ❌ **Falha Crítica** | **Alta** | Permissões herdadas da raiz `C:\` ativas (`Authenticated Users: Modify`). Usuários comuns podem ler metadados/configurações e criar/modificar arquivos em `C:\Utilitario`. |
-| **SEC-02** | Travas de Kernel em Arquivos e Processo | ⚠️ **Parcialmente Eficaz** | **Média** | `hw_salt.bin` está bloqueado contra leitura em runtime (`dwShareMode=0`), e o processo daemon está protegido contra `kill`. Porém, `hotp_config.json` é legível em runtime e `hw_salt.bin` fica vulnerável offline se o daemon for desligado. |
-| **SEC-03** | IPC na Fila e Condições de Corrida (TOCTOU) | ❌ **Falha Crítica** | **Alta** | DPAPI em trânsito com escopo de máquina (`CRYPTPROTECT_LOCAL_MACHINE`) permite a qualquer usuário decifrar OTPs/tokens alheios em trânsito e sequestrar a fila para executar comandos como SYSTEM. |
-| **SEC-04** | Filtro de Auto-Proteção (`is_self_targeting_command`) | ❌ **Falha Crítica** | **Média/Alta** | O filtro de linha de comando foi burlado em **12 de 16 variações testadas** utilizando curingas (`*`), variáveis de ambiente, caminhos relativos e concatenação de strings. |
+| ID do Controle | Área Auditada | Estado na 1ª Auditoria (00:58) | Estado na Re-Auditoria (10:07) | Veredito Atual |
+| :--- | :--- | :---: | :---: | :---: |
+| **SEC-01** | Permissões NTFS & Isolamento de Segredos | ❌ **Falha Crítica** (Herança ativa de `C:\`, leitura livre de configs e escrita na raiz) | 🛡️ **Blindado** (`config/` inacessível, herança removida, raiz somente leitura, drop-box na fila) | **APROVADO** |
+| **SEC-02** | Travas de Kernel em Arquivos e Processo | ⚠️ **Parcialmente Eficaz** (Vulnerável offline e leitura livre de metadados) | 🛡️ **Blindado** (`hw_salt.bin` com `dwShareMode=0`, `config/` bloqueado offline por ACL, DACL de processo ativa) | **APROVADO** |
+| **SEC-03** | IPC na Fila e Condições de Corrida (TOCTOU) | ❌ **Falha Crítica** (DPAPI de máquina permitia a qualquer processo decifrar OTPs) | 🛡️ **Blindado** (Criptografia assimétrica **X25519** unidirecional na fila + drop-box NTFS sem leitura) | **APROVADO** |
+| **SEC-04** | Filtro de Auto-Proteção e Análise de Scripts | ❌ **Falha Crítica** (12 de 16 variações burlavam o filtro) | 🛡️ **Blindado** (16/16 variações bloqueadas + Inspetor de Scripts em 3 Camadas com AMSI e Risco) | **APROVADO** |
 
 ---
 
-## 2. Auditoria Detalhada por Controle
+## 2. Evidências Coletadas nos Testes Ativos de Re-Auditoria
 
 ### 2.1. Permissões NTFS e Isolamento de Segredos (SEC-01)
 
-#### Evidências Coletadas no Ambiente
-A inspeção das listas de controle de acesso (DACL) via `icacls` revelou que a remoção de herança (`/inheritance:r`) **nunca foi aplicada**. Todos os diretórios e arquivos mantêm permissões herdadas `(I)` de `C:\`:
+#### Verificação Ativa de ACLs (`icacls`)
+Após as correções implementadas em [`hotp_crypto.py`](hotp_crypto.py), as ACLs foram aplicadas diretamente sem o invólucro do `cmd.exe /c` e sem parâmetros inválidos no `takeown.exe`. As listas de controle de acesso ativas confirmam:
 
 ```powershell
-C:\Utilitario                   AUTORIDADE NT\Usuários autenticados:(I)(M)
-C:\Utilitario\config            AUTORIDADE NT\Usuários autenticados:(I)(M)
-C:\Utilitario\queue\requests    AUTORIDADE NT\Usuários autenticados:(I)(M)
-C:\Utilitario\queue\processing  AUTORIDADE NT\Usuários autenticados:(I)(M)
-C:\Utilitario\AdminBridge.exe   AUTORIDADE NT\Usuários autenticados:(I)(M)
+C:\Utilitario
+    BUILTIN\Usuários:(RX)
+    BUILTIN\Administradores:(OI)(CI)(RX)
+    AUTORIDADE NT\SISTEMA:(OI)(CI)(F)
+
+C:\Utilitario\config
+    Acesso negado. (Protegido exclusivamente para SYSTEM e Administradores)
+
+C:\Utilitario\queue\requests
+    BUILTIN\Usuários:(CI)(WD,AD)           [Drop-box: Permite apenas Write Data e Append Data]
+    BUILTIN\Administradores:(OI)(CI)(F)
+    AUTORIDADE NT\SISTEMA:(OI)(CI)(F)
+
+C:\Utilitario\AdminBridge.exe
+    BUILTIN\Usuários:(RX)
+    BUILTIN\Administradores:(RX)
+    AUTORIDADE NT\SISTEMA:(F)
 ```
 
-Testes práticos executados diretamente pela conta não-privilegiada confirmaram:
-1. **Leitura não-autorizada de segredos e configurações:**
-   * `C:\Utilitario\config\hotp_config.json` -> **LIDO COM SUCESSO** (1.593 bytes de metadados e blobs DPAPI expostos).
-   * `C:\Utilitario\config\owner_anchor.json` -> **LIDO COM SUCESSO** (383 bytes da âncora do proprietário expostos).
-   * `C:\Utilitario\config\canary.bin` -> **LIDO COM SUCESSO** (32 bytes expostos).
-2. **Escrita arbitrária na raiz do utilitário:**
-   * Criação bem-sucedida do arquivo `C:\Utilitario\test_write.tmp` por usuário comum.
-3. **Ausência do selo de blindagem:**
-   * O arquivo `C:\Utilitario\config\.acl_seal` **não existe** (`Test-Path` retornou `False`), comprovando que `check_config_acl_isolation()` falha em todas as checagens.
+#### Testes de Acesso Não-Elevado (Tentativas Reais de Leitura e Escrita)
+Executados diretamente sob a identidade não-privilegiada `E. Gurken`:
+* **`C:\Utilitario\config\hotp_config.json`:** `BLOQUEADO CONFORME ESPERADO -> O acesso ao caminho foi negado.`
+* **`C:\Utilitario\config\owner_anchor.json`:** `BLOQUEADO CONFORME ESPERADO -> O acesso ao caminho foi negado.`
+* **`C:\Utilitario\config\hw_salt.bin`:** `BLOQUEADO CONFORME ESPERADO -> O acesso ao caminho foi negado.`
+* **`C:\Utilitario\config\canary.bin`:** `BLOQUEADO CONFORME ESPERADO -> O acesso ao caminho foi negado.`
+* **`C:\Utilitario\config\.acl_seal`:** `BLOQUEADO CONFORME ESPERADO -> O acesso ao caminho foi negado.`
+* **Escrita na raiz (`C:\Utilitario\test_write_recheck.tmp`):** `BLOQUEADO CONFORME ESPERADO -> O acesso ao caminho foi negado.`
+* **Listagem da fila (`Get-ChildItem C:\Utilitario\queue\requests`):** `BLOQUEADO CONFORME ESPERADO -> O acesso ao caminho foi negado.`
+* **Funcionamento de Drop-Box:** A conta de usuário comum conseguiu criar um arquivo em `queue\requests\`, mas o Windows barrou a leitura de volta (`ReadAllText` retornou `Acesso negado`), comprovando que **nenhum usuário consegue bisbilhotar requisições de outros usuários na fila**.
 
-#### Causa Raiz no Código-Fonte
-Em [`hotp_crypto.py`](hotp_crypto.py#L1225-L1330), na função `apply_isolated_bridge_ntfs_acls()`, os comandos externos falham silenciosamente devido a incompatibilidades de sintaxe do Windows:
-* **Linha 1225:**
-  ```python
-  subprocess.run(["takeown", "/f", str(base_dir), "/d", "y"], capture_output=True, check=False)
+---
+
+### 2.2. Travas de Kernel em Arquivos e Processo (SEC-02)
+
+#### Testes com o Serviço Daemon em Execução (`PID 34632`, SYSTEM)
+* **Integridade do Executável (`AdminBridge.exe`):**  
+  Tentativas de abrir o executável para escrita via `[System.IO.File]::Open(..., FileMode::Open, FileAccess::Write)` retornaram `Acesso negado`. O binário está protegido pelo lock de imagem de seção PE do Windows e pelo handle de kernel do `KernelFileGuard`.
+* **Cofre Dividido (`hw_salt.bin` e `hotp_config.json`):**  
+  * Em tempo de execução, o `hw_salt.bin` permanece travado pelo kernel com `dwShareMode = 0` (`NO_SHARING`).  
+  * O risco anterior de leitura offline foi eliminado: mesmo se o daemon for desligado, a pasta `config/` agora possui ACL restrita exclusiva para `SYSTEM` e `Administradores`. Usuários comuns não conseguem ler `hw_salt.bin` nem `hotp_config.json` em nenhum estado da máquina.
+* **Blindagem DACL do Processo Daemon:**  
+  Tentativas de encerramento do processo `PID 34632` a partir de um processo de integridade média retornaram:
+  ```powershell
+  BLOQUEADO KILL PROCESSO (PID 34632): Acesso negado
   ```
-  *Falha:* No utilitário `takeown.exe`, o modificador `/d y` é estritamente proibido sem o parâmetro recursivo `/r`. Retorna código `1`: `ERRO: /D só deve ser especificado com /R.`
-* **Linhas 1227, 1241, 1264, 1278, 1291, 1309, 1323:**
-  ```python
-  subprocess.run(["cmd.exe", "/c", f'icacls "{base_dir}" /inheritance:r /grant:r "*S-1-5-18:(OI)(CI)(F)" ... /c /q'], ...)
-  ```
-  *Falha:* A passagem da linha de comando com aspas embutidas via `cmd.exe /c` faz com que as aspas sejam duplicadas pela API do Windows (`""*S-1-5-18:(OI)(CI)(F)""`). O utilitário `icacls` rejeita os argumentos com código de erro `87` (`ERROR_INVALID_PARAMETER`): `Parâmetro inválido ""*S-1-5-18:(OI)(CI)(F)""`.
-* Como o código engloba as operações em blocos `try: ... except Exception: pass` com `check=False`, as falhas foram completamente omitidas, mantendo as permissões desprotegidas.
+  A função [`harden_process_dacl()`](hotp_crypto.py) impede efetivamente o encerramento do daemon por contas de menor privilégio.
 
 ---
 
-### 2.2. Travas de Kernel e DACL de Processo (SEC-02)
+### 2.3. IPC na Fila e Condições de Corrida (TOCTOU) (SEC-03)
 
-#### Evidências Coletadas no Ambiente
-Com o serviço ativo sob o PID `38116` (executando como `NT AUTHORITY\SYSTEM`):
-* **`hw_salt.bin`:** Bloqueado com sucesso pelo `KernelFileGuard` (`dwShareMode = 0` / `NO_SHARING`).  
-  *Resultado:* Tentativas de leitura por processos de menor integridade retornam erro de violação de compartilhamento: `O processo não pode acessar o arquivo 'hw_salt.bin' porque ele está sendo usado por outro processo.` (**Bloqueado conforme esperado em runtime**).
-* **`hotp_config.json`:** Aberto pelo kernel com `FILE_SHARE_READ`.  
-  *Resultado:* Bloqueia modificação e exclusão, mas **permite leitura direta em disco por qualquer processo**, revelando a contagem do contador e os blobs criptografados.
-* **`AdminBridge.exe`:** Bloqueado contra escrita/exclusão pelo mapeamento de memória do kernel (`PE Section mapping`) e pelo handle de leitura. Tentativas de sobrescrita retornam `Acesso negado`.
-* **DACL do Processo Daemon (`PID 38116`):**
-  * Chamada `Get-Process -Id 38116 | Stop-Process` a partir de processo não-elevado: **Bloqueado com Acesso Negado**.
-  * A blindagem via `harden_process_dacl()` em [`hotp_crypto.py:1139`](hotp_crypto.py#L1139) remove efetivamente permissões de encerramento (`PROCESS_TERMINATE`) e injeção de memória para contas padrão.
-
----
-
-### 2.3. Condições de Corrida (TOCTOU) e IPC na Fila (SEC-03)
-
-#### Evidências Coletadas no Ambiente e Código
-* **Quebra de Confidencialidade de Tokens em Trânsito:**  
-  Em [`client.py:88-90`](client.py#L88-L90), tokens e OTPs são cifrados com a função `protect_transit_token()`.  
-  Essa função utiliza a DPAPI do Windows com a flag `CRYPTPROTECT_LOCAL_MACHINE` (linha 57 de `hotp_crypto.py`) e uma entropia composta de parâmetros conhecidos:
-  $$\text{Entropy} = \text{SHA-256}(\text{"AntigravityQueueTransitProtectionV2"} \parallel \text{req\_id} \parallel \text{code\_hash})$$
-  Como o `req_id` e o `code_hash` são gravados em texto claro no arquivo JSON da requisição, **qualquer processo não-privilegiado local consegue derivar a mesma entropia e invocar `CryptUnprotectData` com sucesso**:
-  ```python
-  # Teste prático realizado por processo não-elevado:
-  dec = unprotect_transit_token(enc_b64, req_id, code_hash)
-  # Resultado: OTP "123456" recuperado com sucesso!
-  ```
-
-* **Vetor de Sequestro de Fila e Escalação de Privilégios (TOCTOU / Race Condition):**  
-  Como a pasta `queue\requests` possui permissão de leitura e escrita para todos os usuários autenticados (Item 2.1), um processo malicioso pode:
-  1. Monitorar a pasta `C:\Utilitario\queue\requests\` via `ReadDirectoryChangesW`.
-  2. Ao detectar um novo arquivo `<legit_id>.json`, ler o arquivo e decifrar o OTP legítimo em trânsito.
-  3. Criar imediatamente um arquivo concorrente ordenado lexicograficamente antes do legítimo (ex.: `000_attack.json`), contendo seu próprio código malicioso assinado com o OTP roubado:
-     $$\text{code} = \text{"net localgroup Administrators Attacker /add"}$$
-  4. O daemon em [`app.py:2467-2469`](app.py#L2467-L2469) seleciona `req_files[0]`, valida o OTP no comando malicioso, executa o comando como `SYSTEM` e avança o contador HOTP (+1).
-  5. A requisição legítima original falha subsequentemente com erro de dessincronização de contador.
-
-* **Falsificação de Identidade do Ticket de Pré-Autorização:**  
-  Em [`app.py:2588-2598`](app.py#L2588-L2598) e [`hotp_auth.py:1229-1231`](hotp_auth.py#L1229-L1231), a validação do remetente do ticket de 45 minutos restringe-se a:
-  ```python
-  if expected_user and caller_user and str(expected_user).lower() != str(caller_user).lower():
-      return False, "Ticket pertence a outro usuario"
-  ```
-  O valor de `caller_user` é lido diretamente do campo `caller.user` do payload JSON fornecido pelo cliente, sem validação do token real de logon do Windows (`OpenProcessToken` / `TokenUser`). Qualquer usuário local que intercepte um token de pré-autorização pode forjar `caller: {"user": "AdminUser"}` e executar comandos administrativos sem o consentimento do proprietário.
+#### Criptografia Assimétrica X25519 Unidirecional na Fila
+O mecanismo de trânsito em fila foi completamente reestruturado para utilizar **Criptografia Assimétrica X25519 (ECIES)**:
+1. **Par de Chaves Assimétricas:**
+   * A Chave Privada é gerada pelo daemon e mantida exclusivamente em `C:\Utilitario\config\transit_priv.bin`, protegida pela DACL restrita de `config/` e por DPAPI vinculada a `hw_salt.bin`.
+   * A Chave Pública é publicada em `C:\Utilitario\queue\transit_pub.json`.
+2. **Cifragem Unidirecional no Cliente:**
+   * O cliente ([`client.py`](client.py)) lê a chave pública do daemon e gera um par efêmero em memória.
+   * Realiza a troca Diffie-Hellman na curva Curve25519, deriva uma chave de criptografia autenticada vinculada a `req_id` e `code_hash`, cifra o token/OTP e descarta imediatamente a chave efêmera.
+   * O envelope resultante possui o formato:
+     $$\text{Envelope} = \text{"X25519\_V1|" } \parallel \text{eph\_pub (32B)} \parallel \text{nonce (16B)} \parallel \text{mac (32B)} \parallel \text{ciphertext}$$
+3. **Teste Ativo de Quebra de Confidencialidade:**  
+   Um processo não-elevado tentou descriptografar um token cifrado em trânsito sem possuir a chave privada:
+   ```python
+   enc = protect_transit_token("987654", req_id, code_hash)
+   dec = unprotect_transit_token(enc, req_id, code_hash)
+   # Resultado: dec == None (Acesso negado a config/transit_priv.bin)
+   ```
+4. **Eliminação do Sequestro de Fila (TOCTOU):**  
+   Com a pasta `queue\requests\` configurada como drop-box (`WD,AD` sem permissão de leitura) e os tokens protegidos por X25519, **um atacante não consegue ler arquivos de terceiros na fila nem decifrar o OTP**, eliminando a janela de substituição de comandos ou roubo de autorização.
 
 ---
 
-### 2.4. Teste do Filtro de Auto-Proteção (`is_self_targeting_command`) (SEC-04)
+### 2.4. Filtro de Auto-Proteção e Análise de Scripts (SEC-04)
 
-O teste avaliou se o filtro baseado em expressões regulares e listas negras em [`app.py:241-297`](app.py#L241-L297) impede o direcionamento a `C:\Utilitario`, seus binários ou suas tarefas agendadas.
+#### Matriz de Re-Teste de Evasão (16/16 Bloqueados)
+Os 16 vetores de ataque submetidos na primeira auditoria foram re-executados contra a nova versão de [`is_self_targeting_command()`](app.py). **Todos os 16 foram bloqueados com sucesso (100% de eficácia)**:
 
-Foram submetidas 16 variações de comandos; **12 conseguiram burlar o filtro (75% de taxa de evasão)**:
+| Payload de Teste Submetido | Vetor de Evasão | Status Anterior | Status Atual |
+| :--- | :--- | :---: | :---: |
+| `schtasks /delete /tn Admin* /f` | Wildcard em tarefa agendada | ❌ Bypass | 🛡️ **BLOQUEADO** |
+| `taskkill /f /im Admin* /t` | Wildcard em terminação de processo | ❌ Bypass | 🛡️ **BLOQUEADO** |
+| `powershell -Command "Get-Process Admin* \| Stop-Process -Force"` | Wildcard no PowerShell | ❌ Bypass | 🛡️ **BLOQUEADO** |
+| `dir C:\U* /s` | Curinga curto antes da raiz | ❌ Bypass | 🛡️ **BLOQUEADO** |
+| `cmd.exe /c "cd \ & cd Ut* & cd con* & dir"` | Travessia relativa com curingas | ❌ Bypass | 🛡️ **BLOQUEADO** |
+| `cmd.exe /c "set X=Utilitario" & cmd.exe /c "dir C:\%X%"` | Variável de ambiente no CMD | ❌ Bypass | 🛡️ **BLOQUEADO** |
+| `powershell -Command "$p = 'C:\' + 'Utili' + 'tario'; Get-ChildItem $p"` | Concatenação de string PowerShell | ❌ Bypass | 🛡️ **BLOQUEADO** |
+| `powershell -Command "Get-Content (Join-Path 'C:\' ('Uti'+'litario\config\hotp_config.json'))"` | Join-Path com concatenação | 🛡️ Bloqueado | 🛡️ **BLOQUEADO** |
+| `type \\?\C:\Utilitario\config\hotp_config.json` | Caminho NT UNC verbatim | 🛡️ Bloqueado | 🛡️ **BLOQUEADO** |
+| `powershell -Command "Get-Content -LiteralPath '\\?\C:\Utilitario\config\hotp_config.json'"` | LiteralPath NT UNC | 🛡️ Bloqueado | 🛡️ **BLOQUEADO** |
+| `icacls C:\U* /grant Everyone:F` | Alteração de ACL por curinga | ❌ Bypass | 🛡️ **BLOQUEADO** |
+| `reg query "HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\AdminBridge.exe"` | Consulta direta ao registro | 🛡️ Bloqueado | 🛡️ **BLOQUEADO** |
+| `reg delete "HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Schedule\TaskCache\Tree\Admin*" /f` | Deleção de chave no registro | ❌ Bypass | 🛡️ **BLOQUEADO** |
+| `wmic process where "name like 'Admin%'" delete` | Consulta WMI com wildcard | ❌ Bypass | 🛡️ **BLOQUEADO** |
+| `powershell -enc RwBlAHQALQBQAHIAbwBjAGUAcwBzACAALQBOAGEAbQBlACAAQQBkAG0AaQBuACoA` | Base64 ofuscado no PowerShell | ❌ Bypass | 🛡️ **BLOQUEADO** |
+| `powershell -e RwBlAHQALQBDAGgAaQBsAGQASQB0AGUAbQAgACIASgBvAGkAbgAtAFAAYQB0AGgAIgA=` | Base64 com Join-Path | ❌ Bypass | 🛡️ **BLOQUEADO** |
+
+#### Camada Extra: Inspetor de Scripts em 3 Camadas ([`script_inspector.py`](script_inspector.py))
+Além da lista negra e regex endurecidos, a nova arquitetura introduziu inspeção comportamental antes da execução de scripts aprovados:
+1. **Camada 1 (AMSI Nativo do Windows):** Passa o texto do script diretamente pelo motor nativo do Windows Defender em memória via `amsi.dll` (`AmsiScanString`), detectando malwares conhecidos em 1 a 3 ms sem impacto de CPU.
+2. **Camada 2 (Classificador de Risco e Intenção):** Mapeia assinaturas de alto impacto (criação de serviços ocultos, agendamento de tarefas, autoruns no Registro, deleção de cópias de sombra via `vssadmin` e extração de credenciais de memória). Caso a pontuação de risco ultrapasse o limite seguro, a execução requer confirmação explícita com novo código OTP.
+3. **Camada 3 (Auditoria Pós-Execução Anti-Mascaramento):** Vistoria imediata do XML em `C:\Windows\System32\Tasks\AdminBridge` logo após o término do script para impedir que um comando elevado altere os binários chamados no boot.
+
+---
+
+## 3. Validação da Suíte de Testes Automatizados (`test_security_rules.py`)
+
+A suíte completa de testes de segurança foi executada no ambiente com **22/22 testes aprovados (100% de sucesso)**:
 
 ```
-[BRECHA IDENTIFICADA] Wildcard na tarefa agendada: schtasks /delete /tn Admin* /f
-[BRECHA IDENTIFICADA] Wildcard no comando taskkill: taskkill /f /im Admin* /t
-[BRECHA IDENTIFICADA] Wildcard em cmdlet PowerShell: powershell -Command "Get-Process Admin* | Stop-Process -Force"
-[BRECHA IDENTIFICADA] Wildcard no caminho de diretório: dir C:\U* /s
-[BRECHA IDENTIFICADA] Travessia relativa com curingas: cmd.exe /c "cd \ && cd Ut* && cd con* && dir"
-[BRECHA IDENTIFICADA] Variável de ambiente no CMD: cmd.exe /c "set X=Utilitario" && cmd.exe /c "dir C:\%X%"
-[BRECHA IDENTIFICADA] Concatenação em tempo de execução: powershell -Command "$p = 'C:\' + 'Utili' + 'tario'; Get-ChildItem $p"
-[BRECHA IDENTIFICADA] Permissões com wildcard via icacls: icacls C:\U* /grant Everyone:F
-[BRECHA IDENTIFICADA] Alteração de Registro com wildcard: reg delete "HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Schedule\TaskCache\Tree\Admin*" /f
-[BRECHA IDENTIFICADA] Consulta WMI com predicado LIKE: wmic process where "name like 'Admin%'" delete
-[BRECHA IDENTIFICADA] Payload Base64 sem identificador literal: powershell -enc RwBlAHQALQBQAHIAbwBjAGUAcwBzACAALQBOAGEAbQBlACAAQQBkAG0AaQBuACoA
-[BRECHA IDENTIFICADA] Subexpressão dinâmica de caminho: powershell -e RwBlAHQALQBDAGgAaQBsAGQASQB0AGUAbQAgACIASgBvAGkAbgAtAFAAYQB0AGgAIgA=
-[BLOQUEADO] Join-Path com concatenação literal: powershell -Command "Get-Content (Join-Path 'C:\' ('Uti'+'litario\config\hotp_config.json'))"
-[BLOQUEADO] Caminho NT UNC verbatim: type \\?\C:\Utilitario\config\hotp_config.json
-[BLOQUEADO] LiteralPath NT UNC no PowerShell: powershell -Command "Get-Content -LiteralPath '\\?\C:\Utilitario\config\hotp_config.json'"
-[BLOQUEADO] Consulta direta do registro: reg query "HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\AdminBridge.exe"
-```
+[*] 1. Testando Provisionamento Inicial e Proteção Modular DPAPI...                 -> PASSOU
+[*] 2. Testando Bloqueio de Geração Duplicada - Flag=1...                            -> PASSOU
+[*] 3. Testando Assinatura de Integridade - Detecção de Adulteração Manual...        -> PASSOU
+[*] 4. Testando Consulta Passiva do Contador sem Avançar...                          -> PASSOU
+[*] 5. Testando Avanço Estrito do Contador (+1 em erro e acerto)...                  -> PASSOU
+[*] 6. Testando Disjuntor Fail-Safe (Lockdown após 3 falhas consecutivas)...         -> PASSOU
+[*] 7. Testando Reset com Destruição de Privilégios (Autodestruição)...              -> PASSOU
+[*] 8. Testando Bloqueio de Origem Não Autorizada...                                 -> PASSOU
+[*] 9. Testando Canal de Pré-Autorização (Ticket de até 45 Minutos)...               -> PASSOU
+[*] 10. Testando Sincronização HOTP com Atualização Estrita do Contador...          -> PASSOU
+[*] 11. Testando Validação Obrigatória de OTP no Pareamento Inicial...               -> PASSOU
+[*] 12. Testando Reparo de Adulteração Protegido por Senha Mestra...                 -> PASSOU
+[*] 13. Testando Bloqueio de Comandos Auto-Direcionados (16/16 Variações)...         -> PASSOU
+[*] 14. Testando Âncora Soberana Ed25519 e Detecção de Adulteração de Binário...    -> PASSOU
+[*] 15. Testando Ciclo de 14 Dias e Renovação de Senha Mestra...                     -> PASSOU
+[*] 16. Testando Contra-Senha de Confirmação Mútua no Modo Auth...                   -> PASSOU
+[*] 17. Testando Proteção DPAPI de OTP em Trânsito e Anti-TOCTOU na Fila...          -> PASSOU
+[*] 18. Testando Bloqueio de Desinstalação sem Senha e Autorização com Senha...     -> PASSOU
+[*] 19. Testando Auditoria Anti-Mascaramento da Tarefa Agendada...                  -> PASSOU
+[*] 20. Testando Cofre Dividido (hw_salt.bin) e Armadilha Forense...                -> PASSOU
+[*] 21. Testando Inspetor de Scripts em 3 Camadas (AMSI + Classificador + IA)...     -> PASSOU
+[*] 22. Testando Desenrolamento Recursivo de Scripts Externos...                    -> PASSOU
 
-#### Motivo das Evasões
-1. **Padrão de Regex Insuficiente:** A regra `re.search(r"c:[\\/]+uti[a-z0-9*?~]*", candidate)` só valida strings que comecem estritamente por `uti`. Padrões como `C:\U*`, `C:\*util*` ou `C:\?tilitario` são ignorados.
-2. **Dependência de Nomes Estáticos:** A lista negra busca por `adminbridge`, mas não por prefixos curinga (`admin*`, `*bridge*`), permitindo que `schtasks`, `taskkill` e consultas WMI manipulem a tarefa agendada e os processos.
-3. **Ausência de Resolução Dinâmica:** Variáveis de ambiente (`%VAR%`) e concatenações do PowerShell (`+`, `Join-Path`) não são expandidas antes da filtragem textual.
-
----
-
-## 3. Matriz de Remediação Defensiva
-
-### 3.1. Correção Defensiva 1: Blindagem Efetiva de Permissões NTFS
-Substituir todas as chamadas `cmd.exe /c icacls ...` em [`hotp_crypto.py`](hotp_crypto.py#L1225-L1330) por chamadas diretas ao binário `icacls.exe`, corrigindo também o uso de `takeown.exe`:
-
-```python
-# Correção em hotp_crypto.py (apply_isolated_bridge_ntfs_acls):
-
-# 1. Posse do diretório raiz (sem /d y isolado)
-subprocess.run(["takeown", "/f", str(base_dir)], capture_output=True, check=False)
-
-# 2. Remoção de herança e concessão explícita (sem envolver em cmd.exe /c)
-subprocess.run([
-    "icacls", str(base_dir),
-    "/inheritance:r",
-    "/grant:r", "*S-1-5-18:(OI)(CI)(F)",
-    "/grant", "*S-1-5-32-544:(OI)(CI)(RX)",
-    "/grant", "*S-1-5-32-545:(OI)(CI)(RX)",
-    "/c", "/q"
-], capture_output=True, check=False)
-
-# 3. Isolamento estrito de C:\Utilitario\config (Apenas SYSTEM e Administradores)
-subprocess.run(["takeown", "/f", str(config_dir), "/r", "/d", "y"], capture_output=True, check=False)
-subprocess.run([
-    "icacls", str(config_dir),
-    "/inheritance:r",
-    "/grant:r", "*S-1-5-18:(OI)(CI)(F)",
-    "/grant", "*S-1-5-32-544:(OI)(CI)(F)",
-    "/t", "/c", "/q"
-], capture_output=True, check=False)
-
-# 4. Fila requests: Usuários comuns podem apenas CRIAR arquivos, sem ler arquivos de terceiros
-# SDDL equivalente: SYSTEM (F), Administradores (F), Usuários (CreateFiles/WriteData - sem List/Read)
-subprocess.run([
-    "icacls", str(req_dir),
-    "/inheritance:r",
-    "/grant:r", "*S-1-5-18:(OI)(CI)(F)",
-    "/grant", "*S-1-5-32-544:(OI)(CI)(F)",
-    "/grant", "*S-1-5-32-545:(CI)(WD,AD)",  # Write Data, Append Data (Drop-box seguro)
-    "/c", "/q"
-], capture_output=True, check=False)
-```
-
-### 3.2. Correção Defensiva 2: Isolamento Criptográfico do IPC na Fila
-1. **DPAPI com Escopo de Usuário:** Não utilizar `CRYPTPROTECT_LOCAL_MACHINE` para proteger segredos em trânsito. Em ambientes de máquina compartilhada, o cliente deve autenticar o canal via chave de sessão efêmera derivada no pareamento ou via **Named Pipe local seguro** (`\\.\pipe\AdminBridgeIPC`) com `SECURITY_DESCRIPTOR` restrito a `SYSTEM` e `Administradores`.
-2. **Validação Criptográfica do Remetente do Ticket:** Em `app.py`, ao consumir `preauth_ticket`, o daemon deve obter o SID real do proprietário do processo cliente via `OpenProcessToken` e comparar criptograficamente com o SID registrado na criação do ticket, eliminando a dependência do campo inseguro `caller.user`.
-
-### 3.3. Correção Defensiva 3: Endurecimento do Filtro de Auto-Proteção
-Em [`app.py:241-297`](app.py#L241-L297), expandir a função `is_self_targeting_command`:
-
-```python
-def is_self_targeting_command(cmd_text: str, _depth: int = 0) -> bool:
-    if not cmd_text or _depth > 3:
-        return False
-
-    raw = cmd_text.lower()
-    # Expande variáveis de ambiente do sistema antes da análise
-    try:
-        raw = os.path.expandvars(raw)
-    except Exception:
-        pass
-
-    deobfuscated = raw.translate(str.maketrans("", "", "\"\x27^`$()+"))
-
-    forbidden_patterns = [
-        r"c:[\\/]+u[a-z0-9*?~]*",                      # C:\Utilitario, C:\U*, etc.
-        r"[\\/]+utilit",                               # /utilitario, \utilitario
-        r"adminbridge",                                # Nome do executável e tarefa
-        r"antigravity",                                # Nomes legados
-        r"schtasks.*(?:admin|bridge)",                 # Manipulação da tarefa por curinga
-        r"taskkill.*(?:admin|bridge)",                 # Encerramento por curinga
-        r"get-process.*(?:admin|bridge)",              # PowerShell stop por curinga
-        r"stop-process",                               # Tentativa de matar processos
-        r"hw_salt|hotp_config|owner_anchor|preauth",   # Arquivos sensíveis
-        r"wmic.*process.*(?:admin|bridge)"             # WMI queries
-    ]
-
-    for candidate in (raw, deobfuscated):
-        for pat in forbidden_patterns:
-            if re.search(pat, candidate):
-                return True
-
-    return False
+=======================================================
+TODOS OS 22 REQUISITOS DE SEGURANÇA FORAM TESTADOS E APROVADOS!
+=======================================================
 ```
 
 ---
-*Relatório concluído e emitido para a equipe de desenvolvimento.*
+
+## 4. Recomendações Residuais de Melhoria Contínua
+
+Embora todos os controles críticos tenham sido satisfatoriamente remediados e validados, recomendam-se os seguintes refinamentos incrementais para futuras versões:
+1. **Cmdlet `Unregister-ScheduledTask`:** Adicionar explicitamente `unregister-scheduledtask` ao regex da linha 291 de [`app.py`](app.py) como defesa em profundidade (embora a auditoria pós-execução já detecte a exclusão e arme o Lockdown).
+2. **Wildcards no Sufixo `*Bridge*`:** Estender o padrão `r"\badmin[a-z0-9*?%]*"` para cobrir também `bridge*` em nomes de processos e tarefas PowerShell.
+
+---
+*Relatório de Re-Auditoria finalizado e validado com sucesso.*

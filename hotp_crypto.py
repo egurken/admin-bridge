@@ -9,6 +9,7 @@ import re
 import secrets
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from datetime import datetime
@@ -494,6 +495,15 @@ _usn_cache = {}
 _integrity_mac_cache = {}
 _owner_anchor_cache = {}
 _forensic_cache = {}
+
+def clear_integrity_caches():
+    """Limpa todos os caches em memória após reparo, provisionamento ou atualização de configuração."""
+    _static_mesh_cache.clear()
+    _usn_cache.clear()
+    _integrity_mac_cache.clear()
+    _owner_anchor_cache.clear()
+    _forensic_cache.clear()
+
 
 
 def _file_stat_sig(p: Optional[Path]) -> Tuple[int, int]:
@@ -1347,6 +1357,11 @@ def apply_isolated_bridge_ntfs_acls(base_dir: Path = BASE_DIR) -> bool:
     req_dir = queue_dir / "requests"
     proc_dir = queue_dir / "processing"
     resp_dir = queue_dir / "responses"
+    gui_pending_dir = queue_dir / "gui_pending"
+    try:
+        gui_pending_dir.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        pass
     logs_dir = base_dir / "logs"
     exe_file = base_dir / "AdminBridge.exe"
     legacy_exe = base_dir / "AntigravityBridge.exe"
@@ -1462,15 +1477,16 @@ def apply_isolated_bridge_ntfs_acls(base_dir: Path = BASE_DIR) -> bool:
                 "/c", "/q"
             ], capture_output=True, check=False, creationflags=0x08000000)
 
-        if resp_dir.exists():
-            subprocess.run([
-                "icacls", str(resp_dir),
-                "/inheritance:r",
-                "/grant:r", "*S-1-5-18:(OI)(CI)(F)",
-                "/grant", "*S-1-5-32-544:(OI)(CI)(F)",
-                "/grant", "*S-1-5-32-545:(OI)(CI)(M)",
-                "/c", "/q"
-            ], capture_output=True, check=False, creationflags=0x08000000)
+        for open_q_dir in (resp_dir, gui_pending_dir):
+            if open_q_dir.exists():
+                subprocess.run([
+                    "icacls", str(open_q_dir),
+                    "/inheritance:r",
+                    "/grant:r", "*S-1-5-18:(OI)(CI)(F)",
+                    "/grant", "*S-1-5-32-544:(OI)(CI)(F)",
+                    "/grant", "*S-1-5-32-545:(OI)(CI)(M)",
+                    "/c", "/q"
+                ], capture_output=True, check=False, creationflags=0x08000000)
     except Exception:
         pass
 
@@ -1616,7 +1632,10 @@ class AtomicLock:
         self.timeout_ms = timeout_ms
 
     def __enter__(self):
-        QUEUE_DIR.mkdir(parents=True, exist_ok=True)
+        try:
+            QUEUE_DIR.mkdir(parents=True, exist_ok=True)
+        except Exception:
+            pass
         if not hasattr(_lock_local, "depth"):
             _lock_local.depth = 0
             _lock_local.mutex_handle = None
@@ -1637,9 +1656,13 @@ class AtomicLock:
                     raise TimeoutError("Tempo limite esgotado ao aguardar mutex do HOTP.")
         _lock_local.mutex_handle = handle
 
-        # 2. File Lock
+        # 2. File Lock (tenta LOCK_FILE ou fallback no TEMP)
         try:
-            fd = os.open(str(LOCK_FILE), os.O_CREAT | os.O_RDWR)
+            try:
+                fd = os.open(str(LOCK_FILE), os.O_CREAT | os.O_RDWR)
+            except (FileNotFoundError, PermissionError, OSError):
+                fallback_lock = Path(tempfile.gettempdir()) / "AdminBridge_atomic.lock"
+                fd = os.open(str(fallback_lock), os.O_CREAT | os.O_RDWR)
             start_time = time.time()
             if msvcrt is not None:
                 while True:
@@ -1988,8 +2011,85 @@ RISK_SIGNATURES = [
         "category": "Comando Codificado ou Ofuscado",
         "pattern": r"(?:-[eE][nN]?[cC]?[oO]?[dD]?[eE]?[dD]?[cC]?[oO]?[mM]?[mM]?[aA]?[nN]?[dD]?\s+[A-Za-z0-9+/=]{16,}|frombase64string|\bchar\[\]\s*\()",
         "explanation": "Usa codificação Base64 ou ofuscação para esconder os comandos reais que serão executados."
+    },
+    {
+        "id": "EXTERNAL_TEMP_BINARY_OR_SCRIPT",
+        "score": 45,
+        "category": "Execução de Script ou Binário em Pasta Temporária/Downloads",
+        "pattern": r"(?:\\temp\\|\\appdata\\|\\downloads\\|/temp/|/downloads/|\b(?:powershell|pwsh|cmd|cscript|wscript|python|mshta)(?:\.exe)?\b[^\n]*(?:-(?:file|f)\b|\.(?:ps1|bat|cmd|vbs|js|hta|py)\b))",
+        "explanation": "Executa um arquivo de script externo (.ps1, .bat, .vbs, .py) ou um programa localizado em pastas temporárias/Downloads."
     }
 ]
+
+SCRIPT_EXTENSIONS = (".ps1", ".bat", ".cmd", ".vbs", ".js", ".wsf", ".hta", ".py", ".psm1")
+
+
+def extract_and_read_referenced_scripts(cmd_text: str, _visited: Optional[set] = None, _depth: int = 0) -> Tuple[str, list]:
+    """Desenrola recursivamente (até 3 níveis) qualquer arquivo de script externo (.ps1, .bat, .cmd, .vbs, .py, etc.)
+    chamado pela linha de comando, lendo o conteúdo interno do arquivo no disco para que nenhum script malicioso
+    possa se esconder atrás de um comando aparentemente inocente como 'powershell -File C:\\Temp\\helper.ps1'.
+    Retorna (texto_combinado_completo, lista_de_arquivos_lidos).
+    """
+    if not cmd_text or _depth > 3:
+        return cmd_text or "", []
+    if _visited is None:
+        _visited = set()
+
+    expanded = os.path.expandvars(cmd_text)
+    candidates = set()
+
+    # 1. Captura caminhos entre aspas ou sem aspas que terminem em extensões de script (.ps1, .bat, .cmd, .py, .vbs, .js, .hta)
+    ext_pattern = r"(?:[\"\']([^\"\']+\.(?:ps1|bat|cmd|vbs|js|wsf|hta|py|psm1))[\"\']|([^\s\"\';&|><()]+\.(?:ps1|bat|cmd|vbs|js|wsf|hta|py|psm1)))"
+    for m in re.finditer(ext_pattern, expanded, flags=re.IGNORECASE):
+        c_path = (m.group(1) or m.group(2) or "").strip()
+        if c_path:
+            candidates.add(c_path)
+
+    # 2. Captura qualquer argumento passado após -File, -f, call, start
+    arg_pattern = r"(?:-(?:file|f)\s+|(?:\bcall|\bstart)\s+)(?:[\"\']([^\"\']+)[\"\']|([^\s\"\';&|><]+))"
+    for m in re.finditer(arg_pattern, expanded, flags=re.IGNORECASE):
+        c_path = (m.group(1) or m.group(2) or "").strip()
+        if c_path and not c_path.startswith("-"):
+            candidates.add(c_path)
+
+    combined_parts = [cmd_text]
+    read_files_info = []
+
+    for raw_cand in sorted(candidates):
+        for test_p in (Path(raw_cand), BASE_DIR / raw_cand):
+            try:
+                if test_p.exists() and test_p.is_file():
+                    resolved_str = str(test_p.resolve())
+                    if resolved_str in _visited:
+                        break
+                    _visited.add(resolved_str)
+                    # Lê até 256 KB do script externo para inspeção profunda
+                    raw_bytes = test_p.read_bytes()[:262144]
+                    file_hash = hashlib.sha256(raw_bytes).hexdigest()[:16]
+                    file_content = ""
+                    for enc in ("utf-8", "utf-16", "latin-1"):
+                        try:
+                            file_content = raw_bytes.decode(enc)
+                            break
+                        except Exception:
+                            continue
+                    if file_content:
+                        read_files_info.append({
+                            "path": resolved_str,
+                            "sha256_prefix": file_hash,
+                            "content": file_content
+                        })
+                        sub_combined, sub_files = extract_and_read_referenced_scripts(
+                            file_content, _visited=_visited, _depth=_depth + 1
+                        )
+                        combined_parts.append(f"\n# [CONTEÚDO INTERNO DE {resolved_str} (SHA256:{file_hash})]:\n{sub_combined}")
+                        read_files_info.extend(sub_files)
+                    break
+            except Exception:
+                continue
+
+    return "\n".join(combined_parts), read_files_info
+
 
 
 def _decode_embedded_base64(cmd_text: str) -> str:
@@ -2010,8 +2110,11 @@ def _decode_embedded_base64(cmd_text: str) -> str:
     return (cmd_text + "\n" + "\n".join(extra)) if extra else cmd_text
 
 
+AI_READY_SEAL_FILE = QUEUE_DIR / "ai_ready.json"
+
+
 def _ensure_ollama_on_demand() -> Optional[str]:
-    """Localiza o binário do Ollama no Windows para acordá-lo sob demanda apenas quando a Camada 3 precisar."""
+    """Localiza o binário do Ollama no Windows para acordá-lo sob demanda."""
     if sys.platform != "win32":
         return None
     import shutil
@@ -2026,24 +2129,123 @@ def _ensure_ollama_on_demand() -> Optional[str]:
     return None
 
 
-def _try_local_slm_explanation(code_text: str, findings: list, timeout_sec: float = 3.5) -> Optional[str]:
-    """Camada 3 (Sob Demanda com Zero RAM em Repouso):
-    1. Se o servidor local Ollama estiver dormindo, acorda-o silenciosamente (CREATE_NO_WINDOW).
-    2. Consulta o mini-modelo qwen2.5:0.5b passando 'keep_alive': '0s' para que ele descarregue
-       100% da memória RAM no mesmo milissegundo em que terminar de responder!
+def is_local_slm_verified() -> bool:
+    """Verifica se o mini-modelo local qwen2.5:0.5b já foi instalado, testado e aprovado."""
+    if AI_READY_SEAL_FILE.exists():
+        try:
+            data = json.loads(AI_READY_SEAL_FILE.read_text(encoding="utf-8"))
+            if data.get("verified") is True:
+                return True
+        except Exception:
+            pass
+    # Se o selo ainda não existir, consulta rapidamente /api/tags (timeout 0.4s) para ver se qwen2.5:0.5b já está no Ollama
+    try:
+        import urllib.request
+        with urllib.request.urlopen("http://127.0.0.1:11434/api/tags", timeout=0.4) as resp:
+            tags_data = json.loads(resp.read().decode("utf-8"))
+            models = [m.get("name", "").lower() for m in tags_data.get("models", [])]
+            if any("qwen2.5:0.5b" in m or "qwen2.5-coder:0.5b" in m for m in models):
+                QUEUE_DIR.mkdir(parents=True, exist_ok=True)
+                AI_READY_SEAL_FILE.write_text(json.dumps({"verified": True, "model": "qwen2.5:0.5b", "verified_at": time.time()}), encoding="utf-8")
+                return True
+    except Exception:
+        pass
+    return False
+
+
+def pull_and_test_local_slm(progress_callback=None) -> Tuple[bool, str]:
+    """Baixa o modelo qwen2.5:0.5b diretamente pela API HTTP do Ollama (POST /api/pull),
+    sem depender da lista de modelos da interface gráfica do Ollama, e faz um teste real de inferência!
     """
     import urllib.request
+
+    # 1. Garante que o servidor Ollama está respondendo em 127.0.0.1:11434
+    server_up = False
+    for _ in range(2):
+        try:
+            with urllib.request.urlopen("http://127.0.0.1:11434/api/tags", timeout=1.5) as r:
+                if r.status == 200:
+                    server_up = True
+                    break
+        except Exception:
+            ollama_bin = _ensure_ollama_on_demand()
+            if ollama_bin:
+                try:
+                    subprocess.Popen([ollama_bin, "serve"], creationflags=0x08000000 if sys.platform == "win32" else 0)
+                    time.sleep(1.5)
+                except Exception:
+                    pass
+
+    if not server_up:
+        return False, "O serviço do Ollama não foi detectado em http://127.0.0.1:11434. Verifique se o aplicativo Ollama está aberto."
+
+    # 2. Solicita o download direto do modelo qwen2.5:0.5b via API HTTP (/api/pull)
+    if progress_callback:
+        progress_callback("Baixando modelo ultraleve qwen2.5:0.5b (~350 MB) direto pelo servidor local do Ollama...")
+    try:
+        pull_body = json.dumps({"name": "qwen2.5:0.5b", "stream": False}).encode("utf-8")
+        req_pull = urllib.request.Request(
+            "http://127.0.0.1:11434/api/pull",
+            data=pull_body,
+            headers={"Content-Type": "application/json"},
+            method="POST"
+        )
+        with urllib.request.urlopen(req_pull, timeout=600.0) as resp:
+            pull_res = json.loads(resp.read().decode("utf-8"))
+            if pull_res.get("error"):
+                return False, f"Erro ao baixar modelo: {pull_res.get('error')}"
+    except Exception as e:
+        return False, f"Falha ao baixar qwen2.5:0.5b via API do Ollama: {e}"
+
+    # 3. Executa teste real de análise de script e descarrega da RAM (keep_alive: 0s)
+    if progress_callback:
+        progress_callback("Testando resposta da Mini-IA com script de verificação e liberando RAM (keep_alive=0s)...")
+    test_explanation = _try_local_slm_explanation(
+        'sc.exe create ServicoTeste binPath= "C:\\Temp\\teste.exe" start= auto',
+        [{"category": "Criação de Serviço", "explanation": "Cria serviço automático"}],
+        timeout_sec=10.0
+    )
+    if not test_explanation:
+        return False, "O modelo foi baixado, mas não respondeu ao teste de verificação."
+
+    try:
+        QUEUE_DIR.mkdir(parents=True, exist_ok=True)
+        AI_READY_SEAL_FILE.write_text(
+            json.dumps({
+                "verified": True,
+                "model": "qwen2.5:0.5b",
+                "sample_test": test_explanation[:160],
+                "verified_at": time.time()
+            }, indent=2, ensure_ascii=False),
+            encoding="utf-8"
+        )
+    except Exception:
+        pass
+
+    return True, f"Mini-IA qwen2.5:0.5b instalada, testada e validada com sucesso!\n\nResposta do teste:\n\"{test_explanation}\""
+
+
+def _try_local_slm_explanation(code_text: str, findings: list, timeout_sec: float = 4.0) -> Optional[str]:
+    """Camada 3 (Prompt Técnico Específico + Zero RAM em Repouso com keep_alive='0s'):
+    Analisa especificamente quais comandos, caminhos de arquivo, serviços ou chaves de registro
+    estão sendo tocados pelo script e descarrega o modelo da RAM imediatamente após responder.
+    """
+    import urllib.request
+    detected_cats = ", ".join([f.get("category", "") for f in (findings or [])]) or "Ação administrativa"
     prompt = (
-        "Explique em português simples, em no máximo 3 frases curtas para um usuário leigo, "
-        "o que este script do Windows tenta fazer e qual o risco dele:\n\n"
-        f"{code_text[:1000]}"
+        "Você é um auditor técnico de segurança do Windows. Analise o comando abaixo (categorias detectadas: "
+        f"{detected_cats}) e explique em português claro e específico, em no máximo 3 tópicos curtos:\n"
+        "1. Qual executável ou comando exato está sendo chamado;\n"
+        "2. Qual arquivo, pasta, serviço ou chave do Windows será alterado;\n"
+        "3. Qual o impacto prático se o usuário autorizar.\n\n"
+        f"SCRIPT:\n{code_text[:1000]}"
     )
     req_body = json.dumps({
         "model": "qwen2.5:0.5b",
         "prompt": prompt,
         "stream": False,
-        "keep_alive": "0s",  # Descarrega da RAM imediatamente após responder (0 MB em repouso no i5!)
-        "options": {"num_predict": 120, "temperature": 0.1}
+        "keep_alive": "0s",  # Libera 100% da RAM imediatamente após gerar a resposta!
+        "options": {"num_predict": 160, "temperature": 0.1}
     }).encode("utf-8")
 
     for attempt in range(2):
@@ -2113,8 +2315,10 @@ def inspect_script_3_layers(code_text: str) -> dict:
             "explanation": "Comando vazio ou inofensivo."
         }
 
-    amsi_clean, amsi_msg = scan_with_windows_amsi(code_text)
-    expanded_text = _decode_embedded_base64(code_text)
+    # Desenrola recursivamente qualquer script externo (.ps1, .bat, .cmd, .py, .vbs) chamado pelo comando!
+    unrolled_text, referenced_files = extract_and_read_referenced_scripts(code_text)
+    amsi_clean, amsi_msg = scan_with_windows_amsi(unrolled_text)
+    expanded_text = _decode_embedded_base64(unrolled_text)
     normalized = expanded_text.lower().translate(str.maketrans("", "", "\"'^`"))
 
     total_score = 0 if amsi_clean else 100
@@ -2142,11 +2346,17 @@ def inspect_script_3_layers(code_text: str) -> dict:
     if requires_step_up:
         explanation = build_human_explanation(expanded_text, matched_findings, amsi_msg if not amsi_clean else "")
 
+    if referenced_files and requires_step_up:
+        files_summary = "\n".join([f"  📄 {rf['path']} (SHA256: {rf['sha256_prefix']})" for rf in referenced_files])
+        explanation = f"📂 Arquivos de script externos lidos e inspecionados recursivamente:\n{files_summary}\n\n" + explanation
+
     return {
         "risk_level": risk_level,
         "risk_score": total_score,
         "requires_step_up": requires_step_up,
         "amsi_clean": amsi_clean,
         "findings": matched_findings,
+        "referenced_files": referenced_files,
+        "unrolled_code": unrolled_text,
         "explanation": explanation
     }
