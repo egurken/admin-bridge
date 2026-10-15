@@ -48,6 +48,10 @@ from hotp_crypto import (
     verify_owner_anchor,
     verify_owner_password,
     verify_recovery_password,
+    get_password_lockout_status,
+    record_password_failure,
+    reset_password_lockout,
+    format_lockout_duration,
     wipe_buffer,
     DPAPI_ENTROPY,
     DPAPI_MAC_ENTROPY,
@@ -668,8 +672,14 @@ class HOTPAuth:
                 del secret_ba
                 gc.collect()
 
-    def verify_quit_password(self, password: str) -> Tuple[bool, str]:
-        """Valida a Palavra-passe de Recuperação antes de permitir encerrar a Central de Gestão."""
+    def verify_quit_password(self, password: str, custom_lockout_file: Optional[Path] = None) -> Tuple[bool, str]:
+        """Valida a Palavra-passe de Recuperação antes de permitir encerrar a Central de Gestão,
+        com proteção estrita de taxa (máximo 5 tentativas) e bloqueio progressivo até 4 horas.
+        """
+        lockout_st = get_password_lockout_status(custom_lockout_file)
+        if lockout_st["is_locked"]:
+            return False, lockout_st["message"]
+
         if not password or len(str(password).strip()) < 8:
             return False, "Digite sua Palavra-passe de Recuperação (mínimo 8 caracteres) para encerrar o utilitário."
         pw = str(password).strip()
@@ -677,15 +687,22 @@ class HOTPAuth:
         if self._is_daemon_alive_other_process():
             rpc_res = self._delegate_rpc_to_daemon("verify_password", {"password": pw}, timeout=8.0)
             if rpc_res is not None:
-                return bool(rpc_res.get("ok")), str(rpc_res.get("message", ""))
+                ok = bool(rpc_res.get("ok"))
+                if ok:
+                    reset_password_lockout(custom_lockout_file)
+                    return True, str(rpc_res.get("message", "Senha validada com sucesso."))
+                fail_st = record_password_failure(custom_lockout_file)
+                if fail_st["is_locked"]:
+                    return False, f"Senha incorreta! Limite de 5 tentativas atingido. Sistema bloqueado por {format_lockout_duration(fail_st['remaining_seconds'])}."
+                return False, f"Palavra-passe de Recuperação incorreta! Restam {fail_st['remaining_attempts']} tentativa(s)."
 
         anchor_file = self.config_dir / "owner_anchor.json"
+        is_correct = False
         try:
             if anchor_file.exists():
                 if verify_owner_password(pw, anchor_file, self.config_dir):
-                    return True, "Senha validada com sucesso."
-                return False, "Palavra-passe de Recuperação incorreta."
-            if self.config_file.exists():
+                    is_correct = True
+            elif self.config_file.exists():
                 with open(self.config_file, "r", encoding="utf-8") as f:
                     cfg = json.load(f)
                 salt_b64 = cfg.get("recovery_salt")
@@ -695,22 +712,42 @@ class HOTPAuth:
                     expected_hash = bytes(expected_hash_ba).decode("ascii")
                     wipe_buffer(expected_hash_ba)
                     if verify_recovery_password(pw, expected_hash, salt_b64):
-                        return True, "Senha validada com sucesso."
-                return False, "Palavra-passe de Recuperação incorreta."
+                        is_correct = True
+            else:
+                is_correct = True
         except PermissionError:
             rpc_res = self._delegate_rpc_to_daemon("verify_password", {"password": pw}, timeout=8.0)
             if rpc_res is not None:
-                return bool(rpc_res.get("ok")), str(rpc_res.get("message", ""))
+                ok = bool(rpc_res.get("ok"))
+                if ok:
+                    reset_password_lockout(custom_lockout_file)
+                    return True, str(rpc_res.get("message", "Senha validada com sucesso."))
+                fail_st = record_password_failure(custom_lockout_file)
+                if fail_st["is_locked"]:
+                    return False, f"Senha incorreta! Limite de 5 tentativas atingido. Sistema bloqueado por {format_lockout_duration(fail_st['remaining_seconds'])}."
+                return False, f"Palavra-passe de Recuperação incorreta! Restam {fail_st['remaining_attempts']} tentativa(s)."
             return False, "Sem permissão para ler o cofre e o serviço SYSTEM não respondeu."
         except Exception as e:
             return False, f"Erro ao validar senha: {e}"
-        return True, "Utilitário ainda não provisionado."
 
-    def repair_corrupted_installation(self, recovery_password: str) -> Tuple[bool, str]:
+        if is_correct:
+            reset_password_lockout(custom_lockout_file)
+            return True, "Senha validada com sucesso."
+        else:
+            fail_st = record_password_failure(custom_lockout_file)
+            if fail_st["is_locked"]:
+                return False, f"Senha incorreta! Limite de 5 tentativas atingido. Sistema bloqueado por {format_lockout_duration(fail_st['remaining_seconds'])}."
+            return False, f"Palavra-passe de Recuperação incorreta! Restam {fail_st['remaining_attempts']} tentativa(s) antes do bloqueio."
+
+    def repair_corrupted_installation(self, recovery_password: str, custom_lockout_file: Optional[Path] = None) -> Tuple[bool, str]:
         """Restaura e re-ancora a instalação após detecção de adulteração exigindo a Senha Mestra do proprietário.
         Quando a Senha Mestra é validada, re-assina o hotp_config.json, atualiza o .sig (com USN atual e hash do .exe),
         recria o owner_anchor.json, sincroniza o cofre externo SYSTEM e limpa os caches em memória!
         """
+        lockout_st = get_password_lockout_status(custom_lockout_file)
+        if lockout_st["is_locked"]:
+            return False, lockout_st["message"]
+
         if not recovery_password or len(str(recovery_password).strip()) < 8:
             return False, "A palavra-passe deve conter pelo menos 8 caracteres."
         pw = str(recovery_password).strip()
@@ -720,7 +757,14 @@ class HOTPAuth:
             rpc_res = self._delegate_rpc_to_daemon("repair", {"password": pw}, timeout=12.0)
             if rpc_res is not None:
                 clear_integrity_caches()
-                return bool(rpc_res.get("ok")), str(rpc_res.get("message", ""))
+                ok = bool(rpc_res.get("ok"))
+                if ok:
+                    reset_password_lockout(custom_lockout_file)
+                    return True, str(rpc_res.get("message", ""))
+                fail_st = record_password_failure(custom_lockout_file)
+                if fail_st["is_locked"]:
+                    return False, f"Palavra-passe de recuperação incorreta! Limite de 5 tentativas atingido. Sistema bloqueado por {format_lockout_duration(fail_st['remaining_seconds'])}."
+                return False, f"Palavra-passe de recuperação incorreta. Restam {fail_st['remaining_attempts']} tentativa(s) antes do bloqueio."
 
         with AtomicLock():
             raw_data = None
@@ -733,12 +777,20 @@ class HOTPAuth:
                     if verify_owner_password(pw, anchor_file, self.config_dir):
                         password_verified = True
                     else:
-                        return False, "Palavra-passe de recuperacao incorreta. Apenas o proprietario pode reparar o sistema."
+                        fail_st = record_password_failure(custom_lockout_file)
+                        if fail_st["is_locked"]:
+                            return False, f"Palavra-passe de recuperação incorreta! Limite de 5 tentativas atingido. Sistema bloqueado por {format_lockout_duration(fail_st['remaining_seconds'])}."
+                        return False, f"Palavra-passe de recuperacao incorreta. Restam {fail_st['remaining_attempts']} tentativa(s). Apenas o proprietario pode reparar o sistema."
                 except PermissionError:
                     rpc_res = self._delegate_rpc_to_daemon("repair", {"password": pw}, timeout=12.0)
                     if rpc_res is not None:
                         clear_integrity_caches()
-                        return bool(rpc_res.get("ok")), str(rpc_res.get("message", ""))
+                        ok = bool(rpc_res.get("ok"))
+                        if ok:
+                            reset_password_lockout(custom_lockout_file)
+                        else:
+                            record_password_failure(custom_lockout_file)
+                        return ok, str(rpc_res.get("message", ""))
                     raise
 
             # 2. Carrega hotp_config.json e valida contra o hash PBKDF2 protegido por DPAPI
@@ -755,24 +807,38 @@ class HOTPAuth:
                             expected_hash = bytes(expected_hash_ba).decode("ascii")
                             wipe_buffer(expected_hash_ba)
                             if not verify_recovery_password(pw, expected_hash, salt_b64):
-                                return False, "Palavra-passe de recuperacao incorreta. Apenas o proprietario pode reparar o sistema."
+                                fail_st = record_password_failure(custom_lockout_file)
+                                if fail_st["is_locked"]:
+                                    return False, f"Palavra-passe de recuperação incorreta! Limite de 5 tentativas atingido. Sistema bloqueado por {format_lockout_duration(fail_st['remaining_seconds'])}."
+                                return False, f"Palavra-passe de recuperacao incorreta. Restam {fail_st['remaining_attempts']} tentativa(s). Apenas o proprietario pode reparar o sistema."
                             password_verified = True
                         except Exception:
                             # Se hw_salt.bin foi alterado/recriado mas owner_anchor.json já validou a Senha Mestra (scrypt), prossegue!
                             if not password_verified:
+                                fail_st = record_password_failure(custom_lockout_file)
                                 return False, "Palavra-passe de recuperacao incorreta ou cofre ilegivel."
                 except PermissionError:
                     rpc_res = self._delegate_rpc_to_daemon("repair", {"password": pw}, timeout=12.0)
                     if rpc_res is not None:
                         clear_integrity_caches()
-                        return bool(rpc_res.get("ok")), str(rpc_res.get("message", ""))
+                        ok = bool(rpc_res.get("ok"))
+                        if ok:
+                            reset_password_lockout(custom_lockout_file)
+                        else:
+                            record_password_failure(custom_lockout_file)
+                        return ok, str(rpc_res.get("message", ""))
                     return False, "Permissao de Administrador necessaria para reparar a instalacao."
                 except Exception:
                     if not password_verified:
                         return False, "Nao foi possivel validar a palavra-passe de recuperacao."
 
             if not password_verified and (self.config_file.exists() or anchor_file.exists()):
-                return False, "Palavra-passe de recuperacao incorreta."
+                fail_st = record_password_failure(custom_lockout_file)
+                if fail_st["is_locked"]:
+                    return False, f"Palavra-passe de recuperação incorreta! Limite de 5 tentativas atingido. Sistema bloqueado por {format_lockout_duration(fail_st['remaining_seconds'])}."
+                return False, f"Palavra-passe de recuperacao incorreta. Restam {fail_st['remaining_attempts']} tentativa(s)."
+
+            reset_password_lockout(custom_lockout_file)
 
             # 3. Se o arquivo de configuração possui a chave secreta, re-ancora TUDO com a autorização do proprietário!
             if raw_data and isinstance(raw_data, dict) and raw_data.get("secret_dpapi"):
@@ -986,14 +1052,19 @@ class HOTPAuth:
     def authorize_and_prepare_uninstall(
         self,
         recovery_password: str,
-        caller_info: Optional[dict] = None
+        caller_info: Optional[dict] = None,
+        custom_lockout_file: Optional[Path] = None
     ) -> Tuple[bool, str]:
-        """Exige a Palavra-passe de Recuperação (Senha Mestra) para autorizar a desinstalação.
+        r"""Exige a Palavra-passe de Recuperação (Senha Mestra) para autorizar a desinstalação.
 
         1. Se a senha estiver incorreta ou ausente, bloqueia a desinstalação e mantém os arquivos travados.
         2. Se a senha estiver correta, instrui o daemon SYSTEM a soltar todos os locks de kernel (KernelFileGuard),
-           limpa o cofre externo (HKLM\\SECURITY e System Volume Information) e libera as ACLs para remoção limpa.
+           limpa o cofre externo (HKLM\SECURITY e System Volume Information) e libera as ACLs para remoção limpa.
         """
+        lockout_st = get_password_lockout_status(custom_lockout_file)
+        if lockout_st["is_locked"]:
+            return False, lockout_st["message"]
+
         anchor_file = self.config_dir / "owner_anchor.json"
         has_active_install = self.config_file.exists() or anchor_file.exists()
 
@@ -1012,7 +1083,14 @@ class HOTPAuth:
         if self._is_daemon_alive_other_process():
             rpc_res = self._delegate_rpc_to_daemon("uninstall_unlock", {"password": pw}, timeout=10.0)
             if rpc_res is not None:
-                return bool(rpc_res.get("ok")), str(rpc_res.get("message", ""))
+                ok = bool(rpc_res.get("ok"))
+                if ok:
+                    reset_password_lockout(custom_lockout_file)
+                    return True, str(rpc_res.get("message", ""))
+                fail_st = record_password_failure(custom_lockout_file)
+                if fail_st["is_locked"]:
+                    return False, f"Palavra-passe de Recuperação incorreta! Limite de 5 tentativas atingido. Sistema bloqueado por {format_lockout_duration(fail_st['remaining_seconds'])}."
+                return False, f"Palavra-passe de Recuperação incorreta. Restam {fail_st['remaining_attempts']} tentativa(s) antes do bloqueio."
 
         with AtomicLock():
             verified = False
@@ -1022,7 +1100,10 @@ class HOTPAuth:
                     verified = True
                 else:
                     self._log_audit("UNINSTALL_DENIED", 0, 0, False, "Tentativa de desinstalacao com Senha Mestra incorreta (ancora).", caller_info=caller_info)
-                    return False, "Palavra-passe de Recuperacao incorreta. Desinstalacao bloqueada."
+                    fail_st = record_password_failure(custom_lockout_file)
+                    if fail_st["is_locked"]:
+                        return False, f"Palavra-passe de Recuperação incorreta! Limite de 5 tentativas atingido. Sistema bloqueado por {format_lockout_duration(fail_st['remaining_seconds'])}."
+                    return False, f"Palavra-passe de Recuperacao incorreta. Restam {fail_st['remaining_attempts']} tentativa(s). Desinstalacao bloqueada."
 
             # 2. Verifica contra o hash PBKDF2 protegido por DPAPI no hotp_config.json
             if self.config_file.exists():
@@ -1038,13 +1119,21 @@ class HOTPAuth:
                         wipe_buffer(expected_hash_ba)
                         if not verify_recovery_password(pw, expected_hash_b64, salt_b64):
                             self._log_audit("UNINSTALL_DENIED", cfg.get("counter", 0), cfg.get("counter", 0), False, "Tentativa de desinstalacao com Senha de Recuperacao incorreta.", caller_info=caller_info)
-                            return False, "Palavra-passe de Recuperacao incorreta. Desinstalacao bloqueada."
+                            fail_st = record_password_failure(custom_lockout_file)
+                            if fail_st["is_locked"]:
+                                return False, f"Palavra-passe de Recuperação incorreta! Limite de 5 tentativas atingido. Sistema bloqueado por {format_lockout_duration(fail_st['remaining_seconds'])}."
+                            return False, f"Palavra-passe de Recuperacao incorreta. Restam {fail_st['remaining_attempts']} tentativa(s). Desinstalacao bloqueada."
                         verified = True
                 except PermissionError:
                     # Se o arquivo estiver travado pelo daemon SYSTEM, tenta via RPC
                     rpc_res = self._delegate_rpc_to_daemon("uninstall_unlock", {"password": pw}, timeout=10.0)
                     if rpc_res is not None:
-                        return bool(rpc_res.get("ok")), str(rpc_res.get("message", ""))
+                        ok = bool(rpc_res.get("ok"))
+                        if ok:
+                            reset_password_lockout(custom_lockout_file)
+                        else:
+                            record_password_failure(custom_lockout_file)
+                        return ok, str(rpc_res.get("message", ""))
                     if not verified:
                         return False, "Arquivo de configuracao bloqueado pelo servico SYSTEM. Tente novamente."
                 except Exception as e:
@@ -1052,7 +1141,12 @@ class HOTPAuth:
                         return False, f"Erro ao validar credenciais para desinstalacao: {e}"
 
             if not verified:
-                return False, "Nao foi possivel validar a Palavra-passe de Recuperacao."
+                fail_st = record_password_failure(custom_lockout_file)
+                if fail_st["is_locked"]:
+                    return False, f"Palavra-passe de Recuperação incorreta! Limite de 5 tentativas atingido. Sistema bloqueado por {format_lockout_duration(fail_st['remaining_seconds'])}."
+                return False, f"Nao foi possivel validar a Palavra-passe de Recuperacao. Restam {fail_st['remaining_attempts']} tentativa(s)."
+
+            reset_password_lockout(custom_lockout_file)
 
             # SENHA VALIDADA: Destrava todos os handles de kernel, limpa cofre externo e restaura ACLs
             KernelFileGuard.release_all_locks()

@@ -18,7 +18,7 @@ import threading
 import time
 import uuid
 from datetime import datetime, timezone
-from typing import Optional, Tuple
+from typing import Optional, Tuple, Callable, List, Dict, Any
 
 import re
 try:
@@ -64,7 +64,8 @@ from hotp_crypto import (
     check_config_acl_isolation, protect_transit_token, unprotect_transit_token, verify_owner_anchor,
     KernelFileGuard, verify_scheduled_task_integrity, get_os_process_username, ensure_transit_keypair,
     inspect_script_3_layers, extract_and_read_referenced_scripts,
-    clear_integrity_caches, is_local_slm_verified, pull_and_test_local_slm
+    clear_integrity_caches, is_local_slm_verified, pull_and_test_local_slm,
+    get_password_lockout_status, record_password_failure, reset_password_lockout, format_lockout_duration
 )
 
 LOCAL_SERVER_NAME = f"AdminBridge_GUI_{os.getenv('USERNAME', 'default')}"
@@ -1545,6 +1546,516 @@ class SyncTestDialog(QDialog):
 
 
 # -----------------------------------------------------------------------------
+# DIÁLOGO RESPONSIVO DE AUTENTICAÇÃO POR SENHA (LOCKOUT & FEEDBACK IMEDIATO)
+# -----------------------------------------------------------------------------
+class ResponsivePasswordDialog(QDialog):
+    """Diálogo responsivo moderno para validação de Palavra-passe de Recuperação / Senha Mestra.
+    - Totalmente estilizado no tema escuro oficial (#11111b, #181825, #313244, #cdd6f4).
+    - Campo de senha com botão de alternância de visualização [👁️ / 🔒].
+    - Feedback imediato e claro inline sem fechar a caixa de diálogo em caso de erro.
+    - Contador de tentativas restantes [5 tentativas] e cronômetro regressivo ativo em tempo real [bloqueio progressivo até 4h].
+    - Totalmente não-bloqueante e responsivo para o usuário.
+    """
+    def __init__(
+        self,
+        title: str,
+        prompt: str,
+        verify_fn: Optional[Callable[[str], Tuple[bool, str]]] = None,
+        parent=None,
+        confirm_text: str = "Confirmar"
+    ):
+        super().__init__(parent)
+        self.verify_fn = verify_fn
+        self.verified_password = ""
+        self._verifying = False
+        self._has_error = False
+
+        self.setWindowTitle(title)
+        self.resize(480, 260)
+        self.setMinimumWidth(420)
+        self.setModal(True)
+
+        app_icon = get_app_icon()
+        if app_icon and not app_icon.isNull():
+            self.setWindowIcon(app_icon)
+
+        self.setStyleSheet("""
+            QDialog {
+                background-color: #181825;
+                color: #cdd6f4;
+                font-family: 'Segoe UI', system-ui, sans-serif;
+            }
+            QLabel {
+                color: #cdd6f4;
+            }
+            QLineEdit {
+                background-color: #11111b;
+                color: #cdd6f4;
+                border: 1px solid #313244;
+                border-radius: 6px;
+                padding: 10px;
+                font-size: 13px;
+                selection-background-color: #89b4fa;
+            }
+            QLineEdit:focus {
+                border: 1px solid #89b4fa;
+            }
+            QLineEdit:disabled {
+                background-color: #1e1e2e;
+                color: #6c7086;
+                border: 1px solid #313244;
+            }
+            QPushButton {
+                font-weight: bold;
+                border-radius: 6px;
+                padding: 10px 16px;
+                font-size: 13px;
+                border: none;
+            }
+            QPushButton#btnConfirm {
+                background-color: #89b4fa;
+                color: #11111b;
+            }
+            QPushButton#btnConfirm:hover {
+                background-color: #b4befe;
+            }
+            QPushButton#btnConfirm:disabled {
+                background-color: #313244;
+                color: #6c7086;
+            }
+            QPushButton#btnCancel {
+                background-color: #313244;
+                color: #cdd6f4;
+            }
+            QPushButton#btnCancel:hover {
+                background-color: #45475a;
+            }
+            QPushButton#btnEye {
+                background-color: #313244;
+                color: #cdd6f4;
+                padding: 10px 12px;
+                font-size: 14px;
+            }
+            QPushButton#btnEye:hover {
+                background-color: #45475a;
+            }
+        """)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(24, 20, 24, 20)
+        layout.setSpacing(12)
+
+        lbl_header = QLabel(f"<b>{title}</b>")
+        lbl_header.setStyleSheet("font-size: 14px; color: #89b4fa;")
+        layout.addWidget(lbl_header)
+
+        self.lbl_prompt = QLabel(prompt)
+        self.lbl_prompt.setWordWrap(True)
+        self.lbl_prompt.setStyleSheet("font-size: 12px; color: #a6adc8; line-height: 1.4;")
+        layout.addWidget(self.lbl_prompt)
+
+        input_container = QHBoxLayout()
+        input_container.setSpacing(6)
+
+        self.edit_pwd = QLineEdit()
+        self.edit_pwd.setEchoMode(QLineEdit.EchoMode.Password)
+        self.edit_pwd.setPlaceholderText("Digite sua palavra-passe de recuperação...")
+        self.edit_pwd.returnPressed.connect(self.on_confirm)
+        input_container.addWidget(self.edit_pwd, stretch=1)
+
+        self.btn_eye = QPushButton("👁️")
+        self.btn_eye.setObjectName("btnEye")
+        self.btn_eye.setToolTip("Alternar exibição da senha")
+        self.btn_eye.clicked.connect(self.toggle_password_visibility)
+        input_container.addWidget(self.btn_eye)
+        layout.addLayout(input_container)
+
+        self.lbl_status = QLabel("")
+        self.lbl_status.setWordWrap(True)
+        self.lbl_status.setStyleSheet("font-size: 12px; min-height: 22px;")
+        layout.addWidget(self.lbl_status)
+
+        btn_layout = QHBoxLayout()
+        btn_layout.setSpacing(10)
+        btn_layout.addStretch(1)
+
+        self.btn_cancel = QPushButton("Cancelar")
+        self.btn_cancel.setObjectName("btnCancel")
+        self.btn_cancel.clicked.connect(self.reject)
+        btn_layout.addWidget(self.btn_cancel)
+
+        self.btn_confirm = QPushButton(confirm_text)
+        self.btn_confirm.setObjectName("btnConfirm")
+        self.btn_confirm.clicked.connect(self.on_confirm)
+        btn_layout.addWidget(self.btn_confirm)
+
+        layout.addLayout(btn_layout)
+
+        self.lock_timer = QTimer(self)
+        self.lock_timer.timeout.connect(self.update_lockout_tick)
+        self.lock_timer.start(1000)
+
+        self.update_lockout_tick()
+        QTimer.singleShot(50, self.edit_pwd.setFocus)
+
+    def toggle_password_visibility(self):
+        if self.edit_pwd.echoMode() == QLineEdit.EchoMode.Password:
+            self.edit_pwd.setEchoMode(QLineEdit.EchoMode.Normal)
+            self.btn_eye.setText("🔒")
+        else:
+            self.edit_pwd.setEchoMode(QLineEdit.EchoMode.Password)
+            self.btn_eye.setText("👁️")
+
+    def update_lockout_tick(self):
+        st = get_password_lockout_status()
+        if st["is_locked"]:
+            rem_s = st["remaining_seconds"]
+            dur_str = format_lockout_duration(rem_s)
+            self.lbl_status.setText(f"⏳ Sistema temporariamente bloqueado por excesso de tentativas incorretas.\nAguarde {dur_str} antes de tentar novamente.")
+            self.lbl_status.setStyleSheet("color: #f38ba8; font-size: 12px; font-weight: bold;")
+            self.btn_confirm.setEnabled(False)
+            self.edit_pwd.setEnabled(False)
+        else:
+            if not self.btn_confirm.isEnabled() and not self._verifying:
+                self.btn_confirm.setEnabled(True)
+                self.edit_pwd.setEnabled(True)
+                self.edit_pwd.setFocus()
+            failed = st["failed_count"]
+            if failed > 0 and not self._verifying and not self._has_error:
+                rem_att = st["remaining_attempts"]
+                self.lbl_status.setText(f"⚠️ Atenção: {failed}/5 tentativas incorretas registradas. Restam {rem_att} tentativa[s].")
+                self.lbl_status.setStyleSheet("color: #fab387; font-size: 12px;")
+
+    def on_confirm(self):
+        pwd = self.edit_pwd.text().strip()
+        if not pwd:
+            self.lbl_status.setText("⚠️ Por favor, digite a sua palavra-passe.")
+            self.lbl_status.setStyleSheet("color: #fab387; font-size: 12px;")
+            self.edit_pwd.setFocus()
+            return
+
+        st = get_password_lockout_status()
+        if st["is_locked"]:
+            self.update_lockout_tick()
+            return
+
+        if self.verify_fn:
+            self._verifying = True
+            self.btn_confirm.setEnabled(False)
+            self.lbl_status.setText("🔄 Validando palavra-passe com autenticidade matemática...")
+            self.lbl_status.setStyleSheet("color: #89b4fa; font-size: 12px;")
+            if QApplication is not None:
+                QApplication.processEvents()
+
+            ok, msg = self.verify_fn(pwd)
+            self._verifying = False
+            self.btn_confirm.setEnabled(True)
+
+            if ok:
+                self._has_error = False
+                self.lbl_status.setText("✅ Palavra-passe validada com sucesso!")
+                self.lbl_status.setStyleSheet("color: #a6e3a1; font-size: 12px; font-weight: bold;")
+                self.verified_password = pwd
+                if QApplication is not None:
+                    QApplication.processEvents()
+                QTimer.singleShot(250, self.accept)
+            else:
+                self._has_error = True
+                self.lbl_status.setText(f"❌ {msg}")
+                self.lbl_status.setStyleSheet("color: #f38ba8; font-size: 12px; font-weight: bold;")
+                self.edit_pwd.selectAll()
+                self.edit_pwd.setFocus()
+                self.update_lockout_tick()
+        else:
+            self.verified_password = pwd
+            self.accept()
+
+    @classmethod
+    def get_verified_password(
+        cls,
+        title: str,
+        prompt: str,
+        verify_fn: Optional[Callable[[str], Tuple[bool, str]]] = None,
+        parent=None,
+        confirm_text: str = "Confirmar"
+    ) -> Tuple[str, bool]:
+        dlg = cls(title, prompt, verify_fn=verify_fn, parent=parent, confirm_text=confirm_text)
+        res = dlg.exec()
+        if res == QDialog.DialogCode.Accepted:
+            return dlg.verified_password, True
+        return "", False
+
+
+# -----------------------------------------------------------------------------
+# SISTEMA DE VERIFICAÇÃO E ATUALIZAÇÃO DO APLICATIVO
+# -----------------------------------------------------------------------------
+APP_VERSION = "2.1.0"
+GITHUB_REPO_URL = "https://github.com/egurken/admin-bridge"
+
+
+class UpdateCheckWorker(QThread):
+    finished_signal = pyqtSignal(bool, str, dict)
+
+    def run(self):
+        """Consulta as atualizações do aplicativo via Git local ou GitHub REST API."""
+        result_data = {
+            "current_version": APP_VERSION,
+            "remote_commit": "",
+            "remote_date": "",
+            "commit_msg": "",
+            "has_update": False,
+            "is_git_repo": False,
+            "git_status": ""
+        }
+        git_dir = BASE_DIR / ".git"
+        if not git_dir.exists():
+            curr_git = Path(__file__).resolve().parent / ".git"
+            if curr_git.exists():
+                git_dir = curr_git
+
+        if git_dir.exists():
+            result_data["is_git_repo"] = True
+            try:
+                subprocess.run(
+                    ["git", "fetch", "origin", "main"],
+                    cwd=str(git_dir.parent),
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                    timeout=10,
+                    creationflags=0x08000000 if sys.platform == "win32" else 0
+                )
+                proc_log = subprocess.run(
+                    ["git", "log", "HEAD..origin/main", "--oneline"],
+                    cwd=str(git_dir.parent),
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                    timeout=5,
+                    creationflags=0x08000000 if sys.platform == "win32" else 0
+                )
+                unpulled = proc_log.stdout.strip()
+                if unpulled:
+                    result_data["has_update"] = True
+                    lines = unpulled.splitlines()
+                    result_data["remote_commit"] = lines[0].split()[0]
+                    result_data["commit_msg"] = "\n".join(lines[:5])
+                    self.finished_signal.emit(True, f"Há {len(lines)} nova(s) atualização(ões) no repositório GitHub!", result_data)
+                    return
+                else:
+                    self.finished_signal.emit(True, "Seu utilitário já está atualizado na versão mais recente do Git!", result_data)
+                    return
+            except Exception as e:
+                result_data["git_status"] = f"Aviso Git: {e}"
+
+        # Fallback: GitHub REST API pública
+        try:
+            import urllib.request
+            req = urllib.request.Request(
+                "https://api.github.com/repos/egurken/admin-bridge/commits/main",
+                headers={"User-Agent": "AdminBridge-Updater-Client"}
+            )
+            with urllib.request.urlopen(req, timeout=6.0) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+                sha = data.get("sha", "")[:7]
+                commit_info = data.get("commit", {})
+                msg = commit_info.get("message", "").split("\n")[0]
+                dt = commit_info.get("author", {}).get("date", "")[:10]
+                result_data["remote_commit"] = sha
+                result_data["commit_msg"] = msg
+                result_data["remote_date"] = dt
+                self.finished_signal.emit(True, f"Último commit remoto verificado: [{sha}] - {msg}", result_data)
+                return
+        except Exception as e:
+            self.finished_signal.emit(False, f"Não foi possível consultar o GitHub: {e}", result_data)
+
+
+class UpdateDialog(QDialog):
+    """Diálogo moderno e interativo de verificação e aplicação de atualizações."""
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("🚀 Atualização do Sistema • Admin Bridge")
+        self.resize(520, 320)
+        self.setMinimumWidth(440)
+        self.setModal(True)
+        self.last_data = {}
+
+        app_icon = get_app_icon()
+        if app_icon and not app_icon.isNull():
+            self.setWindowIcon(app_icon)
+
+        self.setStyleSheet("""
+            QDialog {
+                background-color: #181825;
+                color: #cdd6f4;
+                font-family: 'Segoe UI', system-ui, sans-serif;
+            }
+            QLabel {
+                color: #cdd6f4;
+            }
+            QProgressBar {
+                border: 1px solid #313244;
+                border-radius: 6px;
+                text-align: center;
+                background-color: #11111b;
+                color: #cdd6f4;
+                font-weight: bold;
+                height: 18px;
+            }
+            QProgressBar::chunk {
+                background-color: #89b4fa;
+                border-radius: 5px;
+            }
+            QPushButton {
+                font-weight: bold;
+                border-radius: 6px;
+                padding: 10px 16px;
+                font-size: 13px;
+                border: none;
+            }
+            QPushButton#btnUpdate {
+                background-color: #a6e3a1;
+                color: #11111b;
+            }
+            QPushButton#btnUpdate:hover {
+                background-color: #94e2d5;
+            }
+            QPushButton#btnClose {
+                background-color: #313244;
+                color: #cdd6f4;
+            }
+            QPushButton#btnClose:hover {
+                background-color: #45475a;
+            }
+            QPlainTextEdit {
+                background-color: #11111b;
+                color: #a6adc8;
+                border: 1px solid #313244;
+                border-radius: 6px;
+                font-family: 'Consolas', monospace;
+                font-size: 11px;
+                padding: 8px;
+            }
+        """)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(24, 20, 24, 20)
+        layout.setSpacing(12)
+
+        lbl_title = QLabel("<b>Central de Atualizações do Admin Bridge</b>")
+        lbl_title.setStyleSheet("font-size: 15px; color: #89b4fa;")
+        layout.addWidget(lbl_title)
+
+        self.lbl_info = QLabel(f"Versão Instalada: <b>v{APP_VERSION}</b>\nVerificando atualizações no repositório GitHub...")
+        self.lbl_info.setStyleSheet("font-size: 12px; color: #cdd6f4;")
+        layout.addWidget(self.lbl_info)
+
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setRange(0, 0)
+        layout.addWidget(self.progress_bar)
+
+        self.txt_notes = QPlainTextEdit()
+        self.txt_notes.setReadOnly(True)
+        self.txt_notes.hide()
+        layout.addWidget(self.txt_notes, stretch=1)
+
+        btn_layout = QHBoxLayout()
+        btn_layout.setSpacing(10)
+        btn_layout.addStretch(1)
+
+        self.btn_close = QPushButton("Fechar")
+        self.btn_close.setObjectName("btnClose")
+        self.btn_close.clicked.connect(self.accept)
+        btn_layout.addWidget(self.btn_close)
+
+        self.btn_update = QPushButton("📥 Atualizar Agora")
+        self.btn_update.setObjectName("btnUpdate")
+        self.btn_update.hide()
+        self.btn_update.clicked.connect(self.execute_update)
+        btn_layout.addWidget(self.btn_update)
+
+        layout.addLayout(btn_layout)
+
+        self.worker = UpdateCheckWorker(self)
+        self.worker.finished_signal.connect(self.on_check_finished)
+        self.worker.start()
+
+    def on_check_finished(self, success: bool, message: str, data: dict):
+        self.progress_bar.hide()
+        self.last_data = data
+        if not success:
+            self.lbl_info.setText(f"❌ {message}")
+            self.lbl_info.setStyleSheet("color: #f38ba8; font-size: 12px;")
+            return
+
+        if data.get("has_update"):
+            self.lbl_info.setText(f"🚀 <b>Nova atualização disponível!</b>\nCommit: {data.get('remote_commit', '')}")
+            self.lbl_info.setStyleSheet("color: #a6e3a1; font-size: 13px;")
+            self.txt_notes.setPlainText(data.get("commit_msg", ""))
+            self.txt_notes.show()
+            self.btn_update.show()
+        else:
+            self.lbl_info.setText(f"✅ {message}\nSeu sistema está 100% atualizado e alinhado.")
+            self.lbl_info.setStyleSheet("color: #a6e3a1; font-size: 12px;")
+            if data.get("commit_msg"):
+                self.txt_notes.setPlainText(f"Último commit: {data.get('remote_commit', '')}\n{data.get('commit_msg', '')}")
+                self.txt_notes.show()
+
+    def execute_update(self):
+        self.btn_update.setEnabled(False)
+        self.btn_close.setEnabled(False)
+        self.lbl_info.setText("🔄 Baixando e aplicando atualização do repositório...")
+        self.progress_bar.show()
+
+        def _pull_worker():
+            try:
+                git_dir = BASE_DIR / ".git"
+                if not git_dir.exists():
+                    curr_git = Path(__file__).resolve().parent / ".git"
+                    if curr_git.exists():
+                        git_dir = curr_git
+                if git_dir.exists():
+                    p = subprocess.run(
+                        ["git", "pull", "origin", "main"],
+                        cwd=str(git_dir.parent),
+                        capture_output=True,
+                        text=True,
+                        check=False,
+                        timeout=30,
+                        creationflags=0x08000000 if sys.platform == "win32" else 0
+                    )
+                    return True, p.stdout or "Atualizado com sucesso."
+                return False, "Repositório local não configurado para git pull."
+            except Exception as e:
+                return False, str(e)
+
+        def _on_done(res):
+            ok, msg = res
+            self.progress_bar.hide()
+            self.btn_close.setEnabled(True)
+            if ok:
+                self.lbl_info.setText("✅ <b>Atualização aplicada com sucesso!</b>\nReinicie a Central de Gestão para carregar os novos arquivos.")
+                self.lbl_info.setStyleSheet("color: #a6e3a1; font-size: 13px;")
+                self.txt_notes.setPlainText(msg)
+                self.btn_update.setText("Reiniciar Agora")
+                self.btn_update.setEnabled(True)
+                self.btn_update.clicked.disconnect()
+                self.btn_update.clicked.connect(self.restart_app)
+            else:
+                self.lbl_info.setText(f"❌ Falha ao aplicar atualização: {msg}")
+                self.lbl_info.setStyleSheet("color: #f38ba8; font-size: 12px;")
+
+        threading.Thread(target=lambda: _on_done(_pull_worker()), daemon=True).start()
+
+    def restart_app(self):
+        try:
+            subprocess.Popen([sys.executable] + sys.argv[1:], creationflags=0x08000000 if sys.platform == "win32" else 0)
+        except Exception:
+            pass
+        QApplication.quit()
+
+
+# -----------------------------------------------------------------------------
 # JANELA PRINCIPAL DA CENTRAL DE GESTÃO (SYSTEM TRAY & DASHBOARD)
 # -----------------------------------------------------------------------------
 
@@ -1604,6 +2115,9 @@ class AdminBridgeWindow(QMainWindow):
 
         # Atualiza métricas iniciais
         self.refresh_dashboard()
+
+        # Checagem não-bloqueante em segundo plano do motor de IA
+        QTimer.singleShot(1500, self._check_ai_status_background)
 
     def init_ui(self):
         central_widget = QWidget()
@@ -1797,7 +2311,7 @@ class AdminBridgeWindow(QMainWindow):
         self.act_install_ai = QAction("🤖 Instalar e Testar Mini-IA Local (Qwen 0.5B)...", self)
         self.act_install_ai.triggered.connect(self.install_local_ai_assistant)
         self.settings_menu.addAction(self.act_install_ai)
-        if is_local_slm_verified():
+        if is_local_slm_verified(probe_network=False):
             self.act_install_ai.setVisible(False)
 
         act_status = QAction("📋 Status Detalhado do Contador", self)
@@ -1809,6 +2323,10 @@ class AdminBridgeWindow(QMainWindow):
         self.settings_menu.addAction(act_revoke_auth)
 
         self.settings_menu.addSeparator()
+
+        act_update = QAction("🚀 Verificar Atualizações...", self)
+        act_update.triggered.connect(self.show_update_dialog)
+        self.settings_menu.addAction(act_update)
 
         act_reset = QAction("🔄 Reiniciar Configuração...", self)
         act_reset.triggered.connect(self.open_reset_dialog)
@@ -2049,6 +2567,10 @@ class AdminBridgeWindow(QMainWindow):
 
         tray_menu.addSeparator()
 
+        update_action = QAction("🚀 Verificar Atualizações...", self)
+        update_action.triggered.connect(self.show_update_dialog)
+        tray_menu.addAction(update_action)
+
         quit_action = QAction("❌ Encerrar Utilitário", self)
         quit_action.triggered.connect(self.quit_app)
         tray_menu.addAction(quit_action)
@@ -2109,20 +2631,33 @@ class AdminBridgeWindow(QMainWindow):
                 if not getattr(self, "_history_user_hidden", False) and not self.history_panel.isVisible():
                     self.history_panel.show()
 
+    def show_update_dialog(self):
+        """Abre o diálogo interativo de verificação e aplicação de atualizações."""
+        dlg = UpdateDialog(self)
+        dlg.exec()
+
+    def _check_ai_status_background(self):
+        """Verifica se a Mini-IA Local está pronta em background sem engasgar o startup."""
+        def _bg():
+            try:
+                if is_local_slm_verified(probe_network=True):
+                    if hasattr(self, "act_install_ai"):
+                        QTimer.singleShot(0, lambda: self.act_install_ai.setVisible(False))
+            except Exception:
+                pass
+        threading.Thread(target=_bg, daemon=True).start()
+
     def quit_app(self, force_no_prompt: bool = False):
         """Exige a Palavra-passe de Recuperação antes de permitir encerrar a Central de Gestão."""
         if not force_no_prompt and self.hotp_auth.is_provisioned():
-            pwd, ok = QInputDialog.getText(
-                self,
-                "Autenticação Obrigatória • Encerrar Utilitário",
-                "Digite sua Palavra-passe de Recuperação para encerrar o Admin Bridge:",
-                QLineEdit.EchoMode.Password
+            pwd, ok = ResponsivePasswordDialog.get_verified_password(
+                title="Autenticação Obrigatória • Encerrar Utilitário",
+                prompt="Digite sua Palavra-passe de Recuperação para encerrar o Admin Bridge:",
+                verify_fn=self.hotp_auth.verify_quit_password,
+                parent=self,
+                confirm_text="Encerrar"
             )
-            if not ok or not pwd.strip():
-                return
-            valid_pw, msg_pw = self.hotp_auth.verify_quit_password(pwd.strip())
-            if not valid_pw:
-                QMessageBox.critical(self, "Acesso Negado", f"Não foi possível encerrar o utilitário:\n{msg_pw}")
+            if not ok or not pwd:
                 return
         self.tray_icon.hide()
         QApplication.quit()
@@ -2573,64 +3108,63 @@ class AdminBridgeWindow(QMainWindow):
         self.btn_approve.setEnabled(False)
 
     def prompt_and_execute_repair(self):
-        pwd, ok = QInputDialog.getText(
-            self,
-            "Reparo e Re-Ancoragem do Sistema",
-            "Digite a sua Palavra-passe de Recuperação para revalidar a integridade e destravar o sistema:",
-            QLineEdit.EchoMode.Password
-        )
-        if not ok or not pwd or not pwd.strip():
-            return
-        pwd = pwd.strip()
+        def _verify_and_repair(entered_pw: str) -> Tuple[bool, str]:
+            success, msg = self.hotp_auth.repair_corrupted_installation(entered_pw)
 
-        # 1. Tenta reparar diretamente ou via RPC para o daemon SYSTEM
-        success, msg = self.hotp_auth.repair_corrupted_installation(pwd)
-
-        # 2. Se o daemon estava desligado (ex: após Lockdown) e a janela atual não tem Admin,
-        # executa o subcomando CLI 'repair --password' elevado via UAC e aguarda concluir!
-        if not success and not is_admin() and ("Permissao" in msg or "Acesso" in msg or "nao foi possivel" in msg.lower()):
-            try:
-                sei = SHELLEXECUTEINFO()
-                sei.cbSize = ctypes.sizeof(SHELLEXECUTEINFO)
-                sei.fMask = 0x00000040  # SEE_MASK_NOCLOSEPROCESS
-                sei.hwnd = int(self.winId())
-                sei.lpVerb = "runas"
-                sei.lpFile = sys.executable
-                if getattr(sys, "frozen", False):
-                    sei.lpParameters = f'repair --password "{pwd}"'
-                else:
-                    sei.lpParameters = f'"{Path(__file__).resolve()}" repair --password "{pwd}"'
-                sei.nShow = 0  # SW_HIDE
-                if ctypes.windll.shell32.ShellExecuteExW(ctypes.byref(sei)) and sei.hProcess:
-                    ctypes.windll.kernel32.WaitForSingleObject(sei.hProcess, 15000)
-                    ec = wintypes.DWORD()
-                    ctypes.windll.kernel32.GetExitCodeProcess(sei.hProcess, ctypes.byref(ec))
-                    ctypes.windll.kernel32.CloseHandle(sei.hProcess)
-                    if ec.value == 0:
-                        clear_integrity_caches()
-                        success = True
-                        msg = "Integridade revalidada, assinatura re-ancorada e serviço SYSTEM reativado com sucesso!"
+            if not success and not is_admin() and ("Permissao" in msg or "Acesso" in msg or "nao foi possivel" in msg.lower()):
+                try:
+                    sei = SHELLEXECUTEINFO()
+                    sei.cbSize = ctypes.sizeof(SHELLEXECUTEINFO)
+                    sei.fMask = 0x00000040  # SEE_MASK_NOCLOSEPROCESS
+                    sei.hwnd = int(self.winId())
+                    sei.lpVerb = "runas"
+                    sei.lpFile = sys.executable
+                    if getattr(sys, "frozen", False):
+                        sei.lpParameters = f'repair --password "{entered_pw}"'
                     else:
-                        msg = "Palavra-passe de recuperação incorreta ou falha ao re-ancorar."
-            except Exception as e:
-                msg = f"Falha ao elevar privilégios para reparo: {e}"
+                        sei.lpParameters = f'"{Path(__file__).resolve()}" repair --password "{entered_pw}"'
+                    sei.nShow = 0  # SW_HIDE
+                    if ctypes.windll.shell32.ShellExecuteExW(ctypes.byref(sei)) and sei.hProcess:
+                        ctypes.windll.kernel32.WaitForSingleObject(sei.hProcess, 15000)
+                        ec = wintypes.DWORD()
+                        ctypes.windll.kernel32.GetExitCodeProcess(sei.hProcess, ctypes.byref(ec))
+                        ctypes.windll.kernel32.CloseHandle(sei.hProcess)
+                        if ec.value == 0:
+                            clear_integrity_caches()
+                            reset_password_lockout()
+                            return True, "Integridade revalidada, assinatura re-ancorada e serviço SYSTEM reativado com sucesso!"
+                        else:
+                            fail_st = record_password_failure()
+                            if fail_st["is_locked"]:
+                                return False, f"Palavra-passe de recuperação incorreta! Limite de 5 tentativas atingido. Sistema bloqueado por {format_lockout_duration(fail_st['remaining_seconds'])}."
+                            return False, f"Palavra-passe de recuperação incorreta ou falha ao re-ancorar. Restam {fail_st['remaining_attempts']} tentativa(s)."
+                except Exception as e:
+                    return False, f"Falha ao elevar privilégios para reparo: {e}"
+            return success, msg
 
-        if success:
-            if is_admin():
-                threading.Thread(target=register_scheduled_task, daemon=True).start()
-            clear_integrity_caches()
-            self.refresh_dashboard()
-            QMessageBox.information(
-                self,
-                "Reparo Concluído",
-                f"{msg}\nO painel foi atualizado para o estado Ativo."
-            )
-            if not self.hotp_auth.is_provisioned():
-                wizard = SetupWizardDialog(self.hotp_auth, self)
-                wizard.exec()
-            self.refresh_dashboard()
-        else:
-            QMessageBox.critical(self, "Falha no Reparo", msg)
+        pwd, ok = ResponsivePasswordDialog.get_verified_password(
+            title="Reparo e Re-Ancoragem do Sistema",
+            prompt="Digite a sua Palavra-passe de Recuperação para revalidar a integridade e destravar o sistema:",
+            verify_fn=_verify_and_repair,
+            parent=self,
+            confirm_text="Reparar e Destravar"
+        )
+        if not ok or not pwd:
+            return
+
+        if is_admin():
+            threading.Thread(target=register_scheduled_task, daemon=True).start()
+        clear_integrity_caches()
+        self.refresh_dashboard()
+        QMessageBox.information(
+            self,
+            "Reparo Concluído",
+            "Integridade revalidada e re-ancorada com sucesso!\nO painel foi atualizado para o estado Ativo."
+        )
+        if not self.hotp_auth.is_provisioned():
+            wizard = SetupWizardDialog(self.hotp_auth, self)
+            wizard.exec()
+        self.refresh_dashboard()
 
     def revoke_auth_session(self):
         ok, msg = self.hotp_auth.revoke_preauth_ticket()
@@ -2679,23 +3213,27 @@ class AdminBridgeWindow(QMainWindow):
 
         pwd = ""
         if self.hotp_auth.is_provisioned():
-            pwd, ok_pw = QInputDialog.getText(
-                self,
-                "Autenticação Obrigatória • Desinstalação",
-                "Digite sua Palavra-passe de Recuperação para destravar os arquivos e desinstalar:",
-                QLineEdit.EchoMode.Password
+            pwd, ok_pw = ResponsivePasswordDialog.get_verified_password(
+                title="Autenticação Obrigatória • Desinstalação",
+                prompt="Digite sua Palavra-passe de Recuperação para destravar os arquivos e desinstalar:",
+                verify_fn=lambda p: self.hotp_auth.authorize_and_prepare_uninstall(
+                    p,
+                    caller_info={"pid": os.getpid(), "exe": sys.executable, "user": os.getenv("USERNAME", "unknown")}
+                ),
+                parent=self,
+                confirm_text="Destravar e Desinstalar"
             )
             if not ok_pw or not pwd.strip():
                 return
             pwd = pwd.strip()
-
-        ok_auth, auth_msg = self.hotp_auth.authorize_and_prepare_uninstall(
-            pwd,
-            caller_info={"pid": os.getpid(), "exe": sys.executable, "user": os.getenv("USERNAME", "unknown")}
-        )
-        if not ok_auth:
-            QMessageBox.critical(self, "Desinstalação Bloqueada", auth_msg)
-            return
+        else:
+            ok_auth, auth_msg = self.hotp_auth.authorize_and_prepare_uninstall(
+                "",
+                caller_info={"pid": os.getpid(), "exe": sys.executable, "user": os.getenv("USERNAME", "unknown")}
+            )
+            if not ok_auth:
+                QMessageBox.critical(self, "Desinstalação Bloqueada", auth_msg)
+                return
 
         if not is_admin():
             try:

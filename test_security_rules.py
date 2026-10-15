@@ -15,6 +15,9 @@ from hotp_crypto import (
     unprotect_transit_token,
     ensure_transit_keypair,
     verify_scheduled_task_integrity,
+    get_password_lockout_status,
+    record_password_failure,
+    reset_password_lockout,
 )
 from app import is_self_targeting_command
 from hotp_crypto import inspect_script_3_layers
@@ -484,8 +487,68 @@ def test_all_security_rules():
         assert "sc.exe create ServicoEscondido" in rep_nested["unrolled_code"]
         print("  -> PASSOU: Scripts externos aninhados (.bat -> .ps1) são abertos e inspecionados recursivamente!")
 
+        print("[*] 23. Testando Controle de Taxa e Bloqueio Progressivo de Senha (Limite 5 Tentativas e até 4 Horas)...")
+        test_lock_file = Path(tmpdir) / "test_pw_lockout.json"
+        reset_password_lockout(test_lock_file)
+        st0 = get_password_lockout_status(test_lock_file)
+        assert not st0["is_locked"]
+        assert st0["failed_count"] == 0
+        assert st0["remaining_attempts"] == 5
+
+        # 4 tentativas falhas não bloqueiam o sistema ainda
+        for i in range(1, 5):
+            st_f = record_password_failure(test_lock_file)
+            assert not st_f["is_locked"]
+            assert st_f["failed_count"] == i
+            assert st_f["remaining_attempts"] == 5 - i
+
+        # 5ª tentativa falha aciona o bloqueio de 5 minutos (300 segundos)
+        st5 = record_password_failure(test_lock_file)
+        assert st5["is_locked"]
+        assert st5["failed_count"] == 5
+        assert st5["lockout_duration"] == 300
+        assert 295 <= st5["remaining_seconds"] <= 300
+
+        # Enquanto bloqueado, verify_quit_password deve rejeitar imediatamente com o tempo restante
+        ok_l, msg_l = auth.verify_quit_password("SenhaIncorreta", custom_lockout_file=test_lock_file)
+        assert not ok_l
+        assert "bloqueado" in msg_l.lower()
+
+        # 6ª tentativa falha progride para 15 minutos (900s)
+        st6 = record_password_failure(test_lock_file)
+        assert st6["is_locked"]
+        assert st6["lockout_duration"] == 900
+
+        # 7ª tentativa falha progride para 30 minutos (1800s)
+        st7 = record_password_failure(test_lock_file)
+        assert st7["lockout_duration"] == 1800
+
+        # 8ª tentativa falha progride para 1 hora (3600s)
+        st8 = record_password_failure(test_lock_file)
+        assert st8["lockout_duration"] == 3600
+
+        # 9ª tentativa falha progride para 2 horas (7200s)
+        st9 = record_password_failure(test_lock_file)
+        assert st9["lockout_duration"] == 7200
+
+        # 10ª tentativa falha progride para o teto máximo de 4 horas (14400s)
+        st10 = record_password_failure(test_lock_file)
+        assert st10["lockout_duration"] == 14400
+
+        # 11ª tentativa mantém o teto em 4 horas (14400s)
+        st11 = record_password_failure(test_lock_file)
+        assert st11["lockout_duration"] == 14400
+
+        # Digitar a senha correta zera o contador e remove o bloqueio
+        reset_password_lockout(test_lock_file)
+        st_reset = get_password_lockout_status(test_lock_file)
+        assert not st_reset["is_locked"]
+        assert st_reset["failed_count"] == 0
+        assert st_reset["remaining_attempts"] == 5
+        print("  -> PASSOU: Controle de taxa de 5 tentativas e escala progressiva de 5m a 4h validado com sucesso!")
+
     print("\n=======================================================")
-    print("TODOS OS 22 REQUISITOS DE SEGURANÇA FORAM TESTADOS E APROVADOS!")
+    print("TODOS OS 23 REQUISITOS DE SEGURANÇA FORAM TESTADOS E APROVADOS!")
     print("=======================================================")
 
 

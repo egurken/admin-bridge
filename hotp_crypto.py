@@ -14,7 +14,7 @@ import threading
 import time
 from datetime import datetime
 from pathlib import Path
-from typing import Optional, Tuple
+from typing import Optional, Tuple, List, Callable, Dict, Any
 
 if sys.platform == "win32":
     import msvcrt
@@ -2139,8 +2139,10 @@ def _ensure_ollama_on_demand() -> Optional[str]:
     return None
 
 
-def is_local_slm_verified() -> bool:
-    """Verifica se o mini-modelo local qwen2.5:0.5b já foi instalado, testado e aprovado."""
+def is_local_slm_verified(probe_network: bool = False) -> bool:
+    """Verifica se o mini-modelo local qwen2.5:0.5b já foi instalado, testado e aprovado.
+    Por padrão (probe_network=False), realiza apenas leitura local ultrarrápida do selo em disco (< 0.1ms).
+    """
     if AI_READY_SEAL_FILE.exists():
         try:
             data = json.loads(AI_READY_SEAL_FILE.read_text(encoding="utf-8"))
@@ -2148,7 +2150,10 @@ def is_local_slm_verified() -> bool:
                 return True
         except Exception:
             pass
-    # Se o selo ainda não existir, consulta rapidamente /api/tags (timeout 0.4s) para ver se qwen2.5:0.5b já está no Ollama
+    if not probe_network:
+        return False
+
+    # Se probe_network=True e o selo ainda não existir, consulta /api/tags (timeout 0.4s) em segundo plano
     try:
         import urllib.request
         with urllib.request.urlopen("http://127.0.0.1:11434/api/tags", timeout=0.4) as resp:
@@ -2370,3 +2375,135 @@ def inspect_script_3_layers(code_text: str) -> dict:
         "unrolled_code": unrolled_text,
         "explanation": explanation
     }
+
+
+# =============================================================================
+# CONTROLE DE TAXA E BLOQUEIO PROGRESSIVO DE SENHA (RATE LIMITING & LOCKOUT)
+# =============================================================================
+PASSWORD_LOCKOUT_FILE = QUEUE_DIR / "password_lockout.json"
+PASSWORD_LOCKOUT_FALLBACK = Path(tempfile.gettempdir()) / "adminbridge_pw_lockout.json"
+PASSWORD_LOCKOUT_THRESHOLDS = {
+    5: 300,      # 5 min
+    6: 900,      # 15 min
+    7: 1800,     # 30 min
+    8: 3600,     # 1 hora
+    9: 7200,     # 2 horas
+}
+MAX_LOCKOUT_SECONDS = 14400  # 4 horas (14400s max)
+MAX_PASSWORD_ATTEMPTS = 5
+
+
+def format_lockout_duration(seconds: int) -> str:
+    """Formata segundos em representação legível (ex: 4h, 30m, 5m 0s)."""
+    if seconds <= 0:
+        return "0s"
+    hours = seconds // 3600
+    minutes = (seconds % 3600) // 60
+    secs = seconds % 60
+    parts = []
+    if hours > 0:
+        parts.append(f"{hours}h")
+    if minutes > 0:
+        parts.append(f"{minutes}m")
+    if secs > 0 or not parts:
+        parts.append(f"{secs}s")
+    return " ".join(parts)
+
+
+def _resolve_lockout_files(custom_file: Optional[Path] = None) -> List[Path]:
+    if custom_file is not None:
+        return [custom_file]
+    return [PASSWORD_LOCKOUT_FILE, PASSWORD_LOCKOUT_FALLBACK]
+
+
+def get_password_lockout_status(custom_file: Optional[Path] = None) -> dict:
+    """Retorna o estado de bloqueio e contagem de tentativas incorretas."""
+    files = _resolve_lockout_files(custom_file)
+    data = {}
+    for f in files:
+        if f.exists():
+            try:
+                data = json.loads(f.read_text(encoding="utf-8"))
+                if data and isinstance(data, dict):
+                    break
+            except Exception:
+                pass
+
+    failed_count = int(data.get("failed_count", 0))
+    locked_until = float(data.get("locked_until", 0.0))
+    now = time.time()
+
+    is_locked = False
+    remaining = 0
+    if locked_until > now:
+        is_locked = True
+        remaining = int(locked_until - now)
+
+    rem_attempts = max(0, MAX_PASSWORD_ATTEMPTS - failed_count) if not is_locked else 0
+    duration = int(data.get("lockout_duration", 0))
+
+    if is_locked:
+        msg = f"Sistema bloqueado por excesso de tentativas. Aguarde {format_lockout_duration(remaining)}."
+    elif failed_count > 0:
+        msg = f"Tentativas incorretas: {failed_count}/{MAX_PASSWORD_ATTEMPTS}. Restam {rem_attempts} tentativa(s)."
+    else:
+        msg = "Pronto para autenticação."
+
+    return {
+        "is_locked": is_locked,
+        "remaining_seconds": remaining,
+        "failed_count": failed_count,
+        "max_attempts": MAX_PASSWORD_ATTEMPTS,
+        "remaining_attempts": rem_attempts,
+        "lockout_duration": duration,
+        "message": msg
+    }
+
+
+def record_password_failure(custom_file: Optional[Path] = None) -> dict:
+    """Registra uma tentativa falha de senha e aplica penalidade progressiva (5 min a 4 horas)."""
+    st = get_password_lockout_status(custom_file)
+    failed_count = st["failed_count"] + 1
+    now = time.time()
+
+    duration = 0
+    locked_until = 0.0
+    if failed_count >= MAX_PASSWORD_ATTEMPTS:
+        duration = PASSWORD_LOCKOUT_THRESHOLDS.get(failed_count, MAX_LOCKOUT_SECONDS)
+        locked_until = now + duration
+
+    payload = {
+        "failed_count": failed_count,
+        "locked_until": locked_until,
+        "lockout_duration": duration,
+        "last_failure_at": now
+    }
+
+    raw = json.dumps(payload, indent=2)
+    files = _resolve_lockout_files(custom_file)
+    for f in files:
+        try:
+            f.parent.mkdir(parents=True, exist_ok=True)
+            f.write_text(raw, encoding="utf-8")
+        except Exception:
+            pass
+
+    return get_password_lockout_status(custom_file)
+
+
+def reset_password_lockout(custom_file: Optional[Path] = None):
+    """Zera o contador de falhas e remove qualquer bloqueio após autenticação com sucesso."""
+    payload = {
+        "failed_count": 0,
+        "locked_until": 0.0,
+        "lockout_duration": 0,
+        "last_success_at": time.time()
+    }
+    raw = json.dumps(payload, indent=2)
+    files = _resolve_lockout_files(custom_file)
+    for f in files:
+        try:
+            f.parent.mkdir(parents=True, exist_ok=True)
+            f.write_text(raw, encoding="utf-8")
+        except Exception:
+            pass
