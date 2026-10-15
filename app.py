@@ -92,6 +92,23 @@ try:
 except Exception:
     pass
 
+debug_log_path = Path(os.environ.get("TEMP", ".")) / "adminbridge_debug.log"
+def _debug_log(msg: str):
+    try:
+        with open(debug_log_path, "a", encoding="utf-8") as f:
+            f.write(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] [PID:{os.getpid()}] {msg}\n")
+    except Exception:
+        pass
+
+def _global_excepthook(exc_type, exc_value, exc_tb):
+    import traceback
+    tb = "".join(traceback.format_exception(exc_type, exc_value, exc_tb))
+    _debug_log(f"CRITICAL UNCAUGHT EXCEPTION:\n{tb}")
+    if sys.__excepthook__:
+        sys.__excepthook__(exc_type, exc_value, exc_tb)
+
+sys.excepthook = _global_excepthook
+
 if sys.stdout is not None:
     try:
         console_handler = logging.StreamHandler(sys.stdout)
@@ -99,6 +116,7 @@ if sys.stdout is not None:
         root_logger.addHandler(console_handler)
     except Exception:
         pass
+
 
 
 def is_admin() -> bool:
@@ -2160,14 +2178,23 @@ class AdminBridgeWindow(QMainWindow):
             self.lbl_status_val.setStyleSheet("color: #a6e3a1;")
             self.btn_repair.hide()
 
-        # 2. Popula a tabela de histórico apenas quando auth.log realmente mudou (preserva rolagem, seleção e zero uso de CPU)
+        # 2. Popula a tabela de histórico apenas quando auth.log ou status.json realmente mudaram (preserva rolagem, seleção e zero uso de CPU)
         curr_log_sig = None
-        if AUTH_LOG_FILE.exists():
-            try:
+        try:
+            if AUTH_LOG_FILE.exists():
                 st_log = AUTH_LOG_FILE.stat()
                 curr_log_sig = (int(st_log.st_mtime_ns), int(st_log.st_size))
+        except Exception:
+            curr_log_sig = None
+
+        if curr_log_sig is None:
+            try:
+                if STATUS_FILE.exists():
+                    st_stat = STATUS_FILE.stat()
+                    curr_log_sig = ("status", int(st_stat.st_mtime_ns), int(st_stat.st_size))
             except Exception:
                 curr_log_sig = None
+
 
         if curr_log_sig != getattr(self, "_last_history_sig", object()):
             self._last_history_sig = curr_log_sig
@@ -3515,9 +3542,14 @@ def run_cli_setup(args, hotp_auth: HOTPAuth):
 # PONTO DE ENTRADA PRINCIPAL
 # -----------------------------------------------------------------------------
 def main():
+    _debug_log(f"main() entry - sys.argv: {sys.argv}")
     configure_anti_dump_mitigations()
+    _debug_log("configure_anti_dump_mitigations() done")
     ensure_environment_installed()
+    _debug_log("ensure_environment_installed() done")
     hotp_auth = HOTPAuth()
+    _debug_log("HOTPAuth() initialized")
+
 
     parser = argparse.ArgumentParser(
         description="Admin Bridge • Central de Gestão HOTP",
@@ -3611,14 +3643,16 @@ def main():
         app.setWindowIcon(app_icon)
 
     # Verificação de Instância Única (Single Instance) via QLocalSocket
+    _debug_log(f"Testing QLocalSocket with {LOCAL_SERVER_NAME}...")
     local_socket = QLocalSocket()
     local_socket.connectToServer(LOCAL_SERVER_NAME)
     if local_socket.waitForConnected(500):
-        # Outra instância já está ativa: solicita foco e encerra o novo processo
+        _debug_log(f"Existing instance detected on {LOCAL_SERVER_NAME}! Sending SHOW and exiting.")
         local_socket.write(b"SHOW\n")
         local_socket.waitForBytesWritten(1000)
         local_socket.disconnectFromServer()
         sys.exit(0)
+    _debug_log(f"No existing instance on {LOCAL_SERVER_NAME}. Starting new server.")
 
     # Inicia escuta local para instâncias futuras
     QLocalServer.removeServer(LOCAL_SERVER_NAME)
@@ -3626,19 +3660,25 @@ def main():
     ipc_server.listen(LOCAL_SERVER_NAME)
 
     # Verifica se já está provisionado
-    if not hotp_auth.is_provisioned():
-        # Primeira execução: se não for admin, eleva para conseguir salvar chave e permissões SYSTEM
+    _debug_log("Checking is_provisioned()...")
+    is_prov = hotp_auth.is_provisioned()
+    _debug_log(f"is_provisioned result: {is_prov}")
+    if not is_prov:
         if not is_admin():
+            _debug_log("Not provisioned and not admin, requesting elevation...")
             try:
                 request_elevation()
                 return
-            except Exception:
-                pass
+            except Exception as e:
+                _debug_log(f"Elevation request failed: {e}")
         wizard = SetupWizardDialog(hotp_auth)
         if wizard.exec() != QDialog.DialogCode.Accepted:
+            _debug_log("Wizard cancelled, exiting with 0.")
             sys.exit(0)
 
+    _debug_log("Creating AdminBridgeWindow...")
     window = AdminBridgeWindow(hotp_auth)
+    _debug_log("AdminBridgeWindow created.")
 
     def handle_ipc_activation():
         while ipc_server.hasPendingConnections():
@@ -3655,11 +3695,17 @@ def main():
     # Por padrão, abre a janela diretamente na tela do usuário.
     # Se --minimized for passado explicitamente, oculta na bandeja.
     if args.minimized:
+        _debug_log("Hiding window (minimized requested)...")
         window.hide()
     else:
+        _debug_log("Showing window...")
         window.show_window()
 
-    sys.exit(app.exec())
+    _debug_log("Entering app.exec()...")
+    rc = app.exec()
+    _debug_log(f"app.exec() terminated with code {rc}")
+    sys.exit(rc)
+
 
 
 if __name__ == "__main__":

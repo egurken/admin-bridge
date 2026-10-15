@@ -13,6 +13,7 @@ from hotp_crypto import (
     generate_mutual_confirmation_code,
     protect_transit_token,
     unprotect_transit_token,
+    ensure_transit_keypair,
     verify_scheduled_task_integrity,
 )
 from app import is_self_targeting_command
@@ -359,20 +360,27 @@ def test_all_security_rules():
         print("  -> PASSOU: Contra-senha mútua gerada e validada matematicamente no modo auth!")
 
         print("[*] 17. Testando Proteção DPAPI de OTP em Trânsito e Anti-TOCTOU na Fila...")
+        tmp_cfg_dir = Path(tmpdir) / "config"
+        tmp_q_dir = Path(tmpdir) / "queue"
+        tmp_cfg_dir.mkdir(parents=True, exist_ok=True)
+        tmp_q_dir.mkdir(parents=True, exist_ok=True)
+        ensure_transit_keypair(tmp_cfg_dir, tmp_q_dir)
+
         req_id = "req-12345"
         legit_code = "ipconfig /flushdns"
         legit_hash = hashlib.sha256(legit_code.encode("utf-8")).hexdigest()
-        enc_otp = protect_transit_token("654321", req_id, legit_hash)
+        enc_otp = protect_transit_token("654321", req_id, legit_hash, config_dir=tmp_cfg_dir, queue_dir=tmp_q_dir)
         assert enc_otp and "654321" not in enc_otp
 
         # Descriptografia legítima com mesmo req_id e code_hash funciona
-        dec_otp = unprotect_transit_token(enc_otp, req_id, legit_hash)
+        dec_otp = unprotect_transit_token(enc_otp, req_id, legit_hash, config_dir=tmp_cfg_dir)
         assert dec_otp == "654321"
 
         # Se um atacante na fila alterar o comando (code_hash diferente), a descriptografia falha!
         evil_hash = hashlib.sha256(b"net localgroup administrators attacker /add").hexdigest()
-        assert unprotect_transit_token(enc_otp, req_id, evil_hash) is None
+        assert unprotect_transit_token(enc_otp, req_id, evil_hash, config_dir=tmp_cfg_dir) is None
         print("  -> PASSOU: OTP protegido em trânsito e vinculado criptograficamente ao comando!")
+
 
         print("[*] 18. Testando Bloqueio de Desinstalação sem Senha e Autorização com Senha Mestra...")
         # Sem senha deve bloquear

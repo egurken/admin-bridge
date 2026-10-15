@@ -259,8 +259,8 @@ class HOTPAuth:
             status_text = "Bloqueado por adulteração"
 
         recent_hist = []
-        if AUTH_LOG_FILE.exists():
-            try:
+        try:
+            if AUTH_LOG_FILE.exists():
                 with open(AUTH_LOG_FILE, "r", encoding="utf-8", errors="replace") as lf:
                     lines = lf.readlines()
                 for line in reversed(lines[-40:]):
@@ -289,8 +289,8 @@ class HOTPAuth:
                         })
                         if len(recent_hist) >= 30:
                             break
-            except Exception:
-                pass
+        except Exception:
+            pass
 
         status_payload = {
             "counter": cfg.get("counter", 0),
@@ -402,10 +402,14 @@ class HOTPAuth:
             except Exception:
                 pass
 
-        if self.config_file.exists():
+        try:
+            if self.config_file.exists():
+                return True
+        except Exception:
             return True
 
         return False
+
 
     def is_lockdown(self) -> bool:
         """Verifica se o sistema está em estado de lockdown de segurança."""

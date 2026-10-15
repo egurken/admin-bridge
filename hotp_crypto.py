@@ -298,8 +298,8 @@ def dpapi_unprotect(ciphertext: bytes, entropy: bytes = DPAPI_ENTROPY) -> bytear
     return mutable_out
 
 
-_transit_priv_cache = None
-_transit_pub_cache = None
+_transit_priv_cache = {}
+_transit_pub_cache = {}
 
 
 def ensure_transit_keypair(config_dir: Path = CONFIG_DIR, queue_dir: Path = QUEUE_DIR) -> bytes:
@@ -313,9 +313,10 @@ def ensure_transit_keypair(config_dir: Path = CONFIG_DIR, queue_dir: Path = QUEU
 
     priv_file = config_dir / "transit_priv.bin"
     pub_file = queue_dir / "transit_pub.json"
+    cfg_key = str(config_dir.resolve())
 
-    if _transit_priv_cache is not None and pub_file.exists():
-        return _transit_pub_cache
+    if cfg_key in _transit_priv_cache and pub_file.exists():
+        return _transit_pub_cache[cfg_key]
 
     try:
         config_dir.mkdir(parents=True, exist_ok=True)
@@ -352,12 +353,13 @@ def ensure_transit_keypair(config_dir: Path = CONFIG_DIR, queue_dir: Path = QUEU
             encoding=serialization.Encoding.Raw,
             format=serialization.PublicFormat.Raw
         )
-        _transit_priv_cache = priv_key
-        _transit_pub_cache = pub_bytes
+        _transit_priv_cache[cfg_key] = priv_key
+        _transit_pub_cache[cfg_key] = pub_bytes
         pub_b64 = base64.b64encode(pub_bytes).decode("ascii")
         pub_file.write_text(json.dumps({"pub_x25519_b64": pub_b64}), encoding="utf-8")
         return pub_bytes
     except Exception:
+
         return b""
 
 
@@ -434,18 +436,23 @@ def unprotect_transit_token(enc_b64: str, req_id: str, code_hash: str, config_di
             ciphertext = body[80:]
 
             global _transit_priv_cache
-            priv_key = _transit_priv_cache
+            cfg_key = str(config_dir.resolve())
+            priv_key = _transit_priv_cache.get(cfg_key)
             if priv_key is None:
                 priv_file = config_dir / "transit_priv.bin"
-                if not priv_file.exists():
-                    return None
-                comp_ent = get_composite_entropy(DPAPI_QUEUE_ENTROPY, config_dir)
-                priv_ba = dpapi_unprotect(priv_file.read_bytes(), entropy=comp_ent)
                 try:
-                    priv_key = x25519.X25519PrivateKey.from_private_bytes(bytes(priv_ba))
-                    _transit_priv_cache = priv_key
-                finally:
-                    wipe_buffer(priv_ba)
+                    if not priv_file.exists():
+                        return None
+                    comp_ent = get_composite_entropy(DPAPI_QUEUE_ENTROPY, config_dir)
+                    priv_ba = dpapi_unprotect(priv_file.read_bytes(), entropy=comp_ent)
+                    try:
+                        priv_key = x25519.X25519PrivateKey.from_private_bytes(bytes(priv_ba))
+                        _transit_priv_cache[cfg_key] = priv_key
+                    finally:
+                        wipe_buffer(priv_ba)
+                except Exception:
+                    return None
+
 
             eph_pub = x25519.X25519PublicKey.from_public_bytes(eph_pub_bytes)
             shared_secret = bytearray(priv_key.exchange(eph_pub))
@@ -503,6 +510,9 @@ def clear_integrity_caches():
     _integrity_mac_cache.clear()
     _owner_anchor_cache.clear()
     _forensic_cache.clear()
+    _transit_priv_cache.clear()
+    _transit_pub_cache.clear()
+
 
 
 
