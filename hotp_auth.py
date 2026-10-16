@@ -584,13 +584,12 @@ class HOTPAuth:
                 "last_success_counter": 0,
                 "last_owner_password_verified_at": time.time(),
             }
-            self._save_config_raw(new_config)
-
             if not defer_acls:
                 try:
                     apply_isolated_bridge_ntfs_acls(self.config_dir.parent)
                 except Exception:
                     pass
+            self._save_config_raw(new_config)
 
             self._log_audit(
                 "PROVISION",
@@ -634,7 +633,7 @@ class HOTPAuth:
                 cfg = self._load_config_raw()
                 if not cfg:
                     return False, "Configuracao nao encontrada para validacao inicial."
-        except PermissionError:
+        except (PermissionError, OSError):
             rpc_res = self._delegate_rpc_to_daemon(
                 "sync",
                 {"otp": clean_otp, "allow_lookahead": False, "max_lookahead": 3, "max_lookback": 0},
@@ -1750,11 +1749,11 @@ class HOTPAuth:
                     wipe_buffer(secret_ba)
                     del secret_ba
                     gc.collect()
-        except PermissionError:
+        except (PermissionError, OSError) as pe:
             if sys.platform == "win32" and self.config_file == CONFIG_FILE:
                 try:
                     subprocess.run(["schtasks", "/run", "/tn", "AdminBridge"], capture_output=True, check=False, creationflags=0x08000000)
-                    time.sleep(0.8)
+                    time.sleep(1.0)
                     if self._is_daemon_alive_other_process():
                         rpc_res = self._delegate_rpc_to_daemon(
                             "sync",
@@ -1772,5 +1771,10 @@ class HOTPAuth:
                     pass
             return {
                 "success": False,
-                "error": "Acesso negado ao cofre seguro e o servico SYSTEM esta offline. Execute como Administrador ou ative o servico."
+                "error": f"Acesso restrito ao cofre protegido [{pe}]. Inicie o servico AdminBridge ou execute como Administrador para testar a sincronia."
+            }
+        except Exception as e:
+            return {
+                "success": False,
+                "error": f"Falha na verificacao de sincronia: {e}"
             }

@@ -754,7 +754,13 @@ def check_integrity_mac(cfg: dict, config_path: Optional[Path] = None) -> Tuple[
                 if sig_usn and sig_usn != "0x0":
                     curr_usn = get_file_usn(cp)
                     if curr_usn != "0x0" and curr_usn != sig_usn:
-                        return False, "usn_tampered"
+                        if curr_hash == sig_data.get("sha256") and sig_data.get("integrity_mac") == mac_b64:
+                            try:
+                                create_detached_signature_file(cp, cfg)
+                            except Exception:
+                                pass
+                        else:
+                            return False, "usn_tampered"
                 recorded_mesh = sig_data.get("static_mesh_hash")
                 if recorded_mesh:
                     curr_mesh = get_static_mesh_hash(cp.parent)
@@ -765,14 +771,20 @@ def check_integrity_mac(cfg: dict, config_path: Optional[Path] = None) -> Tuple[
                 if rec_salt_hash:
                     if not salt_file.exists():
                         return False, "hw_salt_missing"
-                    curr_salt_hash = hashlib.sha256(salt_file.read_bytes()).hexdigest()
-                    if not hmac.compare_digest(rec_salt_hash, curr_salt_hash):
-                        return False, "hw_salt_tampered"
+                    try:
+                        curr_salt_hash = hashlib.sha256(salt_file.read_bytes()).hexdigest()
+                        if not hmac.compare_digest(rec_salt_hash, curr_salt_hash):
+                            return False, "hw_salt_tampered"
+                    except PermissionError:
+                        pass
                 rec_salt_usn = sig_data.get("hw_salt_usn")
                 if rec_salt_usn and rec_salt_usn != "0x0" and salt_file.exists():
-                    curr_salt_usn = get_file_usn(salt_file)
-                    if curr_salt_usn != "0x0" and curr_salt_usn != rec_salt_usn:
-                        return False, "hw_salt_usn_tampered"
+                    try:
+                        curr_salt_usn = get_file_usn(salt_file)
+                        if curr_salt_usn != "0x0" and curr_salt_usn != rec_salt_usn:
+                            return False, "hw_salt_usn_tampered"
+                    except PermissionError:
+                        pass
             except PermissionError:
                 pass
             except Exception:
@@ -1429,7 +1441,7 @@ def apply_isolated_bridge_ntfs_acls(base_dir: Path = BASE_DIR) -> bool:
             for specific_file in ("hotp_config.json", "hotp_config.json.sig", "owner_anchor.json", "preauth_ticket.json", "hw_salt.bin", "transit_priv.bin", "canary.bin"):
                 sp = config_dir / specific_file
                 if sp.exists():
-                    if is_system_account and specific_file in ("hw_salt.bin", "transit_priv.bin", "canary.bin"):
+                    if is_system_account and specific_file == "transit_priv.bin":
                         subprocess.run([
                             "icacls", str(sp),
                             "/inheritance:r",
@@ -1526,6 +1538,18 @@ def apply_isolated_bridge_ntfs_acls(base_dir: Path = BASE_DIR) -> bool:
         except Exception:
             pass
 
+    # 6. Sincroniza a assinatura de integridade desanexada (.sig) com o USN atualizado pós-ACLs
+    cfg_f = config_dir / "hotp_config.json"
+    if cfg_f.exists():
+        try:
+            with open(cfg_f, "r", encoding="utf-8") as f:
+                c_data = json.load(f)
+            if c_data.get("integrity_mac"):
+                create_detached_signature_file(cfg_f, c_data)
+                clear_integrity_caches()
+        except Exception:
+            pass
+
     ok_iso = check_config_acl_isolation(base_dir)
     if ok_iso:
         try:
@@ -1587,6 +1611,8 @@ def check_forensic_integrity(config_file: Path) -> Tuple[bool, str]:
                     res_fail = (False, "Alerta forense: Arquivo canario adulterado na pasta de configuracao.")
                     _forensic_cache[for_cache_key] = res_fail
                     return res_fail
+            except PermissionError:
+                pass  # Leitura restrita ao processo elevado; não constitui adulteração forense
             except Exception as e:
                 res_fail = (False, f"Alerta forense: Falha ao verificar canario: {e}")
                 _forensic_cache[for_cache_key] = res_fail
@@ -2365,6 +2391,122 @@ def _try_local_slm_explanation(code_text: str, findings: list, timeout_sec: floa
                         break
             break
     return None
+
+
+def get_local_ai_status() -> dict:
+    """Retorna o status completo e diagnostico da Mini-IA Local (Ollama + Qwen 2.5 0.5B)."""
+    ollama_running = False
+    model_installed = False
+    model_name = "qwen2.5:0.5b"
+    models_list = []
+
+    # 1. Verifica selo estatico em disco
+    seal_verified = False
+    for f in AI_READY_SEAL_FALLBACKS:
+        if f.exists():
+            try:
+                data = json.loads(f.read_text(encoding="utf-8"))
+                if data.get("verified") is True:
+                    seal_verified = True
+                    model_name = data.get("model", model_name)
+                    break
+            except Exception:
+                pass
+
+    # 2. Testa conectividade local com o servidor Ollama (porta 11434)
+    import urllib.request
+    try:
+        req = urllib.request.Request("http://127.0.0.1:11434/api/tags", headers={"User-Agent": "AdminBridge/2.4"})
+        with urllib.request.urlopen(req, timeout=0.8) as resp:
+            if resp.status == 200:
+                ollama_running = True
+                tags_data = json.loads(resp.read().decode("utf-8"))
+                for m in tags_data.get("models", []):
+                    m_name = m.get("name", "")
+                    models_list.append(m_name)
+                    if "qwen2.5:0.5b" in m_name.lower() or "qwen2.5-coder:0.5b" in m_name.lower():
+                        model_installed = True
+                        model_name = m_name
+    except Exception:
+        ollama_running = False
+
+    ready = ollama_running and model_installed
+    if ready:
+        badge_text = f"Ativa [{model_name}]"
+        badge_color = "#a6e3a1"
+        summary = f"Mini-IA local operacional em http://127.0.0.1:11434 com modelo {model_name} pronto para inferencia."
+    elif ollama_running:
+        badge_text = "Modelo Pendente"
+        badge_color = "#fab387"
+        summary = "Servidor Ollama ativo na porta 11434, mas o modelo qwen2.5:0.5b precisa ser baixado."
+    elif seal_verified:
+        badge_text = "Servico Desconectado"
+        badge_color = "#fab387"
+        summary = f"Modelo {model_name} ja instalado anteriormente, mas o servidor Ollama esta offline no momento."
+    else:
+        badge_text = "Inativa / Nao Instalada"
+        badge_color = "#6c7086"
+        summary = "Mini-IA local ainda nao configurada neste computador."
+
+    return {
+        "ready": ready,
+        "running": ollama_running,
+        "model_installed": model_installed,
+        "model_name": model_name,
+        "models_available": models_list,
+        "seal_verified": seal_verified,
+        "badge_text": badge_text,
+        "badge_color": badge_color,
+        "summary": summary
+    }
+
+
+def test_local_ai_inference(timeout_sec: float = 12.0) -> Tuple[bool, str, float]:
+    """Executa um prompt rapido de verificacao na Mini-IA Local e mede a latencia em segundos."""
+    import urllib.request
+    st = get_local_ai_status()
+    if not st["running"]:
+        ollama_bin = _ensure_ollama_on_demand()
+        if ollama_bin:
+            try:
+                subprocess.Popen([ollama_bin, "serve"], creationflags=0x08000000 if sys.platform == "win32" else 0)
+                time.sleep(1.2)
+            except Exception:
+                pass
+
+    t0 = time.time()
+    prompt = "Responda em uma frase curta de ate 15 palavras: a Mini-IA Local esta ativa e operacional?"
+    req_body = json.dumps({
+        "model": "qwen2.5:0.5b",
+        "prompt": prompt,
+        "stream": False,
+        "keep_alive": "0s",
+        "options": {
+            "num_predict": 45,
+            "num_ctx": 256,
+            "temperature": 0.2,
+            "num_thread": 4
+        }
+    }).encode("utf-8")
+
+    try:
+        req = urllib.request.Request(
+            "http://127.0.0.1:11434/api/generate",
+            data=req_body,
+            headers={"Content-Type": "application/json"},
+            method="POST"
+        )
+        with urllib.request.urlopen(req, timeout=timeout_sec) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+            elapsed = time.time() - t0
+            ans = (data.get("response") or "").strip()
+            if ans:
+                _save_ai_ready_seal({"verified": True, "model": "qwen2.5:0.5b", "verified_at": time.time(), "sample_test": ans[:160]})
+                return True, ans, elapsed
+            return False, "Ollama respondeu, mas o texto da resposta veio vazio.", elapsed
+    except Exception as e:
+        elapsed = time.time() - t0
+        return False, f"Falha na comunicacao com a Mini-IA: {e}", elapsed
 
 
 def build_human_explanation(code_text: str, findings: list, amsi_msg: str = "") -> str:

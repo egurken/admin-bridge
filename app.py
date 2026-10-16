@@ -65,9 +65,11 @@ from hotp_crypto import (
     KernelFileGuard, verify_scheduled_task_integrity, get_os_process_username, ensure_transit_keypair,
     inspect_script_3_layers, extract_and_read_referenced_scripts,
     clear_integrity_caches, is_local_slm_verified, pull_and_test_local_slm,
-    get_password_lockout_status, record_password_failure, reset_password_lockout, format_lockout_duration
+    get_password_lockout_status, record_password_failure, reset_password_lockout, format_lockout_duration,
+    get_local_ai_status, test_local_ai_inference
 )
 
+APP_VERSION = "v2.4"
 LOCAL_SERVER_NAME = f"AdminBridge_GUI_{os.getenv('USERNAME', 'default')}"
 BASE_DIR = Path("C:/Utilitario")
 CONFIG_DIR = BASE_DIR / "config"
@@ -409,6 +411,10 @@ def register_scheduled_task() -> bool:
             "/f"
         ]
         subprocess.run(cmd_wd, capture_output=True, text=True, check=False, creationflags=0x08000000)
+        for tn in ("AdminBridge", "AdminBridgeWatchdog"):
+            tp = Path(f"C:/Windows/System32/Tasks/{tn}")
+            if tp.exists():
+                subprocess.run(["icacls", str(tp), "/grant", "*S-1-5-32-545:(RX)", "/c", "/q"], capture_output=True, check=False, creationflags=0x08000000)
         subprocess.run(["schtasks", "/run", "/tn", "AdminBridge"], capture_output=True, check=False, creationflags=0x08000000)
         return True
     else:
@@ -423,6 +429,9 @@ def register_scheduled_task() -> bool:
             "/f"
         ]
         res2 = subprocess.run(cmd_fallback, capture_output=True, text=True, check=False, creationflags=0x08000000)
+        tp = Path("C:/Windows/System32/Tasks/AdminBridge")
+        if tp.exists():
+            subprocess.run(["icacls", str(tp), "/grant", "*S-1-5-32-545:(RX)", "/c", "/q"], capture_output=True, check=False, creationflags=0x08000000)
         return res2.returncode == 0
 
 
@@ -949,12 +958,16 @@ class SetupWizardDialog(QDialog):
         otp = self.txt_verify_otp.text().strip()
         if len(otp) != 6 or not otp.isdigit():
             QMessageBox.warning(self, "Código Inválido", "Digite o código OTP de 6 dígitos exibido no seu celular.")
+        try:
+            ok, msg = self.hotp_auth.verify_and_finalize_initial_otp(otp)
+            if not ok:
+                QMessageBox.critical(self, "Falha de Pareamento", msg)
+                return
+        except Exception as e:
+            QMessageBox.critical(self, "Falha de Pareamento", f"Erro ao validar pareamento inicial: {e}")
             return
 
-        ok, msg = self.hotp_auth.verify_and_finalize_initial_otp(otp)
-        if not ok:
-            QMessageBox.critical(self, "Falha de Pareamento", msg)
-            return
+        clear_integrity_caches()
 
         try:
             hwnd = int(self.winId())
@@ -1416,6 +1429,23 @@ class SyncTestDialog(QDialog):
         res_layout.addWidget(self.frame_details)
         self.frame_details.hide()
 
+        self.btn_search_ahead = QPushButton("🔍 Pesquisar Próximas 10 Posições no Celular")
+        self.btn_search_ahead.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_search_ahead.setStyleSheet("""
+            QPushButton {
+                background-color: #89b4fa;
+                color: #11111b;
+                font-weight: bold;
+                border-radius: 6px;
+                padding: 8px 14px;
+                font-size: 12px;
+            }
+            QPushButton:hover { background-color: #b4befe; }
+        """)
+        self.btn_search_ahead.clicked.connect(lambda: self.run_verification(allow_lookahead=True))
+        self.btn_search_ahead.hide()
+        res_layout.addWidget(self.btn_search_ahead)
+
         layout.addWidget(self.card_result)
 
         # Rodapé de segurança transparente
@@ -1438,7 +1468,7 @@ class SyncTestDialog(QDialog):
         if clean != text:
             self.edit_otp.setText(clean)
 
-    def run_verification(self):
+    def run_verification(self, allow_lookahead: bool = False):
         otp = self.edit_otp.text().strip()
         if len(otp) != 6 or not otp.isdigit():
             self.badge_status.setText("CÓDIGO INCOMPLETO")
@@ -1446,38 +1476,17 @@ class SyncTestDialog(QDialog):
             self.lbl_verdict.setText("O código deve conter exatamente 6 números.")
             self.lbl_instruction.setText("Consulte os 6 dígitos exibidos no aplicativo do seu celular e tente novamente.")
             self.frame_details.hide()
+            self.btn_search_ahead.hide()
             return
 
         self.btn_verify.setEnabled(False)
+        self.btn_search_ahead.setEnabled(False)
         self.btn_verify.setText("Verificando...")
         QApplication.processEvents()
 
         res = None
         try:
-            res = self.hotp_auth.diagnose_otp_sync(otp, allow_lookahead=False)
-            if res and not res.get("success") and res.get("status") == "prompt_lookahead":
-                ask = QMessageBox.question(
-                    self,
-                    "Pesquisar Posições Futuras?",
-                    "O código digitado não corresponde ao contador atual nem aos anteriores.\n\n"
-                    "Deseja pesquisar nas próximas 10 posições futuras do seu autenticador?\n\n"
-                    "Atenção: caso o código não seja localizado nessa janela à frente, "
-                    "o contador do sistema saltará 10 posições para forçar o alinhamento com seu dispositivo.",
-                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-                    QMessageBox.StandardButton.No
-                )
-                if ask == QMessageBox.StandardButton.Yes:
-                    res = self.hotp_auth.diagnose_otp_sync(otp, allow_lookahead=True)
-                else:
-                    self.badge_status.setText("NÃO RECONHECIDO")
-                    self.badge_status.setStyleSheet("background-color: #fab387; color: #11111b; padding: 4px 10px; border-radius: 4px; font-weight: bold; font-size: 11px;")
-                    self.lbl_verdict.setText("Código não localizado no contador atual.")
-                    self.lbl_instruction.setText("Verificação cancelada pelo usuário. O contador do sistema permaneceu inalterado.")
-                    self.lbl_det_code.setText(otp)
-                    self.lbl_det_phone.setText("Não localizado")
-                    self.lbl_det_next.setText(f"OTP #{res.get('current_counter')}")
-                    self.frame_details.show()
-                    return
+            res = self.hotp_auth.diagnose_otp_sync(otp, allow_lookahead=allow_lookahead)
         except Exception as e:
             self.badge_status.setText("FALHA DE COMUNICAÇÃO")
             self.badge_status.setStyleSheet("background-color: #f38ba8; color: #11111b; padding: 4px 10px; border-radius: 4px; font-weight: bold; font-size: 11px;")
@@ -1487,15 +1496,18 @@ class SyncTestDialog(QDialog):
             self.lbl_det_phone.setText("Erro")
             self.lbl_det_next.setText("-")
             self.frame_details.show()
+            self.btn_search_ahead.hide()
             return
         finally:
             self.btn_verify.setEnabled(True)
+            self.btn_search_ahead.setEnabled(True)
             self.btn_verify.setText("Verificar")
 
         if not res:
             return
 
         if res.get("success"):
+            self.btn_search_ahead.hide()
             st = res.get("status")
             matched = res.get("matched_counter")
             next_c = res.get("next_counter")
@@ -1526,7 +1538,18 @@ class SyncTestDialog(QDialog):
 
             self.lbl_det_code.setText(otp)
             self.frame_details.show()
+        elif res.get("status") == "prompt_lookahead":
+            self.badge_status.setText("NÃO LOCALIZADO NA POSIÇÃO ATUAL")
+            self.badge_status.setStyleSheet("background-color: #fab387; color: #11111b; padding: 4px 10px; border-radius: 4px; font-weight: bold; font-size: 11px;")
+            self.lbl_verdict.setText("ℹ️ Código não corresponde ao contador atual do computador.")
+            self.lbl_instruction.setText("Se você avançou o código no celular, clique no botão abaixo para pesquisar nas próximas 10 posições futuras e alinhar:")
+            self.lbl_det_code.setText(otp)
+            self.lbl_det_phone.setText("Não alinhado")
+            self.lbl_det_next.setText(f"OTP #{res.get('current_counter')}")
+            self.frame_details.show()
+            self.btn_search_ahead.show()
         else:
+            self.btn_search_ahead.hide()
             self.badge_status.setText("NÃO RECONHECIDO")
             self.badge_status.setStyleSheet("background-color: #f38ba8; color: #11111b; padding: 4px 10px; border-radius: 4px; font-weight: bold; font-size: 11px;")
             self.lbl_verdict.setText("❌ " + res.get("summary", "Código não encontrado."))
@@ -2254,6 +2277,317 @@ def pull_and_test_local_ai_with_ui(parent=None) -> Tuple[bool, str]:
     return dlg._success, dlg._success_msg or "Operação cancelada pelo usuário."
 
 
+class AITestWorker(QThread):
+    finished_signal = pyqtSignal(bool, str, float)
+
+    def run(self):
+        try:
+            ok, resp, latency = test_local_ai_inference(timeout_sec=14.0)
+            self.finished_signal.emit(ok, resp, latency)
+        except Exception as e:
+            self.finished_signal.emit(False, str(e), 0.0)
+
+
+class AITestDialog(QDialog):
+    """Diálogo visual moderno para teste prático em tempo real da Mini-IA Local [Qwen 2.5 0.5B]."""
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle(f"Diagnóstico da Mini-IA Local • Admin Bridge {APP_VERSION}")
+        self.resize(600, 480)
+        self.setMinimumSize(540, 440)
+        self.worker = None
+        self.init_ui()
+
+    def init_ui(self):
+        self.setStyleSheet("""
+            QDialog {
+                background-color: #11111b;
+                color: #cdd6f4;
+                font-family: 'Segoe UI', system-ui, sans-serif;
+            }
+            QLabel { color: #cdd6f4; }
+            QFrame.cardBox {
+                background-color: #181825;
+                border: 1px solid #313244;
+                border-radius: 8px;
+                padding: 14px;
+            }
+            QPushButton#btnTestAI {
+                background-color: #89b4fa;
+                color: #11111b;
+                border: none;
+                border-radius: 8px;
+                font-size: 13px;
+                font-weight: bold;
+                padding: 10px 18px;
+            }
+            QPushButton#btnTestAI:hover { background-color: #b4befe; }
+            QPushButton#btnTestAI:disabled { background-color: #45475a; color: #a6adc8; }
+            QPushButton#btnInstallAI {
+                background-color: #a6e3a1;
+                color: #11111b;
+                border: none;
+                border-radius: 8px;
+                font-size: 13px;
+                font-weight: bold;
+                padding: 10px 18px;
+            }
+            QPushButton#btnInstallAI:hover { background-color: #94e2d5; }
+            QPushButton#btnClose {
+                background-color: #313244;
+                color: #cdd6f4;
+                border: none;
+                border-radius: 8px;
+                font-size: 13px;
+                padding: 8px 18px;
+            }
+            QPushButton#btnClose:hover { background-color: #45475a; }
+            QPlainTextEdit#txtOutput {
+                background-color: #11111b;
+                color: #a6e3a1;
+                font-family: 'Consolas', monospace;
+                font-size: 12px;
+                border: 1px solid #313244;
+                border-radius: 6px;
+                padding: 10px;
+            }
+        """)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(20, 20, 20, 20)
+        layout.setSpacing(14)
+
+        lbl_title = QLabel("🤖 Diagnóstico da Mini-IA Local [On-Device SLM]")
+        lbl_title.setStyleSheet("font-size: 18px; font-weight: bold; color: #cdd6f4;")
+        layout.addWidget(lbl_title)
+
+        lbl_desc = QLabel(
+            "Verifique o status do motor local Ollama e teste a capacidade de raciocínio "
+            "do modelo Qwen 2.5 0.5B executado 100% offline no seu computador:"
+        )
+        lbl_desc.setWordWrap(True)
+        lbl_desc.setStyleSheet("font-size: 12px; color: #a6adc8;")
+        layout.addWidget(lbl_desc)
+
+        card_status = QFrame()
+        card_status.setProperty("class", "cardBox")
+        cs_layout = QVBoxLayout(card_status)
+        cs_layout.setSpacing(8)
+
+        self.badge_ai = QLabel("VERIFICANDO...")
+        self.badge_ai.setStyleSheet("background-color: #313244; color: #a6adc8; padding: 4px 10px; border-radius: 4px; font-weight: bold; font-size: 11px;")
+        cs_layout.addWidget(self.badge_ai, alignment=Qt.AlignmentFlag.AlignLeft)
+
+        self.lbl_ai_summary = QLabel("Consultando motor local Ollama...")
+        self.lbl_ai_summary.setWordWrap(True)
+        self.lbl_ai_summary.setStyleSheet("font-size: 13px; color: #cdd6f4;")
+        cs_layout.addWidget(self.lbl_ai_summary)
+
+        self.lbl_ai_meta = QLabel("Endpoint: http://127.0.0.1:11434 • Modelo calibrado: qwen2.5:0.5b")
+        self.lbl_ai_meta.setStyleSheet("font-size: 11px; color: #6c7086;")
+        cs_layout.addWidget(self.lbl_ai_meta)
+        layout.addWidget(card_status)
+
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setRange(0, 0)
+        self.progress_bar.setFixedHeight(6)
+        self.progress_bar.setTextVisible(False)
+        self.progress_bar.setStyleSheet("""
+            QProgressBar { background-color: #181825; border-radius: 3px; }
+            QProgressBar::chunk { background-color: #89b4fa; border-radius: 3px; }
+        """)
+        self.progress_bar.hide()
+        layout.addWidget(self.progress_bar)
+
+        lbl_resp_title = QLabel("Resultado da Inferência em Tempo Real:")
+        lbl_resp_title.setStyleSheet("font-size: 12px; font-weight: bold; color: #cdd6f4;")
+        layout.addWidget(lbl_resp_title)
+
+        self.txt_output = QPlainTextEdit()
+        self.txt_output.setObjectName("txtOutput")
+        self.txt_output.setReadOnly(True)
+        self.txt_output.setPlaceholderText("Clique em 'Testar Resposta da IA' para executar um ciclo de inferência...")
+        layout.addWidget(self.txt_output, stretch=1)
+
+        btn_layout = QHBoxLayout()
+        self.btn_install_ai = QPushButton("📥 Baixar / Instalar Mini-IA")
+        self.btn_install_ai.setObjectName("btnInstallAI")
+        self.btn_install_ai.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_install_ai.clicked.connect(self.open_installer)
+        self.btn_install_ai.hide()
+        btn_layout.addWidget(self.btn_install_ai)
+
+        self.btn_test = QPushButton("⚡ Testar Resposta da IA")
+        self.btn_test.setObjectName("btnTestAI")
+        self.btn_test.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_test.clicked.connect(self.run_test)
+        btn_layout.addWidget(self.btn_test)
+
+        btn_layout.addStretch()
+
+        btn_close = QPushButton("Fechar")
+        btn_close.setObjectName("btnClose")
+        btn_close.setCursor(Qt.CursorShape.PointingHandCursor)
+        btn_close.clicked.connect(self.accept)
+        btn_layout.addWidget(btn_close)
+
+        layout.addLayout(btn_layout)
+
+        QTimer.singleShot(60, self.refresh_status)
+
+    def refresh_status(self):
+        try:
+            st = get_local_ai_status()
+            self.badge_ai.setText(st.get("badge_text", "Ativa").upper())
+            self.badge_ai.setStyleSheet(f"background-color: {st.get('badge_color', '#a6e3a1')}; color: #11111b; padding: 4px 10px; border-radius: 4px; font-weight: bold; font-size: 11px;")
+            self.lbl_ai_summary.setText(st.get("summary", ""))
+            models = ", ".join(st.get("models_available", [])) or "Nenhum detectado"
+            self.lbl_ai_meta.setText(f"Endpoint: http://127.0.0.1:11434 • Modelos: {models}")
+            if not st.get("ready"):
+                self.btn_install_ai.show()
+                self.btn_test.setText("⚡ Tentar Teste mesmo assim")
+            else:
+                self.btn_install_ai.hide()
+                self.btn_test.setText("⚡ Testar Resposta da IA")
+        except Exception as e:
+            self.badge_ai.setText("ERRO")
+            self.lbl_ai_summary.setText(f"Erro ao consultar status da IA: {e}")
+
+    def run_test(self):
+        self.btn_test.setEnabled(False)
+        self.btn_test.setText("Testando...")
+        self.progress_bar.show()
+        self.txt_output.setPlainText("Enviando prompt de teste para http://127.0.0.1:11434/api/generate...\nPrompt: 'Responda em uma frase curta de ate 15 palavras: a Mini-IA Local esta ativa e operacional?'\n\nAguardando inferência local...")
+        QApplication.processEvents()
+
+        self.worker = AITestWorker()
+        self.worker.finished_signal.connect(self.on_test_finished)
+        self.worker.start()
+
+    def on_test_finished(self, ok: bool, resp: str, latency: float):
+        self.progress_bar.hide()
+        self.btn_test.setEnabled(True)
+        self.btn_test.setText("⚡ Testar Resposta da IA")
+
+        ms = int(latency * 1000)
+        if ok:
+            self.badge_ai.setText("100% OPERACIONAL")
+            self.badge_ai.setStyleSheet("background-color: #a6e3a1; color: #11111b; padding: 4px 10px; border-radius: 4px; font-weight: bold; font-size: 11px;")
+            self.txt_output.setPlainText(
+                f"✅ TESTE DE INFERÊNCIA APROVADO COM SUCESSO!\n"
+                f"Latência de resposta: {ms} ms\n"
+                f"Modelo: qwen2.5:0.5b [Ollama]\n\n"
+                f"Resposta recebida da Mini-IA:\n"
+                f"\"{resp}\"\n\n"
+                f"Status: A Mini-IA está pronta para auditar scripts e comandos."
+            )
+        else:
+            self.badge_ai.setText("TESTE COM FALHA")
+            self.badge_ai.setStyleSheet("background-color: #f38ba8; color: #11111b; padding: 4px 10px; border-radius: 4px; font-weight: bold; font-size: 11px;")
+            self.txt_output.setPlainText(
+                f"❌ FALHA AO EXECUTAR TESTE DE INFERÊNCIA!\n"
+                f"Tempo decorrido: {ms} ms\n\n"
+                f"Detalhes do erro:\n{resp}\n\n"
+                f"Recomendação: Verifique se o Ollama está aberto ou clique no botão 'Baixar / Instalar Mini-IA'."
+            )
+            self.btn_install_ai.show()
+
+    def open_installer(self):
+        pull_and_test_local_ai_with_ui(self)
+        self.refresh_status()
+
+
+class AboutDialog(QDialog):
+    """Diálogo informativo moderno sobre o Admin Bridge e suas especificações de segurança."""
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle(f"Sobre o Admin Bridge {APP_VERSION}")
+        self.resize(540, 440)
+        self.setMinimumSize(500, 400)
+        self.init_ui()
+
+    def init_ui(self):
+        self.setStyleSheet("""
+            QDialog {
+                background-color: #11111b;
+                color: #cdd6f4;
+                font-family: 'Segoe UI', system-ui, sans-serif;
+            }
+            QLabel { color: #cdd6f4; }
+            QFrame.infoCard {
+                background-color: #181825;
+                border: 1px solid #313244;
+                border-radius: 8px;
+                padding: 16px;
+            }
+            QPushButton#btnClose {
+                background-color: #89b4fa;
+                color: #11111b;
+                border: none;
+                border-radius: 6px;
+                font-size: 13px;
+                font-weight: bold;
+                padding: 8px 24px;
+            }
+            QPushButton#btnClose:hover { background-color: #b4befe; }
+        """)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(24, 24, 24, 24)
+        layout.setSpacing(16)
+
+        hdr_layout = QHBoxLayout()
+        lbl_app = QLabel(f"Admin Bridge {APP_VERSION}")
+        lbl_app.setStyleSheet("font-size: 22px; font-weight: bold; color: #89b4fa;")
+        hdr_layout.addWidget(lbl_app)
+        hdr_layout.addStretch()
+
+        lbl_badge = QLabel("RELEASE OFICIAL")
+        lbl_badge.setStyleSheet("background-color: #a6e3a1; color: #11111b; font-weight: bold; font-size: 11px; padding: 4px 10px; border-radius: 4px;")
+        hdr_layout.addWidget(lbl_badge)
+        layout.addLayout(hdr_layout)
+
+        lbl_sub = QLabel("Central de Gestão, Elevação Local de Privilégios e Auditoria Criptográfica")
+        lbl_sub.setStyleSheet("font-size: 12px; color: #a6adc8;")
+        layout.addWidget(lbl_sub)
+
+        card = QFrame()
+        card.setProperty("class", "infoCard")
+        grid = QGridLayout(card)
+        grid.setHorizontalSpacing(16)
+        grid.setVerticalSpacing(10)
+
+        specs = [
+            ("Versão do Utilitário:", f"{APP_VERSION} [Produção]"),
+            ("Autenticação OTP:", "HOTP RFC 4226 • HMAC-SHA1 [6 dígitos]"),
+            ("Proteção de Chaves:", "DPAPI de Máquina com Salt Composto [TPM/LSA]"),
+            ("Âncora Soberana:", "Assinatura Ed25519 e Carimbo Forense NTFS USN"),
+            ("Serviço em Background:", "Windows Task Scheduler [SYSTEM HIGHEST]"),
+            ("Inteligência Artificial:", "Mini-IA On-Device Qwen 2.5 0.5B [Ollama Local]"),
+            ("Assinatura de Código:", "Authenticode SHA256 [AdminBridge Sovereign Root]"),
+            ("Desenvolvedor / Autor:", "E. Gurken [epgur@users.noreply.github.com]")
+        ]
+
+        for row, (k, v) in enumerate(specs):
+            lbl_k = QLabel(k)
+            lbl_k.setStyleSheet("color: #a6adc8; font-size: 12px; font-weight: 600;")
+            lbl_v = QLabel(v)
+            lbl_v.setStyleSheet("color: #cdd6f4; font-size: 12px; font-family: 'Segoe UI', monospace;")
+            grid.addWidget(lbl_k, row, 0)
+            grid.addWidget(lbl_v, row, 1)
+
+        layout.addWidget(card)
+
+        btn_box = QHBoxLayout()
+        btn_box.addStretch()
+        btn_close = QPushButton("Fechar")
+        btn_close.setObjectName("btnClose")
+        btn_close.setCursor(Qt.CursorShape.PointingHandCursor)
+        btn_close.clicked.connect(self.accept)
+        btn_box.addWidget(btn_close)
+        layout.addLayout(btn_box)
+
+
 class AdminBridgeWindow(QMainWindow):
     def __init__(self, hotp_auth: HOTPAuth):
         super().__init__()
@@ -2261,7 +2595,7 @@ class AdminBridgeWindow(QMainWindow):
         self.current_request = None
         self.exec_thread = None
 
-        self.setWindowTitle("Admin Bridge • Central de Gestão")
+        self.setWindowTitle(f"Admin Bridge {APP_VERSION} • Central de Gestão")
         self.resize(1080, 580)
         self.setMinimumSize(560, 460)
         self._history_user_hidden = False
@@ -2486,7 +2820,11 @@ class AdminBridgeWindow(QMainWindow):
         act_sync.triggered.connect(self.show_sync_test_dialog)
         self.settings_menu.addAction(act_sync)
 
-        self.act_install_ai = QAction("🤖 Instalar e Testar Mini-IA Local [Qwen 0.5B]...", self)
+        self.act_test_ai = QAction("⚡ Testar Mini-IA Local [Qwen 2.5]...", self)
+        self.act_test_ai.triggered.connect(self.show_ai_test_dialog)
+        self.settings_menu.addAction(self.act_test_ai)
+
+        self.act_install_ai = QAction("🤖 Baixar / Instalar Mini-IA Local...", self)
         self.act_install_ai.triggered.connect(self.install_local_ai_assistant)
         self.settings_menu.addAction(self.act_install_ai)
         if is_local_slm_verified(probe_network=False):
@@ -2501,6 +2839,10 @@ class AdminBridgeWindow(QMainWindow):
         self.settings_menu.addAction(act_revoke_auth)
 
         self.settings_menu.addSeparator()
+
+        act_about = QAction(f"ℹ️ Sobre o Admin Bridge {APP_VERSION}...", self)
+        act_about.triggered.connect(self.show_about_dialog)
+        self.settings_menu.addAction(act_about)
 
         act_update = QAction("🚀 Verificar Atualizações...", self)
         act_update.triggered.connect(self.show_update_dialog)
@@ -2589,6 +2931,30 @@ class AdminBridgeWindow(QMainWindow):
         cf_layout.addWidget(lbl_f_title)
         cf_layout.addWidget(self.lbl_fails_val)
         metrics_layout.addWidget(card_fails, 1)
+
+        # Card 4: Mini-IA On-Device
+        card_ai = QFrame()
+        card_ai.setProperty("class", "card")
+        cai_layout = QVBoxLayout(card_ai)
+        lbl_ai_title = QLabel("Mini-IA On-Device")
+        lbl_ai_title.setProperty("class", "metricTitle")
+
+        ai_row = QHBoxLayout()
+        self.lbl_ai_val = QLabel("Detectando...")
+        self.lbl_ai_val.setProperty("class", "metricValue")
+        self.lbl_ai_val.setStyleSheet("color: #a6e3a1; font-size: 14px; font-weight: bold;")
+        ai_row.addWidget(self.lbl_ai_val)
+        ai_row.addStretch()
+
+        self.btn_test_ai_quick = QPushButton("⚡ Testar")
+        self.btn_test_ai_quick.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+        self.btn_test_ai_quick.setStyleSheet("background-color: #89b4fa; color: #11111b; font-weight: bold; border-radius: 4px; padding: 3px 8px; font-size: 11px;")
+        self.btn_test_ai_quick.clicked.connect(self.show_ai_test_dialog)
+        ai_row.addWidget(self.btn_test_ai_quick)
+
+        cai_layout.addWidget(lbl_ai_title)
+        cai_layout.addLayout(ai_row)
+        metrics_layout.addWidget(card_ai, 1)
 
         left_layout.addLayout(metrics_layout)
 
@@ -2705,9 +3071,21 @@ class AdminBridgeWindow(QMainWindow):
 
         body_split_layout.addWidget(self.history_panel, stretch=2)
 
+        # Rodapé com Versão Oficial e Especificação Soberana
+        footer_layout = QHBoxLayout()
+        footer_layout.setContentsMargins(4, 2, 4, 0)
+        lbl_footer_ver = QLabel(f"Admin Bridge {APP_VERSION} • RFC 4226 Soberano • DPAPI LSA")
+        lbl_footer_ver.setStyleSheet("color: #6c7086; font-size: 11px;")
+        footer_layout.addWidget(lbl_footer_ver)
+        footer_layout.addStretch()
+        lbl_footer_auth = QLabel("Autor: E. Gurken • Autenticação On-Device")
+        lbl_footer_auth.setStyleSheet("color: #6c7086; font-size: 11px;")
+        footer_layout.addWidget(lbl_footer_auth)
+        main_layout.addLayout(footer_layout)
+
     def init_tray(self):
         self.tray_icon = QSystemTrayIcon(self)
-        self.tray_icon.setToolTip("Admin Bridge")
+        self.tray_icon.setToolTip(f"Admin Bridge {APP_VERSION}")
         app_icon = get_app_icon()
         self.tray_icon.setIcon(app_icon)
 
@@ -2735,9 +3113,17 @@ class AdminBridgeWindow(QMainWindow):
         open_action.triggered.connect(self.show_window)
         tray_menu.addAction(open_action)
 
+        tray_ai = QAction("⚡ Testar Mini-IA Local...", self)
+        tray_ai.triggered.connect(self.show_ai_test_dialog)
+        tray_menu.addAction(tray_ai)
+
         status_action = QAction("📋 Status do Contador", self)
         status_action.triggered.connect(self.show_counter_status_dialog)
         tray_menu.addAction(status_action)
+
+        tray_about = QAction(f"ℹ️ Sobre o Admin Bridge {APP_VERSION}...", self)
+        tray_about.triggered.connect(self.show_about_dialog)
+        tray_menu.addAction(tray_about)
 
         tray_menu.addSeparator()
 
@@ -2820,13 +3206,36 @@ class AdminBridgeWindow(QMainWindow):
         dlg = UpdateDialog(self)
         dlg.exec()
 
+    def show_ai_test_dialog(self):
+        """Abre o diálogo interativo de teste da Mini-IA Local."""
+        dlg = AITestDialog(self)
+        dlg.exec()
+        self._check_ai_status_background()
+
+    def show_about_dialog(self):
+        """Abre o diálogo informativo Sobre o Admin Bridge."""
+        dlg = AboutDialog(self)
+        dlg.exec()
+
+    def _update_ai_label(self, text: str, color: str):
+        try:
+            if hasattr(self, "lbl_ai_val"):
+                self.lbl_ai_val.setText(text)
+                self.lbl_ai_val.setStyleSheet(f"color: {color}; font-size: 14px; font-weight: bold;")
+        except Exception:
+            pass
+
     def _check_ai_status_background(self):
         """Verifica se a Mini-IA Local está pronta em background sem engasgar o startup."""
         def _bg():
             try:
-                if is_local_slm_verified(probe_network=True):
-                    if hasattr(self, "act_install_ai"):
-                        QTimer.singleShot(0, lambda: self.act_install_ai.setVisible(False))
+                st = get_local_ai_status()
+                ready = bool(st.get("ready", False))
+                text = "Ativa [Qwen 2.5]" if ready else "Inativa"
+                color = "#a6e3a1" if ready else "#f38ba8"
+                QTimer.singleShot(0, lambda: self._update_ai_label(text, color))
+                if hasattr(self, "act_install_ai"):
+                    QTimer.singleShot(0, lambda: self.act_install_ai.setVisible(not ready))
             except Exception:
                 pass
         threading.Thread(target=_bg, daemon=True).start()
@@ -2887,84 +3296,97 @@ class AdminBridgeWindow(QMainWindow):
 
     def refresh_dashboard(self):
         """Atualiza os cards de métricas e a tabela de histórico recente."""
-        # 1. Lê metadados passivos
-        status_data = self.hotp_auth.get_counter_status()
-        counter = status_data.get("counter", 0)
-        status_text = status_data.get("status_text", "Ativo")
-        fails = status_data.get("recent_failures", 0)
-        max_fails = status_data.get("max_failures", 3)
-
-        self.lbl_counter_val.setText(str(counter))
-        self.lbl_status_val.setText(status_text)
-        self.lbl_fails_val.setText(f"{fails} / {max_fails} Falhas")
-
-        if status_data.get("auth_mode_active"):
-            mins = status_data.get("auth_expires_in", 0) // 60
-            self.lbl_status_val.setText(f"Modo Auth Ativo [{mins}m]")
-            self.lbl_status_val.setStyleSheet("color: #89b4fa;")
-            self.btn_repair.hide()
-        elif "adulteração" in status_text.lower() or status_data.get("tampered"):
-            self.lbl_status_val.setText("Bloqueado por adulteração")
-            self.lbl_status_val.setStyleSheet("color: #f38ba8;")
-            self.btn_repair.show()
-        elif "Bloqueado" in status_text or status_data.get("lockdown"):
-            self.lbl_status_val.setStyleSheet("color: #f38ba8;")
-            self.btn_repair.hide()
-        elif "Aguardando" in status_text:
-            self.lbl_status_val.setStyleSheet("color: #f9e2af;")
-            self.btn_repair.hide()
-        else:
-            self.lbl_status_val.setStyleSheet("color: #a6e3a1;")
-            self.btn_repair.hide()
-
-        # 2. Popula a tabela de histórico apenas quando auth.log ou status.json realmente mudaram (preserva rolagem, seleção e zero uso de CPU)
-        curr_log_sig = None
         try:
-            if AUTH_LOG_FILE.exists():
-                st_log = AUTH_LOG_FILE.stat()
-                curr_log_sig = (int(st_log.st_mtime_ns), int(st_log.st_size))
-        except Exception:
-            curr_log_sig = None
+            # 1. Lê metadados passivos
+            status_data = self.hotp_auth.get_counter_status()
+            counter = status_data.get("counter", 0)
+            status_text = status_data.get("status_text", "Ativo")
+            fails = status_data.get("recent_failures", 0)
+            max_fails = status_data.get("max_failures", 3)
 
-        if curr_log_sig is None:
+            self.lbl_counter_val.setText(str(counter))
+            self.lbl_status_val.setText(status_text)
+            self.lbl_fails_val.setText(f"{fails} / {max_fails} Falhas")
+
+            if status_data.get("auth_mode_active"):
+                mins = status_data.get("auth_expires_in", 0) // 60
+                self.lbl_status_val.setText(f"Modo Auth Ativo [{mins}m]")
+                self.lbl_status_val.setStyleSheet("color: #89b4fa;")
+                self.btn_repair.hide()
+            elif "adulteração" in status_text.lower() or status_data.get("tampered"):
+                self.lbl_status_val.setText("Bloqueado por adulteração")
+                self.lbl_status_val.setStyleSheet("color: #f38ba8;")
+                self.btn_repair.show()
+            elif "Bloqueado" in status_text or status_data.get("lockdown"):
+                self.lbl_status_val.setStyleSheet("color: #f38ba8;")
+                self.btn_repair.hide()
+            elif "Aguardando" in status_text:
+                self.lbl_status_val.setStyleSheet("color: #f9e2af;")
+                self.btn_repair.hide()
+            else:
+                self.lbl_status_val.setStyleSheet("color: #a6e3a1;")
+                self.btn_repair.hide()
+
+            # Checagem leve de status da IA periodicamente
+            self._ai_tick = getattr(self, "_ai_tick", 0) + 1
+            if self._ai_tick % 4 == 0:
+                self._check_ai_status_background()
+
+            # 2. Popula a tabela de histórico apenas quando auth.log ou status.json realmente mudaram (preserva rolagem, seleção e zero uso de CPU)
+            curr_log_sig = None
             try:
-                if STATUS_FILE.exists():
-                    st_stat = STATUS_FILE.stat()
-                    curr_log_sig = ("status", int(st_stat.st_mtime_ns), int(st_stat.st_size))
+                if AUTH_LOG_FILE.exists():
+                    st_log = AUTH_LOG_FILE.stat()
+                    curr_log_sig = (int(st_log.st_mtime_ns), int(st_log.st_size))
             except Exception:
                 curr_log_sig = None
 
+            if curr_log_sig is None:
+                try:
+                    if STATUS_FILE.exists():
+                        st_stat = STATUS_FILE.stat()
+                        curr_log_sig = ("status", int(st_stat.st_mtime_ns), int(st_stat.st_size))
+                except Exception:
+                    curr_log_sig = None
 
-        if curr_log_sig != getattr(self, "_last_history_sig", object()):
-            self._last_history_sig = curr_log_sig
-            history_items = load_recent_history(50)
-            self.table_history.setUpdatesEnabled(False)
-            try:
-                self.table_history.setRowCount(len(history_items))
-                for row, item in enumerate(history_items):
-                    it_date = QTableWidgetItem(item["datetime"])
-                    it_cmd = QTableWidgetItem(item["command"])
-                    it_status = QTableWidgetItem(item["status"])
-                    it_otp = QTableWidgetItem(item["otp"])
+            if curr_log_sig != getattr(self, "_last_history_sig", object()):
+                self._last_history_sig = curr_log_sig
+                history_items = load_recent_history(50)
+                self.table_history.setUpdatesEnabled(False)
+                try:
+                    self.table_history.setRowCount(len(history_items))
+                    for row, item in enumerate(history_items):
+                        it_date = QTableWidgetItem(item["datetime"])
+                        it_cmd = QTableWidgetItem(item["command"])
+                        it_status = QTableWidgetItem(item["status"])
+                        it_otp = QTableWidgetItem(item["otp"])
 
-                    if item["status"] == "Aprovado":
-                        it_status.setForeground(QColor("#a6e3a1"))
-                    else:
-                        it_status.setForeground(QColor("#f38ba8"))
+                        if item["status"] == "Aprovado":
+                            it_status.setForeground(QColor("#a6e3a1"))
+                        else:
+                            it_status.setForeground(QColor("#f38ba8"))
 
-                    it_otp.setForeground(QColor("#fab387"))
+                        it_otp.setForeground(QColor("#fab387"))
 
-                    self.table_history.setItem(row, 0, it_date)
-                    self.table_history.setItem(row, 1, it_cmd)
-                    self.table_history.setItem(row, 2, it_status)
-                    self.table_history.setItem(row, 3, it_otp)
-            finally:
-                self.table_history.setUpdatesEnabled(True)
+                        self.table_history.setItem(row, 0, it_date)
+                        self.table_history.setItem(row, 1, it_cmd)
+                        self.table_history.setItem(row, 2, it_status)
+                        self.table_history.setItem(row, 3, it_otp)
+                finally:
+                    self.table_history.setUpdatesEnabled(True)
+        except Exception:
+            pass
 
     # -------------------------------------------------------------
     # PROCESSAMENTO ATÔMICO DA FILA DE REQUISIÇÕES
     # -------------------------------------------------------------
     def check_requests(self):
+        try:
+            self._check_requests_impl()
+        except Exception as e:
+            logging.debug(f"[CHECK_REQUESTS ERROR]: {e}")
+
+    def _check_requests_impl(self):
         if self.current_request or (self.exec_thread and self.exec_thread.isRunning()):
             return
 
