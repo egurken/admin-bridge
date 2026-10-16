@@ -778,11 +778,12 @@ def check_integrity_mac(cfg: dict, config_path: Optional[Path] = None) -> Tuple[
             except Exception:
                 return False, "sig_read_error"
 
+    res_tuple = (True, "ok")
     if cache_key is not None:
         if len(_integrity_mac_cache) > 64:
             _integrity_mac_cache.clear()
-        _integrity_mac_cache[cache_key] = (True, "ok")
-    return True, "ok"
+        _integrity_mac_cache[cache_key] = res_tuple
+    return res_tuple
 
 
 def verify_integrity_mac(cfg: dict, config_path: Optional[Path] = None) -> bool:
@@ -1234,7 +1235,9 @@ def verify_owner_anchor(anchor_path: Optional[Path] = None, base_dir: Path = BAS
         # Recalcula o hash atual do executável AdminBridge.exe e da Tarefa Agendada no disco
         actual_mesh = get_static_mesh_hash(base_dir)
         if not hmac.compare_digest(recorded_mesh, actual_mesh):
-            return False, "static_mesh_tampered: executavel AdminBridge.exe ou tarefa agendada foram alterados"
+            res_fail = (False, "static_mesh_tampered: executavel AdminBridge.exe ou tarefa agendada foram alterados")
+            _owner_anchor_cache[anc_cache_key] = res_fail
+            return res_fail
 
         pub_key = ed25519.Ed25519PublicKey.from_public_bytes(pub_bytes)
         sign_payload = f"AdminBridge_OwnerAnchor_v1|{actual_mesh}".encode("utf-8")
@@ -1243,14 +1246,19 @@ def verify_owner_anchor(anchor_path: Optional[Path] = None, base_dir: Path = BAS
         if base_dir == BASE_DIR or Path(base_dir).resolve() == BASE_DIR.resolve() or Path(base_dir).parent.resolve() == BASE_DIR.resolve():
             ok_ext, ext_msg = verify_external_system_vault(anchor_data)
             if not ok_ext:
-                return False, ext_msg
+                res_fail = (False, ext_msg)
+                _owner_anchor_cache[anc_cache_key] = res_fail
+                return res_fail
 
         if len(_owner_anchor_cache) > 64:
             _owner_anchor_cache.clear()
-        _owner_anchor_cache[anc_cache_key] = (True, "ok")
-        return True, "ok"
+        res_ok = (True, "ok")
+        _owner_anchor_cache[anc_cache_key] = res_ok
+        return res_ok
     except Exception as e:
-        return False, f"owner_anchor_invalid: {e}"
+        res_err = (False, f"owner_anchor_invalid: {e}")
+        _owner_anchor_cache[anc_cache_key] = res_err
+        return res_err
 
 
 def verify_owner_password(password: str, anchor_path: Optional[Path] = None, base_dir: Path = BASE_DIR) -> bool:
@@ -1544,8 +1552,11 @@ def check_forensic_integrity(config_file: Path) -> Tuple[bool, str]:
         _file_stat_sig(exe_file),
     )
 
+    if for_cache_key in _forensic_cache:
+        return _forensic_cache[for_cache_key]
+
     try:
-        if sys.platform == "win32" and for_cache_key not in _forensic_cache:
+        if sys.platform == "win32":
             ps_cmd = f"(Get-Acl -LiteralPath '{config_file}').Owner"
             res = subprocess.run(
                 ["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", ps_cmd],
@@ -1563,7 +1574,9 @@ def check_forensic_integrity(config_file: Path) -> Tuple[bool, str]:
                 or "S-1-5-18" in owner
                 or "S-1-5-32-544" in owner
             ):
-                return False, f"Alerta forense: Posse do arquivo de configuracao alterada para {owner} durante a inatividade."
+                res_fail = (False, f"Alerta forense: Posse do arquivo de configuracao alterada para {owner} durante a inatividade.")
+                _forensic_cache[for_cache_key] = res_fail
+                return res_fail
 
         canary_file = config_file.parent / "canary.bin"
         if canary_file.exists():
@@ -1571,9 +1584,13 @@ def check_forensic_integrity(config_file: Path) -> Tuple[bool, str]:
                 with open(canary_file, "rb") as cf:
                     cdata = cf.read()
                 if len(cdata) != 32:
-                    return False, "Alerta forense: Arquivo canario adulterado na pasta de configuracao."
+                    res_fail = (False, "Alerta forense: Arquivo canario adulterado na pasta de configuracao.")
+                    _forensic_cache[for_cache_key] = res_fail
+                    return res_fail
             except Exception as e:
-                return False, f"Alerta forense: Falha ao verificar canario: {e}"
+                res_fail = (False, f"Alerta forense: Falha ao verificar canario: {e}")
+                _forensic_cache[for_cache_key] = res_fail
+                return res_fail
         else:
             try:
                 with open(canary_file, "wb") as cf:
@@ -1586,17 +1603,22 @@ def check_forensic_integrity(config_file: Path) -> Tuple[bool, str]:
         if anchor_file.exists():
             ok_anc, msg_anc = verify_owner_anchor(anchor_file, config_file.parent)
             if not ok_anc:
-                return False, f"Alerta forense: Violacao da ancora do proprietario ({msg_anc})."
+                res_fail = (False, f"Alerta forense: Violacao da ancora do proprietario ({msg_anc}).")
+                _forensic_cache[for_cache_key] = res_fail
+                return res_fail
 
         # Verifica se a Tarefa Agendada do Windows não foi adulterada para mascarar outro script
         ok_task, msg_task = verify_scheduled_task_integrity(_resolve_mesh_root(config_file.parent))
         if not ok_task:
-            return False, f"Alerta forense: {msg_task}"
+            res_fail = (False, f"Alerta forense: {msg_task}")
+            _forensic_cache[for_cache_key] = res_fail
+            return res_fail
 
         if len(_forensic_cache) > 32:
             _forensic_cache.clear()
-        _forensic_cache[for_cache_key] = True
-        return True, "Integridade forense confirmada."
+        res_ok = (True, "Integridade forense confirmada.")
+        _forensic_cache[for_cache_key] = res_ok
+        return res_ok
     except Exception as e:
         return True, f"Verificacao forense ignorada por erro de ambiente: {e}"
 
@@ -2121,6 +2143,12 @@ def _decode_embedded_base64(cmd_text: str) -> str:
 
 
 AI_READY_SEAL_FILE = QUEUE_DIR / "ai_ready.json"
+AI_READY_SEAL_FALLBACKS = [
+    QUEUE_DIR / "ai_ready.json",
+    QUEUE_DIR / "gui_pending" / "ai_ready.json",
+    Path(os.environ.get("LOCALAPPDATA", tempfile.gettempdir())) / "AdminBridge" / "ai_ready.json",
+    Path(tempfile.gettempdir()) / "adminbridge_ai_ready.json"
+]
 
 
 def _ensure_ollama_on_demand() -> Optional[str]:
@@ -2141,42 +2169,74 @@ def _ensure_ollama_on_demand() -> Optional[str]:
 
 def is_local_slm_verified(probe_network: bool = False) -> bool:
     """Verifica se o mini-modelo local qwen2.5:0.5b já foi instalado, testado e aprovado.
-    Por padrão (probe_network=False), realiza apenas leitura local ultrarrápida do selo em disco (< 0.1ms).
+    Por padrão [probe_network=False], realiza apenas leitura local ultrarrápida do selo em disco [< 0.1ms].
     """
-    if AI_READY_SEAL_FILE.exists():
-        try:
-            data = json.loads(AI_READY_SEAL_FILE.read_text(encoding="utf-8"))
-            if data.get("verified") is True:
-                return True
-        except Exception:
-            pass
+    for f in AI_READY_SEAL_FALLBACKS:
+        if f.exists():
+            try:
+                data = json.loads(f.read_text(encoding="utf-8"))
+                if data.get("verified") is True:
+                    return True
+            except Exception:
+                pass
     if not probe_network:
         return False
 
-    # Se probe_network=True e o selo ainda não existir, consulta /api/tags (timeout 0.4s) em segundo plano
+    # Se probe_network=True e o selo ainda não existir, consulta /api/tags [timeout 0.4s] em segundo plano
     try:
         import urllib.request
         with urllib.request.urlopen("http://127.0.0.1:11434/api/tags", timeout=0.4) as resp:
             tags_data = json.loads(resp.read().decode("utf-8"))
             models = [m.get("name", "").lower() for m in tags_data.get("models", [])]
             if any("qwen2.5:0.5b" in m or "qwen2.5-coder:0.5b" in m for m in models):
-                QUEUE_DIR.mkdir(parents=True, exist_ok=True)
-                AI_READY_SEAL_FILE.write_text(json.dumps({"verified": True, "model": "qwen2.5:0.5b", "verified_at": time.time()}), encoding="utf-8")
+                _save_ai_ready_seal({"verified": True, "model": "qwen2.5:0.5b", "verified_at": time.time()})
                 return True
     except Exception:
         pass
     return False
 
 
+def _save_ai_ready_seal(payload: dict):
+    raw = json.dumps(payload, indent=2, ensure_ascii=False)
+    for f in AI_READY_SEAL_FALLBACKS:
+        try:
+            f.parent.mkdir(parents=True, exist_ok=True)
+            f.write_text(raw, encoding="utf-8")
+        except Exception:
+            pass
+
+
+def _notify_ai_progress(cb, percent: int, msg: str, stage: str = ""):
+    if not cb:
+        return
+    try:
+        import inspect
+        sig = inspect.signature(cb)
+        num_params = len(sig.parameters)
+        if num_params >= 3:
+            cb(percent, msg, stage)
+        elif num_params == 2:
+            cb(percent, msg)
+        else:
+            cb(f"[{percent}%] {msg}")
+    except Exception:
+        try:
+            cb(f"[{percent}%] {msg}")
+        except Exception:
+            pass
+
+
 def pull_and_test_local_slm(progress_callback=None) -> Tuple[bool, str]:
-    """Baixa o modelo qwen2.5:0.5b diretamente pela API HTTP do Ollama (POST /api/pull),
-    sem depender da lista de modelos da interface gráfica do Ollama, e faz um teste real de inferência!
+    """Baixa o modelo qwen2.5:0.5b com streaming em tempo real via API HTTP do Ollama [POST /api/pull]
+    e executa teste prático de inferência calibrado para CPU, descarregando a RAM ao final.
     """
     import urllib.request
 
+    _notify_ai_progress(progress_callback, 5, "Verificando serviço do motor local Ollama...", "server")
+
     # 1. Garante que o servidor Ollama está respondendo em 127.0.0.1:11434
     server_up = False
-    for _ in range(2):
+    for attempt_srv in range(3):
         try:
             with urllib.request.urlopen("http://127.0.0.1:11434/api/tags", timeout=1.5) as r:
                 if r.status == 200:
@@ -2187,18 +2247,18 @@ def pull_and_test_local_slm(progress_callback=None) -> Tuple[bool, str]:
             if ollama_bin:
                 try:
                     subprocess.Popen([ollama_bin, "serve"], creationflags=0x08000000 if sys.platform == "win32" else 0)
-                    time.sleep(1.5)
+                    time.sleep(1.8)
                 except Exception:
                     pass
 
     if not server_up:
-        return False, "O serviço do Ollama não foi detectado em http://127.0.0.1:11434. Verifique se o aplicativo Ollama está aberto."
+        return False, "O serviço do Ollama não foi detectado em http://127.0.0.1:11434. Inicie o aplicativo Ollama para prosseguir."
 
-    # 2. Solicita o download direto do modelo qwen2.5:0.5b via API HTTP (/api/pull)
-    if progress_callback:
-        progress_callback("Baixando modelo ultraleve qwen2.5:0.5b (~350 MB) direto pelo servidor local do Ollama...")
+    _notify_ai_progress(progress_callback, 15, "Conectado ao Ollama. Iniciando download do modelo qwen2.5:0.5b [~397 MB]...", "download")
+
+    # 2. Solicita o download com streaming via API HTTP [/api/pull]
     try:
-        pull_body = json.dumps({"name": "qwen2.5:0.5b", "stream": False}).encode("utf-8")
+        pull_body = json.dumps({"name": "qwen2.5:0.5b", "stream": True}).encode("utf-8")
         req_pull = urllib.request.Request(
             "http://127.0.0.1:11434/api/pull",
             data=pull_body,
@@ -2206,44 +2266,55 @@ def pull_and_test_local_slm(progress_callback=None) -> Tuple[bool, str]:
             method="POST"
         )
         with urllib.request.urlopen(req_pull, timeout=600.0) as resp:
-            pull_res = json.loads(resp.read().decode("utf-8"))
-            if pull_res.get("error"):
-                return False, f"Erro ao baixar modelo: {pull_res.get('error')}"
+            for line_bytes in resp:
+                if not line_bytes:
+                    continue
+                try:
+                    line_data = json.loads(line_bytes.decode("utf-8", errors="replace"))
+                    if line_data.get("error"):
+                        return False, f"Erro retornado pelo Ollama: {line_data.get('error')}"
+                    st = line_data.get("status", "")
+                    completed = line_data.get("completed", 0)
+                    total = line_data.get("total", 0)
+                    if total > 0:
+                        pct = min(88, max(15, int(15 + (completed / total) * 73)))
+                        mb_done = completed / (1024 * 1024)
+                        mb_tot = total / (1024 * 1024)
+                        _notify_ai_progress(progress_callback, pct, f"{st} • {mb_done:.1f} MB / {mb_tot:.1f} MB [{pct}%]", "download")
+                    else:
+                        _notify_ai_progress(progress_callback, 20, f"{st}...", "download")
+                except Exception:
+                    pass
     except Exception as e:
-        return False, f"Falha ao baixar qwen2.5:0.5b via API do Ollama: {e}"
+        return False, f"Falha na comunicação com a API do Ollama: {e}"
 
-    # 3. Executa teste real de análise de script e descarrega da RAM (keep_alive: 0s)
-    if progress_callback:
-        progress_callback("Testando resposta da Mini-IA com script de verificação e liberando RAM (keep_alive=0s)...")
+    # 3. Executa teste real de análise de script calibrado para CPU e descarrega da RAM [keep_alive: 0s]
+    _notify_ai_progress(progress_callback, 90, "Executando teste prático com script de amostra e liberando RAM [keep_alive=0s]...", "test")
+
     test_explanation = _try_local_slm_explanation(
         'sc.exe create ServicoTeste binPath= "C:\\Temp\\teste.exe" start= auto',
         [{"category": "Criação de Serviço", "explanation": "Cria serviço automático"}],
-        timeout_sec=10.0
+        timeout_sec=45.0
     )
     if not test_explanation:
-        return False, "O modelo foi baixado, mas não respondeu ao teste de verificação."
+        return False, "O modelo qwen2.5:0.5b foi baixado, mas não respondeu ao teste de verificação dentro do tempo limite."
 
-    try:
-        QUEUE_DIR.mkdir(parents=True, exist_ok=True)
-        AI_READY_SEAL_FILE.write_text(
-            json.dumps({
-                "verified": True,
-                "model": "qwen2.5:0.5b",
-                "sample_test": test_explanation[:160],
-                "verified_at": time.time()
-            }, indent=2, ensure_ascii=False),
-            encoding="utf-8"
-        )
-    except Exception:
-        pass
+    _notify_ai_progress(progress_callback, 100, "Teste de inferência aprovado! Mini-IA 100% pronta.", "done")
+
+    _save_ai_ready_seal({
+        "verified": True,
+        "model": "qwen2.5:0.5b",
+        "sample_test": test_explanation[:160],
+        "verified_at": time.time()
+    })
 
     return True, f"Mini-IA qwen2.5:0.5b instalada, testada e validada com sucesso!\n\nResposta do teste:\n\"{test_explanation}\""
 
 
-def _try_local_slm_explanation(code_text: str, findings: list, timeout_sec: float = 4.0) -> Optional[str]:
-    """Camada 3 (Prompt Técnico Específico + Zero RAM em Repouso com keep_alive='0s'):
-    Analisa especificamente quais comandos, caminhos de arquivo, serviços ou chaves de registro
-    estão sendo tocados pelo script e descarrega o modelo da RAM imediatamente após responder.
+def _try_local_slm_explanation(code_text: str, findings: list, timeout_sec: float = 18.0) -> Optional[str]:
+    """Camada 3 [Prompt Técnico Específico + Zero RAM em Repouso com keep_alive='0s']:
+    Analisa os comandos, caminhos de arquivo, serviços ou chaves tocados pelo script
+    e descarrega o modelo da RAM imediatamente após responder. Otimizado para CPU i5.
     """
     import urllib.request
     detected_cats = ", ".join([f.get("category", "") for f in (findings or [])]) or "Ação administrativa"
@@ -2260,7 +2331,12 @@ def _try_local_slm_explanation(code_text: str, findings: list, timeout_sec: floa
         "prompt": prompt,
         "stream": False,
         "keep_alive": "0s",  # Libera 100% da RAM imediatamente após gerar a resposta!
-        "options": {"num_predict": 160, "temperature": 0.1}
+        "options": {
+            "num_predict": 90,
+            "num_ctx": 512,
+            "temperature": 0.1,
+            "num_thread": 4
+        }
     }).encode("utf-8")
 
     for attempt in range(2):

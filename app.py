@@ -35,7 +35,7 @@ try:
         QLabel, QPushButton, QPlainTextEdit, QFrame, QSystemTrayIcon,
         QMenu, QMessageBox, QDialog, QLineEdit, QTableWidget, QTableWidgetItem,
         QHeaderView, QAbstractItemView, QInputDialog, QGridLayout, QLayout,
-        QProgressBar
+        QProgressBar, QSizePolicy
     )
     from app_icon import get_app_icon
 except ImportError:
@@ -44,7 +44,7 @@ except ImportError:
     QApplication = QWidget = QVBoxLayout = QHBoxLayout = QLabel = QPushButton = None
     QPlainTextEdit = QFrame = QSystemTrayIcon = QMenu = QMessageBox = QLineEdit = None
     QTableWidget = QTableWidgetItem = QHeaderView = QAbstractItemView = QInputDialog = None
-    QGridLayout = QLayout = QProgressBar = None
+    QGridLayout = QLayout = QProgressBar = QSizePolicy = None
     class QThread:
         pass
     class QDialog:
@@ -183,44 +183,22 @@ def get_desktop_dir() -> Optional[Path]:
 
 
 def create_desktop_shortcut():
-    """Garante a existência do atalho da Central de Gestão na Área de Trabalho do usuário."""
+    """Remove atalhos legados .lnk sem lentidão de subprocessos PowerShell."""
     try:
-        desktops_to_create = []
+        desktops_to_clean = []
         user_desktop = get_desktop_dir()
         if user_desktop:
-            desktops_to_create.append(user_desktop)
+            desktops_to_clean.append(user_desktop)
         pub_desktop = Path(os.environ.get("PUBLIC", "C:/Users/Public")) / "Desktop"
-        if pub_desktop.exists() and pub_desktop not in desktops_to_create:
-            desktops_to_create.append(pub_desktop)
+        if pub_desktop.exists() and pub_desktop not in desktops_to_clean:
+            desktops_to_clean.append(pub_desktop)
 
-        target = (BASE_DIR / "AdminBridge.exe").resolve()
-        if not target.exists():
-            target = (BASE_DIR / "AntigravityBridge.exe").resolve()
-        icon_path = (BASE_DIR / "icon.ico").resolve()
-
-        for d in desktops_to_create:
-            lnk_path = d / "Admin Bridge.lnk"
-            if lnk_path.exists():
-                continue
-            # Remove atalhos antigos com nomes legados
-            for old_lnk in ["Antigravity Bridge.lnk", "Antigravity Admin Bridge.lnk", "Configurar Antigravity Bridge.lnk"]:
-                (d / old_lnk).unlink(missing_ok=True)
-
-            ps_cmd = (
-                f'$ws = New-Object -ComObject WScript.Shell; '
-                f'$s = $ws.CreateShortcut("{lnk_path}"); '
-                f'$s.TargetPath = "{target}"; '
-                f'$s.WorkingDirectory = "{BASE_DIR}"; '
-                f'$s.IconLocation = "{icon_path},0"; '
-                f'$s.Description = "Admin Bridge • Central de Gestao e Autorizacao"; '
-                f'$s.Save()'
-            )
-            subprocess.run(
-                ["powershell.exe", "-NoProfile", "-Command", ps_cmd],
-                capture_output=True,
-                check=False,
-                creationflags=0x08000000
-            )
+        for d in desktops_to_clean:
+            for old_lnk in ["Admin Bridge.lnk", "Antigravity Bridge.lnk", "Antigravity Admin Bridge.lnk", "Configurar Antigravity Bridge.lnk"]:
+                try:
+                    (d / old_lnk).unlink(missing_ok=True)
+                except Exception:
+                    pass
     except Exception:
         pass
 
@@ -1742,30 +1720,39 @@ class ResponsivePasswordDialog(QDialog):
         if self.verify_fn:
             self._verifying = True
             self.btn_confirm.setEnabled(False)
+            self.edit_pwd.setEnabled(False)
+            self.btn_cancel.setEnabled(False)
             self.lbl_status.setText("🔄 Validando palavra-passe com autenticidade matemática...")
             self.lbl_status.setStyleSheet("color: #89b4fa; font-size: 12px;")
-            if QApplication is not None:
-                QApplication.processEvents()
 
-            ok, msg = self.verify_fn(pwd)
-            self._verifying = False
-            self.btn_confirm.setEnabled(True)
+            def _bg_worker():
+                try:
+                    ok, msg = self.verify_fn(pwd)
+                except Exception as ex:
+                    ok, msg = False, f"Erro inesperado: {ex}"
 
-            if ok:
-                self._has_error = False
-                self.lbl_status.setText("✅ Palavra-passe validada com sucesso!")
-                self.lbl_status.setStyleSheet("color: #a6e3a1; font-size: 12px; font-weight: bold;")
-                self.verified_password = pwd
-                if QApplication is not None:
-                    QApplication.processEvents()
-                QTimer.singleShot(250, self.accept)
-            else:
-                self._has_error = True
-                self.lbl_status.setText(f"❌ {msg}")
-                self.lbl_status.setStyleSheet("color: #f38ba8; font-size: 12px; font-weight: bold;")
-                self.edit_pwd.selectAll()
-                self.edit_pwd.setFocus()
-                self.update_lockout_tick()
+                def _ui_callback():
+                    self._verifying = False
+                    self.btn_confirm.setEnabled(True)
+                    self.edit_pwd.setEnabled(True)
+                    self.btn_cancel.setEnabled(True)
+                    if ok:
+                        self._has_error = False
+                        self.lbl_status.setText("✅ Palavra-passe validada com sucesso!")
+                        self.lbl_status.setStyleSheet("color: #a6e3a1; font-size: 12px; font-weight: bold;")
+                        self.verified_password = pwd
+                        QTimer.singleShot(250, self.accept)
+                    else:
+                        self._has_error = True
+                        self.lbl_status.setText(f"❌ {msg}")
+                        self.lbl_status.setStyleSheet("color: #f38ba8; font-size: 12px; font-weight: bold;")
+                        self.edit_pwd.selectAll()
+                        self.edit_pwd.setFocus()
+                        self.update_lockout_tick()
+
+                QTimer.singleShot(0, _ui_callback)
+
+            threading.Thread(target=_bg_worker, daemon=True).start()
         else:
             self.verified_password = pwd
             self.accept()
@@ -2059,21 +2046,198 @@ class UpdateDialog(QDialog):
 # JANELA PRINCIPAL DA CENTRAL DE GESTÃO (SYSTEM TRAY & DASHBOARD)
 # -----------------------------------------------------------------------------
 
+class LocalAIWorker(QThread):
+    progress_signal = pyqtSignal(int, str, str)
+    finished_signal = pyqtSignal(bool, str)
+
+    def run(self):
+        def _cb(percent: int, msg: str, stage: str = ""):
+            self.progress_signal.emit(percent, msg, stage)
+
+        ok, msg = pull_and_test_local_slm(progress_callback=_cb)
+        self.finished_signal.emit(ok, msg)
+
+
+class LocalAIInstallerDialog(QDialog):
+    """Diálogo visual moderno com barra de progresso, taxa em MB e log em tempo real do download da Mini-IA."""
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Instalador da Mini-IA Local [Qwen 2.5 0.5B]")
+        self.resize(560, 380)
+        self.setMinimumWidth(480)
+        self.setModal(True)
+        self.worker = None
+
+        app_icon = get_app_icon()
+        if app_icon and not app_icon.isNull():
+            self.setWindowIcon(app_icon)
+
+        self.setStyleSheet("""
+            QDialog {
+                background-color: #181825;
+                color: #cdd6f4;
+                font-family: 'Segoe UI', system-ui, sans-serif;
+            }
+            QLabel {
+                color: #cdd6f4;
+            }
+            QProgressBar {
+                background-color: #11111b;
+                border: 1px solid #313244;
+                border-radius: 6px;
+                text-align: center;
+                color: #cdd6f4;
+                font-weight: bold;
+                height: 24px;
+            }
+            QProgressBar::chunk {
+                background-color: #89b4fa;
+                border-radius: 5px;
+            }
+            QPlainTextEdit {
+                background-color: #11111b;
+                color: #a6adc8;
+                border: 1px solid #313244;
+                border-radius: 6px;
+                font-family: Consolas, monospace;
+                font-size: 11px;
+                padding: 6px;
+            }
+            QPushButton {
+                font-weight: bold;
+                border-radius: 6px;
+                padding: 9px 18px;
+                font-size: 13px;
+                border: none;
+                background-color: #313244;
+                color: #cdd6f4;
+            }
+            QPushButton:hover {
+                background-color: #45475a;
+            }
+        """)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(22, 18, 22, 18)
+        layout.setSpacing(10)
+
+        lbl_title = QLabel("<b>🤖 Assistente de Segurança Local [Mini-IA]</b>")
+        lbl_title.setStyleSheet("font-size: 15px; color: #89b4fa;")
+        layout.addWidget(lbl_title)
+
+        lbl_desc = QLabel(
+            "Configuração e validação automática do modelo ultraleve 'qwen2.5:0.5b' [~397 MB].\n"
+            "O modelo é mantido fora da memória RAM [0 MB consumidos em repouso] e ativado apenas sob demanda na Camada 3."
+        )
+        lbl_desc.setWordWrap(True)
+        lbl_desc.setStyleSheet("font-size: 12px; color: #a6adc8; line-height: 1.4;")
+        layout.addWidget(lbl_desc)
+
+        self.lbl_status = QLabel("Iniciando processo de verificação...")
+        self.lbl_status.setStyleSheet("font-size: 12px; font-weight: bold; color: #cdd6f4;")
+        layout.addWidget(self.lbl_status)
+
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setRange(0, 100)
+        self.progress_bar.setValue(5)
+        layout.addWidget(self.progress_bar)
+
+        self.lbl_details = QLabel("Aguardando conexão com o motor Ollama...")
+        self.lbl_details.setStyleSheet("font-size: 11px; color: #89b4fa;")
+        layout.addWidget(self.lbl_details)
+
+        self.log_view = QPlainTextEdit()
+        self.log_view.setReadOnly(True)
+        self.log_view.setFixedHeight(120)
+        layout.addWidget(self.log_view)
+
+        btn_row = QHBoxLayout()
+        btn_row.addStretch(1)
+        self.btn_action = QPushButton("Cancelar")
+        self.btn_action.clicked.connect(self.on_btn_clicked)
+        btn_row.addWidget(self.btn_action)
+        layout.addLayout(btn_row)
+
+        self._finished = False
+        self._success = False
+        self._success_msg = ""
+
+        QTimer.singleShot(150, self.start_installation)
+
+    def start_installation(self):
+        self.worker = LocalAIWorker(self)
+        self.worker.progress_signal.connect(self.on_progress)
+        self.worker.finished_signal.connect(self.on_finished)
+        self.worker.start()
+
+    def on_progress(self, percent: int, msg: str, stage: str):
+        self.progress_bar.setValue(percent)
+        self.lbl_details.setText(msg)
+        if stage == "server":
+            self.lbl_status.setText("1/3 Conectando ao motor Ollama...")
+        elif stage == "download":
+            self.lbl_status.setText("2/3 Baixando modelo neural...")
+        elif stage == "test":
+            self.lbl_status.setText("3/3 Executando teste prático de inferência...")
+        elif stage == "done":
+            self.lbl_status.setText("Concluído!")
+
+        self.log_view.appendPlainText(msg)
+        sb = self.log_view.verticalScrollBar()
+        if sb:
+            sb.setValue(sb.maximum())
+
+    def on_finished(self, success: bool, msg: str):
+        self._finished = True
+        self._success = success
+        self._success_msg = msg
+        if success:
+            self.progress_bar.setValue(100)
+            self.progress_bar.setStyleSheet("QProgressBar::chunk { background-color: #a6e3a1; }")
+            self.lbl_status.setText("✅ Mini-IA instalada e validada com sucesso!")
+            self.lbl_status.setStyleSheet("font-size: 13px; font-weight: bold; color: #a6e3a1;")
+            self.lbl_details.setText("Modelo homologado. Zero consumo de RAM em repouso [keep_alive=0s].")
+            self.btn_action.setText("Concluir")
+            self.btn_action.setStyleSheet("background-color: #a6e3a1; color: #11111b; font-weight: bold;")
+            self.log_view.appendPlainText(f"\n{msg}")
+            if self.parent() and hasattr(self.parent(), "act_install_ai"):
+                self.parent().act_install_ai.setVisible(False)
+        else:
+            self.lbl_status.setText("❌ Falha na instalação ou no teste de verificação.")
+            self.lbl_status.setStyleSheet("font-size: 13px; font-weight: bold; color: #f38ba8;")
+            self.lbl_details.setText("Consulte os detalhes abaixo para corrigir.")
+            self.btn_action.setText("Fechar")
+            self.log_view.appendPlainText(f"\nERRO: {msg}")
+
+        sb = self.log_view.verticalScrollBar()
+        if sb:
+            sb.setValue(sb.maximum())
+
+    def on_btn_clicked(self):
+        if self._finished:
+            if self._success:
+                self.accept()
+            else:
+                self.reject()
+        else:
+            self.reject()
+
+    def closeEvent(self, event):
+        if not self._finished and self.worker and self.worker.isRunning():
+            try:
+                self.worker.terminate()
+            except Exception:
+                pass
+        event.accept()
+
+
 def pull_and_test_local_ai_with_ui(parent=None) -> Tuple[bool, str]:
-    """Executa pull_and_test_local_slm mantendo a interface responsiva durante o download."""
-    res_holder = {"done": False, "ok": False, "msg": ""}
-    def _worker():
-        ok, msg = pull_and_test_local_slm()
-        res_holder["ok"] = ok
-        res_holder["msg"] = msg
-        res_holder["done"] = True
-    t = threading.Thread(target=_worker, daemon=True)
-    t.start()
-    while not res_holder["done"]:
-        if QApplication is not None:
-            QApplication.processEvents()
-        time.sleep(0.08)
-    return res_holder["ok"], res_holder["msg"]
+    """Abre o diálogo interativo de instalação e validação da Mini-IA com feedback em tempo real."""
+    dlg = LocalAIInstallerDialog(parent)
+    res = dlg.exec()
+    if res == QDialog.DialogCode.Accepted:
+        return True, dlg._success_msg
+    return dlg._success, dlg._success_msg or "Operação cancelada pelo usuário."
 
 
 class AdminBridgeWindow(QMainWindow):
@@ -2308,7 +2472,7 @@ class AdminBridgeWindow(QMainWindow):
         act_sync.triggered.connect(self.show_sync_test_dialog)
         self.settings_menu.addAction(act_sync)
 
-        self.act_install_ai = QAction("🤖 Instalar e Testar Mini-IA Local (Qwen 0.5B)...", self)
+        self.act_install_ai = QAction("🤖 Instalar e Testar Mini-IA Local [Qwen 0.5B]...", self)
         self.act_install_ai.triggered.connect(self.install_local_ai_assistant)
         self.settings_menu.addAction(self.act_install_ai)
         if is_local_slm_verified(probe_network=False):
@@ -2431,7 +2595,12 @@ class AdminBridgeWindow(QMainWindow):
         header_pending.addStretch()
 
         self.lbl_badge = QLabel("INATIVO")
-        self.lbl_badge.setStyleSheet("background-color: #313244; color: #a6adc8; padding: 3px 8px; border-radius: 4px; font-size: 11px; font-weight: bold;")
+        self.lbl_badge.setFixedHeight(24)
+        self.lbl_badge.setMinimumWidth(72)
+        self.lbl_badge.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        if QSizePolicy is not None:
+            self.lbl_badge.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
+        self.lbl_badge.setStyleSheet("background-color: #313244; color: #a6adc8; padding: 2px 10px; border-radius: 4px; font-size: 11px; font-weight: bold;")
         header_pending.addWidget(self.lbl_badge)
         pending_layout.addLayout(header_pending)
 
@@ -2491,6 +2660,7 @@ class AdminBridgeWindow(QMainWindow):
         btn_box_main.addLayout(btn_box)
         self.btn_box_widget.hide()
         pending_layout.addWidget(self.btn_box_widget)
+        pending_layout.addStretch(1)
 
         left_layout.addWidget(self.card_pending, stretch=1)
 
@@ -2909,7 +3079,7 @@ class AdminBridgeWindow(QMainWindow):
             self.lbl_req_title.setText(f"⚠️ Alerta de Script Sensível (Risco {score}/100): {title}")
             self.lbl_req_sub.setText("A Camada 3 pausou este comando para você revisar o que ele faz antes de liberar:")
             self.lbl_badge.setText(f"REVISÃO DE RISCO • {script_type}")
-            self.lbl_badge.setStyleSheet("background-color: #f38ba8; color: #11111b; padding: 4px 10px; border-radius: 4px; font-weight: bold;")
+            self.lbl_badge.setStyleSheet("background-color: #f38ba8; color: #11111b; padding: 2px 10px; border-radius: 4px; font-size: 11px; font-weight: bold;")
             shown_code = risk_report.get("unrolled_code") or code
             viewer_text = f"{risk_report.get('explanation', '')}\n\n--- CÓDIGO DO SCRIPT (INCLUINDO ARQUIVOS EXTERNOS) ---\n{shown_code}"
             self.code_viewer.setFixedHeight(170)
@@ -2917,7 +3087,7 @@ class AdminBridgeWindow(QMainWindow):
             self.lbl_req_title.setText(title)
             self.lbl_req_sub.setText(f"[Sem OTP] Confirmação manual requerida • {desc}")
             self.lbl_badge.setText(f"UAC REQUERIDO - {script_type}")
-            self.lbl_badge.setStyleSheet("background-color: #f9e2af; color: #11111b; padding: 4px 10px; border-radius: 4px;")
+            self.lbl_badge.setStyleSheet("background-color: #f9e2af; color: #11111b; padding: 2px 10px; border-radius: 4px; font-size: 11px; font-weight: bold;")
             viewer_text = code
             self.code_viewer.setFixedHeight(110)
 
@@ -2958,8 +3128,8 @@ class AdminBridgeWindow(QMainWindow):
 
         self.lbl_req_title.setText(title)
         self.lbl_req_sub.setText(f"Autenticado via HOTP (Contador #{counter}) • {desc}")
-        self.lbl_badge.setText(f"AUTORIZADO ({script_type})")
-        self.lbl_badge.setStyleSheet("background-color: #a6e3a1; color: #11111b; padding: 4px 10px; border-radius: 4px;")
+        self.lbl_badge.setText(f"AUTORIZADO [{script_type}]")
+        self.lbl_badge.setStyleSheet("background-color: #a6e3a1; color: #11111b; padding: 2px 10px; border-radius: 4px; font-size: 11px; font-weight: bold;")
 
         self.code_viewer.setPlainText(code)
         self.code_viewer.show()
@@ -2998,7 +3168,8 @@ class AdminBridgeWindow(QMainWindow):
                 json.dump(self.current_request, f, indent=2, ensure_ascii=False)
             if hasattr(self, "current_processing_file") and self.current_processing_file:
                 self.current_processing_file.unlink(missing_ok=True)
-            self.lbl_badge.setText("ENVIADO AO DAEMON SYSTEM...")
+            self.lbl_badge.setText("ENVIADO AO DAEMON")
+            self.lbl_badge.setStyleSheet("background-color: #89b4fa; color: #11111b; padding: 2px 10px; border-radius: 4px; font-size: 11px; font-weight: bold;")
             QTimer.singleShot(1200, self.reset_ui)
             return
 
@@ -3026,7 +3197,7 @@ class AdminBridgeWindow(QMainWindow):
         self.btn_approve.setEnabled(False)
         self.btn_reject.setEnabled(False)
         self.lbl_badge.setText("EXECUTANDO VIA UAC...")
-        self.lbl_badge.setStyleSheet("background-color: #f9e2af; color: #11111b; padding: 4px 10px; border-radius: 4px;")
+        self.lbl_badge.setStyleSheet("background-color: #f9e2af; color: #11111b; padding: 2px 10px; border-radius: 4px; font-size: 11px; font-weight: bold;")
 
         self.exec_thread = ExecutionThread(self.current_request, int(self.winId()), force_uac=True)
         self.exec_thread.finished_signal.connect(self.on_execution_finished)
@@ -3081,12 +3252,12 @@ class AdminBridgeWindow(QMainWindow):
             self.lbl_req_title.setText("Executado com Sucesso! Retornado ao Chat.")
             self.lbl_req_sub.setText("O comando foi finalizado com código 0.")
             self.lbl_badge.setText("CONCLUÍDO")
-            self.lbl_badge.setStyleSheet("background-color: #a6e3a1; color: #11111b; padding: 4px 10px; border-radius: 4px;")
+            self.lbl_badge.setStyleSheet("background-color: #a6e3a1; color: #11111b; padding: 2px 10px; border-radius: 4px; font-size: 11px; font-weight: bold;")
             self.code_viewer.setPlainText(f"=== SAÍDA RETORNADA (CÓDIGO 0) ===\n\n{output_data}")
         else:
             self.lbl_req_title.setText(f"Finalizado com Erro (Código {exit_code})")
             self.lbl_badge.setText("ERRO")
-            self.lbl_badge.setStyleSheet("background-color: #f38ba8; color: #11111b; padding: 4px 10px; border-radius: 4px;")
+            self.lbl_badge.setStyleSheet("background-color: #f38ba8; color: #11111b; padding: 2px 10px; border-radius: 4px; font-size: 11px; font-weight: bold;")
             self.code_viewer.setPlainText(f"=== SAÍDA DA EXECUÇÃO (CÓDIGO {exit_code}) ===\n\n{output_data}")
 
         self.code_viewer.show()
@@ -3100,7 +3271,7 @@ class AdminBridgeWindow(QMainWindow):
         self.lbl_req_title.setText("Aguardando solicitações...")
         self.lbl_req_sub.setText("Aplicações clientes enviarão solicitações aqui quando precisarem executar comandos.")
         self.lbl_badge.setText("INATIVO")
-        self.lbl_badge.setStyleSheet("background-color: #313244; color: #a6adc8; padding: 3px 8px; border-radius: 4px; font-size: 11px; font-weight: bold;")
+        self.lbl_badge.setStyleSheet("background-color: #313244; color: #a6adc8; padding: 2px 10px; border-radius: 4px; font-size: 11px; font-weight: bold;")
         self.code_viewer.clear()
         self.code_viewer.hide()
         self.btn_box_widget.hide()
@@ -3275,31 +3446,9 @@ class AdminBridgeWindow(QMainWindow):
         )
 
     def install_local_ai_assistant(self):
-        """Baixa o modelo qwen2.5:0.5b direto pela API HTTP do Ollama, executa um teste real e oculta a opção do menu quando validado."""
-        ask = QMessageBox.question(
-            self,
-            "Ativar e Testar Mini-IA Local (Qwen 2.5 • 0.5B)",
-            "O Admin Bridge irá configurar e testar automaticamente o modelo ultraleve 'qwen2.5:0.5b' (~350 MB) no seu Ollama local.\n\n"
-            "• Você NÃO precisa selecionar o modelo na janela do Ollama (o download é feito direto via API local).\n"
-            "• Após o teste passar, esta opção desaparecerá do menu automaticamente.\n\n"
-            "Deseja iniciar o download e teste agora?",
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-            QMessageBox.StandardButton.Yes
-        )
-        if ask != QMessageBox.StandardButton.Yes:
-            return
-
-        self.setWindowTitle("Admin Bridge • Baixando e Testando Mini-IA Local (Aguarde)...")
-        QApplication.processEvents()
-        ok_ai, msg_ai = pull_and_test_local_ai_with_ui(self)
-        self.setWindowTitle("Admin Bridge • Central de Gestão")
-
-        if ok_ai:
-            if hasattr(self, "act_install_ai"):
-                self.act_install_ai.setVisible(False)
-            QMessageBox.information(self, "Mini-IA Ativada e Testada!", msg_ai)
-        else:
-            QMessageBox.warning(self, "Aviso na Verificação da Mini-IA", msg_ai)
+        """Abre o instalador visual e reativo da Mini-IA com progresso contínuo e teste integrado."""
+        dlg = LocalAIInstallerDialog(self)
+        dlg.exec()
 
     def show_sync_test_dialog(self):
         try:

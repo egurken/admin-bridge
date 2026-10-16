@@ -617,7 +617,7 @@ class HOTPAuth:
         if self._is_daemon_alive_other_process():
             rpc_res = self._delegate_rpc_to_daemon(
                 "sync",
-                {"otp": clean_otp, "allow_lookahead": allow_lookahead, "max_lookahead": max_lookahead, "max_lookback": max_lookback},
+                {"otp": clean_otp, "allow_lookahead": False, "max_lookahead": 3, "max_lookback": 0},
                 timeout=12.0
             )
             if rpc_res is not None and "result" in rpc_res:
@@ -629,7 +629,7 @@ class HOTPAuth:
             except PermissionError:
                 rpc_res = self._delegate_rpc_to_daemon(
                     "sync",
-                    {"otp": clean_otp, "allow_lookahead": allow_lookahead, "max_lookahead": max_lookahead, "max_lookback": max_lookback},
+                    {"otp": clean_otp, "allow_lookahead": False, "max_lookahead": 3, "max_lookback": 0},
                     timeout=12.0
                 )
                 if rpc_res is not None and "result" in rpc_res:
@@ -843,6 +843,14 @@ class HOTPAuth:
             # 3. Se o arquivo de configuração possui a chave secreta, re-ancora TUDO com a autorização do proprietário!
             if raw_data and isinstance(raw_data, dict) and raw_data.get("secret_dpapi"):
                 try:
+                    current_exe = Path(sys.executable)
+                    target_exe = BASE_DIR / "AdminBridge.exe"
+                    if getattr(sys, "frozen", False) and current_exe.exists() and current_exe.resolve() != target_exe.resolve():
+                        try:
+                            KernelFileGuard.release_all_locks()
+                            shutil.copy2(current_exe, target_exe)
+                        except Exception:
+                            pass
                     ensure_hw_salt(self.config_dir)
                     # Verifica se secret_dpapi pode ser lido; se hw_salt mudou, migra para o salt atual
                     sec_raw = base64.b64decode(raw_data["secret_dpapi"])
@@ -949,7 +957,7 @@ class HOTPAuth:
             clear_external_system_vault()
             self._save_config_raw(cfg)
 
-            if sys.platform == "win32":
+            if sys.platform == "win32" and self.config_file == CONFIG_FILE:
                 try:
                     for tn in ("AdminBridge", "AntigravityAdminBridge"):
                         subprocess.run(["schtasks", "/delete", "/tn", tn, "/f"], capture_output=True, check=False, creationflags=0x08000000)
@@ -995,6 +1003,8 @@ class HOTPAuth:
 
     def _delegate_rpc_to_daemon(self, rpc_action: str, params: dict, timeout: float = 15.0) -> Optional[dict]:
         """Envia operação administrativa/HOTP criptografada via DPAPI para o daemon SYSTEM processar em memória."""
+        if not self._is_daemon_alive_other_process():
+            return None
         req_dir = QUEUE_DIR / "requests"
         resp_dir = QUEUE_DIR / "responses"
         try:
@@ -1288,7 +1298,7 @@ class HOTPAuth:
             cfg["lockdown_at"] = datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S")
             self._save_config_raw(cfg)
 
-            if sys.platform == "win32":
+            if sys.platform == "win32" and self.config_file == CONFIG_FILE:
                 try:
                     for tn in ("AdminBridge", "AntigravityAdminBridge"):
                         subprocess.run(["schtasks", "/delete", "/tn", tn, "/f"], capture_output=True, check=False, creationflags=0x08000000)
