@@ -49,9 +49,13 @@ if %ERRORLEVEL% EQU 0 (
 
     echo Atualizando C:\Utilitario...
     if exist "C:\Utilitario\AdminBridge.exe" (
+        takeown /f "C:\Utilitario\AdminBridge.exe" /a >nul 2>&1
+        icacls "C:\Utilitario\AdminBridge.exe" /grant *S-1-5-32-544:F >nul 2>&1
         attrib -r "C:\Utilitario\AdminBridge.exe" >nul 2>&1
     )
     if exist "C:\Utilitario\AntigravityBridge.exe" (
+        takeown /f "C:\Utilitario\AntigravityBridge.exe" /a >nul 2>&1
+        icacls "C:\Utilitario\AntigravityBridge.exe" /grant *S-1-5-32-544:F >nul 2>&1
         attrib -r "C:\Utilitario\AntigravityBridge.exe" >nul 2>&1
     )
     copy /y "%~dp0dist\AdminBridge.exe" "C:\Utilitario\AdminBridge.exe" >nul
@@ -61,6 +65,9 @@ if %ERRORLEVEL% EQU 0 (
 
     echo Aplicando blindagem de permissoes NTFS (harden) em C:\Utilitario...
     "C:\Utilitario\AdminBridge.exe" harden
+
+    echo Registrando e iniciando servico em segundo plano sob conta SYSTEM...
+    "C:\Utilitario\AdminBridge.exe" setup-service
 
     echo.
     if "%1"=="--with-llm" (

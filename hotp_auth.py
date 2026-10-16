@@ -621,22 +621,36 @@ class HOTPAuth:
                 timeout=12.0
             )
             if rpc_res is not None and "result" in rpc_res:
-                return rpc_res["result"]
+                res_dict = rpc_res["result"]
+                if isinstance(res_dict, dict):
+                    ok = bool(res_dict.get("success", False))
+                    msg = str(res_dict.get("summary") or res_dict.get("message") or res_dict.get("error", ""))
+                    return ok, msg
+                elif isinstance(res_dict, (tuple, list)) and len(res_dict) >= 2:
+                    return bool(res_dict[0]), str(res_dict[1])
+
+        try:
+            with AtomicLock():
+                cfg = self._load_config_raw()
+                if not cfg:
+                    return False, "Configuracao nao encontrada para validacao inicial."
+        except PermissionError:
+            rpc_res = self._delegate_rpc_to_daemon(
+                "sync",
+                {"otp": clean_otp, "allow_lookahead": False, "max_lookahead": 3, "max_lookback": 0},
+                timeout=12.0
+            )
+            if rpc_res is not None and "result" in rpc_res:
+                res_dict = rpc_res["result"]
+                if isinstance(res_dict, dict):
+                    ok = bool(res_dict.get("success", False))
+                    msg = str(res_dict.get("summary") or res_dict.get("message") or res_dict.get("error", ""))
+                    return ok, msg
+                elif isinstance(res_dict, (tuple, list)) and len(res_dict) >= 2:
+                    return bool(res_dict[0]), str(res_dict[1])
+            return False, "Acesso ao cofre negado pelo sistema operacional. Servico em segundo plano offline."
 
         with AtomicLock():
-            try:
-                cfg = self._load_config_raw()
-            except PermissionError:
-                rpc_res = self._delegate_rpc_to_daemon(
-                    "sync",
-                    {"otp": clean_otp, "allow_lookahead": False, "max_lookahead": 3, "max_lookback": 0},
-                    timeout=12.0
-                )
-                if rpc_res is not None and "result" in rpc_res:
-                    return rpc_res["result"]
-                raise
-            if not cfg:
-                return False, "Configuracao nao encontrada para validacao inicial."
 
             secret_dpapi_b64 = cfg.get("secret_dpapi")
             secret_enc = base64.b64decode(secret_dpapi_b64)
@@ -699,23 +713,42 @@ class HOTPAuth:
         anchor_file = self.config_dir / "owner_anchor.json"
         is_correct = False
         try:
-            if anchor_file.exists():
+            anchor_exists = False
+            try:
+                anchor_exists = anchor_file.exists()
+            except (PermissionError, OSError):
+                anchor_exists = False
+
+            if anchor_exists:
                 if verify_owner_password(pw, anchor_file, self.config_dir):
                     is_correct = True
-            elif self.config_file.exists():
-                with open(self.config_file, "r", encoding="utf-8") as f:
-                    cfg = json.load(f)
-                salt_b64 = cfg.get("recovery_salt")
-                hash_dpapi_b64 = cfg.get("recovery_hash_dpapi")
-                if salt_b64 and hash_dpapi_b64:
-                    expected_hash_ba = self._unprotect_secret(base64.b64decode(hash_dpapi_b64))
-                    expected_hash = bytes(expected_hash_ba).decode("ascii")
-                    wipe_buffer(expected_hash_ba)
-                    if verify_recovery_password(pw, expected_hash, salt_b64):
-                        is_correct = True
             else:
-                is_correct = True
+                config_exists = False
+                try:
+                    config_exists = self.config_file.exists()
+                except (PermissionError, OSError):
+                    config_exists = False
+
+                if config_exists:
+                    with open(self.config_file, "r", encoding="utf-8") as f:
+                        cfg = json.load(f)
+                    salt_b64 = cfg.get("recovery_salt")
+                    hash_dpapi_b64 = cfg.get("recovery_hash_dpapi")
+                    if salt_b64 and hash_dpapi_b64:
+                        expected_hash_ba = self._unprotect_secret(base64.b64decode(hash_dpapi_b64))
+                        expected_hash = bytes(expected_hash_ba).decode("ascii")
+                        wipe_buffer(expected_hash_ba)
+                        if verify_recovery_password(pw, expected_hash, salt_b64):
+                            is_correct = True
+                else:
+                    is_correct = True
         except PermissionError:
+            if sys.platform == "win32" and self.config_file == CONFIG_FILE:
+                try:
+                    subprocess.run(["schtasks", "/run", "/tn", "AdminBridge"], capture_output=True, check=False, creationflags=0x08000000)
+                    time.sleep(0.8)
+                except Exception:
+                    pass
             rpc_res = self._delegate_rpc_to_daemon("verify_password", {"password": pw}, timeout=8.0)
             if rpc_res is not None:
                 ok = bool(rpc_res.get("ok"))
@@ -1102,61 +1135,92 @@ class HOTPAuth:
                     return False, f"Palavra-passe de Recuperação incorreta! Limite de 5 tentativas atingido. Sistema bloqueado por {format_lockout_duration(fail_st['remaining_seconds'])}."
                 return False, f"Palavra-passe de Recuperação incorreta. Restam {fail_st['remaining_attempts']} tentativa(s) antes do bloqueio."
 
-        with AtomicLock():
-            verified = False
-            # 1. Verifica contra a âncora Ed25519 do proprietário
-            if anchor_file.exists():
-                if verify_owner_password(pw, anchor_file, self.config_dir):
-                    verified = True
-                else:
-                    self._log_audit("UNINSTALL_DENIED", 0, 0, False, "Tentativa de desinstalacao com Senha Mestra incorreta (ancora).", caller_info=caller_info)
-                    fail_st = record_password_failure(custom_lockout_file)
-                    if fail_st["is_locked"]:
-                        return False, f"Palavra-passe de Recuperação incorreta! Limite de 5 tentativas atingido. Sistema bloqueado por {format_lockout_duration(fail_st['remaining_seconds'])}."
-                    return False, f"Palavra-passe de Recuperacao incorreta. Restam {fail_st['remaining_attempts']} tentativa(s). Desinstalacao bloqueada."
-
-            # 2. Verifica contra o hash PBKDF2 protegido por DPAPI no hotp_config.json
-            if self.config_file.exists():
-                try:
-                    with open(self.config_file, "r", encoding="utf-8") as f:
-                        cfg = json.load(f)
-                    salt_b64 = cfg.get("recovery_salt")
-                    hash_dpapi_b64 = cfg.get("recovery_hash_dpapi")
-                    if salt_b64 and hash_dpapi_b64:
-                        enc_hash = base64.b64decode(hash_dpapi_b64)
-                        expected_hash_ba = self._unprotect_secret(enc_hash)
-                        expected_hash_b64 = expected_hash_ba.decode("ascii")
-                        wipe_buffer(expected_hash_ba)
-                        if not verify_recovery_password(pw, expected_hash_b64, salt_b64):
-                            self._log_audit("UNINSTALL_DENIED", cfg.get("counter", 0), cfg.get("counter", 0), False, "Tentativa de desinstalacao com Senha de Recuperacao incorreta.", caller_info=caller_info)
-                            fail_st = record_password_failure(custom_lockout_file)
-                            if fail_st["is_locked"]:
-                                return False, f"Palavra-passe de Recuperação incorreta! Limite de 5 tentativas atingido. Sistema bloqueado por {format_lockout_duration(fail_st['remaining_seconds'])}."
-                            return False, f"Palavra-passe de Recuperacao incorreta. Restam {fail_st['remaining_attempts']} tentativa(s). Desinstalacao bloqueada."
-                        verified = True
-                except PermissionError:
-                    # Se o arquivo estiver travado pelo daemon SYSTEM, tenta via RPC
+        # Se não estiver elevado e o daemon estiver offline, tenta acordar o daemon antes de tentar acesso direto
+        if sys.platform == "win32" and self.config_file == CONFIG_FILE and not self._is_daemon_alive_other_process():
+            try:
+                subprocess.run(["schtasks", "/run", "/tn", "AdminBridge"], capture_output=True, check=False, creationflags=0x08000000)
+                time.sleep(0.8)
+                if self._is_daemon_alive_other_process():
                     rpc_res = self._delegate_rpc_to_daemon("uninstall_unlock", {"password": pw}, timeout=10.0)
                     if rpc_res is not None:
                         ok = bool(rpc_res.get("ok"))
                         if ok:
                             reset_password_lockout(custom_lockout_file)
-                        else:
-                            record_password_failure(custom_lockout_file)
-                        return ok, str(rpc_res.get("message", ""))
-                    if not verified:
-                        return False, "Arquivo de configuracao bloqueado pelo servico SYSTEM. Tente novamente."
-                except Exception as e:
-                    if not verified:
-                        return False, f"Erro ao validar credenciais para desinstalacao: {e}"
+                            return True, str(rpc_res.get("message", ""))
+                        fail_st = record_password_failure(custom_lockout_file)
+                        if fail_st["is_locked"]:
+                            return False, f"Palavra-passe de Recuperação incorreta! Limite de 5 tentativas atingido. Sistema bloqueado por {format_lockout_duration(fail_st['remaining_seconds'])}."
+                        return False, f"Palavra-passe de Recuperação incorreta. Restam {fail_st['remaining_attempts']} tentativa(s) antes do bloqueio."
+            except Exception:
+                pass
 
-            if not verified:
-                fail_st = record_password_failure(custom_lockout_file)
-                if fail_st["is_locked"]:
-                    return False, f"Palavra-passe de Recuperação incorreta! Limite de 5 tentativas atingido. Sistema bloqueado por {format_lockout_duration(fail_st['remaining_seconds'])}."
-                return False, f"Nao foi possivel validar a Palavra-passe de Recuperacao. Restam {fail_st['remaining_attempts']} tentativa(s)."
+        try:
+            with AtomicLock():
+                verified = False
+                # 1. Verifica contra a âncora Ed25519 do proprietário
+                anchor_exists = False
+                try:
+                    anchor_exists = anchor_file.exists()
+                except (PermissionError, OSError):
+                    anchor_exists = False
 
-            reset_password_lockout(custom_lockout_file)
+                if anchor_exists:
+                    if verify_owner_password(pw, anchor_file, self.config_dir):
+                        verified = True
+                    else:
+                        self._log_audit("UNINSTALL_DENIED", 0, 0, False, "Tentativa de desinstalacao com Senha Mestra incorreta (ancora).", caller_info=caller_info)
+                        fail_st = record_password_failure(custom_lockout_file)
+                        if fail_st["is_locked"]:
+                            return False, f"Palavra-passe de Recuperação incorreta! Limite de 5 tentativas atingido. Sistema bloqueado por {format_lockout_duration(fail_st['remaining_seconds'])}."
+                        return False, f"Palavra-passe de Recuperacao incorreta. Restam {fail_st['remaining_attempts']} tentativa(s). Desinstalacao bloqueada."
+
+                # 2. Verifica contra o hash PBKDF2 protegido por DPAPI no hotp_config.json
+                config_exists = False
+                try:
+                    config_exists = self.config_file.exists()
+                except (PermissionError, OSError):
+                    config_exists = False
+
+                if not verified and config_exists:
+                    try:
+                        with open(self.config_file, "r", encoding="utf-8") as f:
+                            cfg = json.load(f)
+                        salt_b64 = cfg.get("recovery_salt")
+                        hash_dpapi_b64 = cfg.get("recovery_hash_dpapi")
+                        if salt_b64 and hash_dpapi_b64:
+                            enc_hash = base64.b64decode(hash_dpapi_b64)
+                            expected_hash_ba = self._unprotect_secret(enc_hash)
+                            expected_hash_b64 = expected_hash_ba.decode("ascii")
+                            wipe_buffer(expected_hash_ba)
+                            if not verify_recovery_password(pw, expected_hash_b64, salt_b64):
+                                self._log_audit("UNINSTALL_DENIED", cfg.get("counter", 0), cfg.get("counter", 0), False, "Tentativa de desinstalacao com Senha de Recuperacao incorreta.", caller_info=caller_info)
+                                fail_st = record_password_failure(custom_lockout_file)
+                                if fail_st["is_locked"]:
+                                    return False, f"Palavra-passe de Recuperação incorreta! Limite de 5 tentativas atingido. Sistema bloqueado por {format_lockout_duration(fail_st['remaining_seconds'])}."
+                                return False, f"Palavra-passe de Recuperacao incorreta. Restam {fail_st['remaining_attempts']} tentativa(s). Desinstalacao bloqueada."
+                            verified = True
+                    except PermissionError:
+                        rpc_res = self._delegate_rpc_to_daemon("uninstall_unlock", {"password": pw}, timeout=10.0)
+                        if rpc_res is not None:
+                            ok = bool(rpc_res.get("ok"))
+                            if ok:
+                                reset_password_lockout(custom_lockout_file)
+                            else:
+                                record_password_failure(custom_lockout_file)
+                            return ok, str(rpc_res.get("message", ""))
+                        if not verified:
+                            return False, "Arquivo de configuracao bloqueado pelo servico SYSTEM. Tente novamente."
+                    except Exception as e:
+                        if not verified:
+                            return False, f"Erro ao validar credenciais para desinstalacao: {e}"
+
+                if not verified:
+                    fail_st = record_password_failure(custom_lockout_file)
+                    if fail_st["is_locked"]:
+                        return False, f"Palavra-passe de Recuperação incorreta! Limite de 5 tentativas atingido. Sistema bloqueado por {format_lockout_duration(fail_st['remaining_seconds'])}."
+                    return False, f"Nao foi possivel validar a Palavra-passe de Recuperacao. Restam {fail_st['remaining_attempts']} tentativa(s)."
+
+                reset_password_lockout(custom_lockout_file)
 
             # SENHA VALIDADA: Destrava todos os handles de kernel, limpa cofre externo e restaura ACLs
             KernelFileGuard.release_all_locks()
@@ -1179,6 +1243,16 @@ class HOTPAuth:
                 caller_info=caller_info
             )
             return True, "Desinstalacao autorizada com sucesso. Travas de seguranca liberadas."
+        except PermissionError:
+            rpc_res = self._delegate_rpc_to_daemon("uninstall_unlock", {"password": pw}, timeout=10.0)
+            if rpc_res is not None:
+                ok = bool(rpc_res.get("ok"))
+                if ok:
+                    reset_password_lockout(custom_lockout_file)
+                else:
+                    record_password_failure(custom_lockout_file)
+                return ok, str(rpc_res.get("message", ""))
+            return False, "Acesso ao cofre negado pelo sistema operacional. O servico SYSTEM esta offline."
 
     def verify_and_advance(self, provided_otp: Optional[str], caller_info: Optional[dict] = None) -> Tuple[bool, str, int]:
         """Validação cega atômica do token HOTP com higiene estrita de memória e Fail-Safe."""
@@ -1521,142 +1595,182 @@ class HOTPAuth:
                 "error": f"O código OTP deve conter exatamente {DEFAULT_DIGITS} dígitos numéricos."
             }
 
-        with AtomicLock():
-            cfg = self._load_config_raw()
+        # 1. Se o daemon SYSTEM estiver ativo em outro processo, delega a operacao via RPC seguro
+        if self._is_daemon_alive_other_process():
+            rpc_res = self._delegate_rpc_to_daemon(
+                "sync",
+                {
+                    "otp": clean_otp,
+                    "allow_lookahead": allow_lookahead,
+                    "max_lookahead": max_lookahead,
+                    "max_lookback": max_lookback
+                },
+                timeout=12.0
+            )
+            if rpc_res is not None and "result" in rpc_res and isinstance(rpc_res["result"], dict):
+                return rpc_res["result"]
 
-            if not cfg or cfg.get("provisioned_flag") != 1:
-                return {
-                    "success": False,
-                    "error": "O utilitário ainda não está provisionado."
-                }
+        try:
+            with AtomicLock():
+                cfg = self._load_config_raw()
 
-            if cfg.get("lockdown", False):
-                return {
-                    "success": False,
-                    "error": "FAIL_SAFE_LOCKDOWN: O utilitário está em lockdown de segurança."
-                }
+                if not cfg or cfg.get("provisioned_flag") != 1:
+                    return {
+                        "success": False,
+                        "error": "O utilitario ainda nao esta provisionado."
+                    }
 
-            current_counter = cfg.get("counter", 0)
-            lower_bound = 0 if max_lookback is None else max(0, current_counter - int(max_lookback))
+                if cfg.get("lockdown", False):
+                    return {
+                        "success": False,
+                        "error": "FAIL_SAFE_LOCKDOWN: O utilitario esta em lockdown de seguranca."
+                    }
 
-            secret_dpapi_b64 = cfg.get("secret_dpapi")
-            secret_enc = base64.b64decode(secret_dpapi_b64)
-            secret_ba = self._unprotect_secret(secret_enc)
+                current_counter = cfg.get("counter", 0)
+                lower_bound = 0 if max_lookback is None else max(0, current_counter - int(max_lookback))
 
-            try:
-                # 1. Fase 1: Busca sequencial de trás para frente dentro do limite seguro
-                for c in range(current_counter, lower_bound - 1, -1):
-                    code = self._compute_hotp_internal(secret_ba, c, DEFAULT_DIGITS)
-                    if hmac.compare_digest(clean_otp, code):
-                        if c == current_counter:
-                            new_c = current_counter + 1
+                secret_dpapi_b64 = cfg.get("secret_dpapi")
+                secret_enc = base64.b64decode(secret_dpapi_b64)
+                secret_ba = self._unprotect_secret(secret_enc)
+
+                try:
+                    # 1. Fase 1: Busca sequencial de tras para frente dentro do limite seguro
+                    for c in range(current_counter, lower_bound - 1, -1):
+                        code = self._compute_hotp_internal(secret_ba, c, DEFAULT_DIGITS)
+                        if hmac.compare_digest(clean_otp, code):
+                            if c == current_counter:
+                                new_c = current_counter + 1
+                                cfg["counter"] = new_c
+                                self._save_config_raw(cfg)
+                                self._log_audit(
+                                    "SYNC_MATCH_CURRENT",
+                                    current_counter,
+                                    new_c,
+                                    True,
+                                    f"Sincronizacao confirmada no indice atual #{c}. Contador avancou para {new_c}.",
+                                    clean_otp
+                                )
+                                return {
+                                    "success": True,
+                                    "matched_counter": c,
+                                    "current_counter": current_counter,
+                                    "next_counter": new_c,
+                                    "diff": 0,
+                                    "status": "synchronized",
+                                    "status_label": "100% Sincronizado",
+                                    "summary": "Seu celular esta perfeitamente sincronizado com o computador.",
+                                    "action_instruction": f"O proximo codigo gerado no seu celular OTP #{new_c} sera o aceito para o proximo comando.",
+                                    "message": f"Seu autenticador esta no OTP #{c} e esta sincronizado com o computador. O proximo OTP necessario agora e o #{new_c}."
+                                }
+                            else:
+                                diff = c - current_counter
+                                return {
+                                    "success": True,
+                                    "matched_counter": c,
+                                    "current_counter": current_counter,
+                                    "next_counter": current_counter,
+                                    "diff": diff,
+                                    "status": "behind",
+                                    "status_label": "Codigo Antigo - Atrasado",
+                                    "summary": "Este codigo ja expirou e nao sera aceito.",
+                                    "action_instruction": f"O celular gerou o codigo antigo #{c}, mas o computador ja espera o OTP #{current_counter}. Gere novos codigos no aplicativo ate alcancar o computador.",
+                                    "message": f"Seu autenticador esta no OTP #{c}, abaixo do contador do computador que esta no #{current_counter}. O proximo OTP necessario no computador continua sendo o #{current_counter}."
+                                }
+
+                    if not allow_lookahead:
+                        return {
+                            "success": False,
+                            "matched_counter": None,
+                            "current_counter": current_counter,
+                            "next_counter": current_counter,
+                            "diff": None,
+                            "status": "prompt_lookahead",
+                            "status_label": "Busca a Frente Necessaria",
+                            "summary": "Codigo nao localizado no contador atual nem nos anteriores.",
+                            "action_instruction": "Deseja pesquisar as proximas 10 posicoes futuras? Se nao encontrar, o contador saltara 10 posicoes para alinhar.",
+                            "message": "Codigo nao coincide com a posicao atual. Confirmacao necessaria para buscar a frente."
+                        }
+
+                    # 2. Fase 2: Busca sequencial para frente sob autorizacao expressa - ate 10 posicoes
+                    step_limit = min(int(max_lookahead), 10)
+                    max_c = current_counter + step_limit
+                    for c in range(current_counter + 1, max_c + 1):
+                        code = self._compute_hotp_internal(secret_ba, c, DEFAULT_DIGITS)
+                        if hmac.compare_digest(clean_otp, code):
+                            new_c = c + 1
                             cfg["counter"] = new_c
                             self._save_config_raw(cfg)
                             self._log_audit(
-                                "SYNC_MATCH_CURRENT",
+                                "SYNC_JUMP_AHEAD",
                                 current_counter,
                                 new_c,
                                 True,
-                                f"Sincronizacao confirmada no indice atual #{c}. Contador avancou para {new_c}.",
+                                f"Sincronizacao identificada a frente no OTP #{c}. Contador saltou para {new_c}.",
                                 clean_otp
                             )
-                            return {
-                                "success": True,
-                                "matched_counter": c,
-                                "current_counter": current_counter,
-                                "next_counter": new_c,
-                                "diff": 0,
-                                "status": "synchronized",
-                                "status_label": "100% Sincronizado",
-                                "summary": "Seu celular esta perfeitamente sincronizado com o computador.",
-                                "action_instruction": f"O proximo codigo gerado no seu celular OTP #{new_c} sera o aceito para o proximo comando.",
-                                "message": f"Seu autenticador esta no OTP #{c} e esta sincronizado com o computador. O proximo OTP necessario agora e o #{new_c}."
-                            }
-                        else:
                             diff = c - current_counter
                             return {
                                 "success": True,
                                 "matched_counter": c,
                                 "current_counter": current_counter,
-                                "next_counter": current_counter,
+                                "next_counter": new_c,
                                 "diff": diff,
-                                "status": "behind",
-                                "status_label": "Codigo Antigo - Atrasado",
-                                "summary": "Este codigo ja expirou e nao sera aceito.",
-                                "action_instruction": f"O celular gerou o codigo antigo #{c}, mas o computador ja espera o OTP #{current_counter}. Gere novos codigos no aplicativo ate alcancar o computador.",
-                                "message": f"Seu autenticador esta no OTP #{c}, abaixo do contador do computador que esta no #{current_counter}. O proximo OTP necessario no computador continua sendo o #{current_counter}."
+                                "status": "ahead",
+                                "status_label": "Compativel - A Frente",
+                                "summary": "Seu aplicativo avancou e o computador sincronizou com o salto!",
+                                "action_instruction": f"Seu celular esta no OTP #{c}. O computador avancou o contador e agora aguarda o OTP #{new_c}.",
+                                "message": f"Seu autenticador esta no OTP #{c}. O contador do computador pulou para #{new_c} e este sera o proximo aceito."
                             }
 
-                if not allow_lookahead:
+                    # 3. Esgotamento das 10 posicoes acima sem correspondencia: salta 10 posicoes e contabiliza falha
+                    exhausted_c = current_counter + 10
+                    cfg["counter"] = exhausted_c
+                    self._record_failure_and_check_lockdown(
+                        cfg,
+                        current_counter,
+                        exhausted_c,
+                        clean_otp,
+                        None,
+                        "10 posicoes acima testadas sem correspondencia em diagnose_otp_sync"
+                    )
                     return {
                         "success": False,
                         "matched_counter": None,
                         "current_counter": current_counter,
-                        "next_counter": current_counter,
+                        "next_counter": exhausted_c,
                         "diff": None,
-                        "status": "prompt_lookahead",
-                        "status_label": "Busca a Frente Necessaria",
-                        "summary": "Codigo nao localizado no contador atual nem nos anteriores.",
-                        "action_instruction": "Deseja pesquisar as proximas 10 posicoes futuras? Se nao encontrar, o contador saltara 10 posicoes para alinhar.",
-                        "message": "Codigo nao coincide com a posicao atual. Confirmacao necessaria para buscar a frente."
+                        "status": "not_found",
+                        "status_label": "Nao Reconhecido",
+                        "summary": "O codigo digitado nao correspondeu as 10 posicoes testadas.",
+                        "action_instruction": f"Foram testadas 10 posicoes acima do computador #{current_counter} e o contador saltou para o OTP #{exhausted_c}.",
+                        "message": f"Codigo OTP nao encontrado apos testar 10 posicoes acima. O contador do sistema saltou para #{exhausted_c}."
                     }
 
-                # 2. Fase 2: Busca sequencial para frente sob autorização expressa - até 10 posições
-                step_limit = min(int(max_lookahead), 10)
-                max_c = current_counter + step_limit
-                for c in range(current_counter + 1, max_c + 1):
-                    code = self._compute_hotp_internal(secret_ba, c, DEFAULT_DIGITS)
-                    if hmac.compare_digest(clean_otp, code):
-                        new_c = c + 1
-                        cfg["counter"] = new_c
-                        self._save_config_raw(cfg)
-                        self._log_audit(
-                            "SYNC_JUMP_AHEAD",
-                            current_counter,
-                            new_c,
-                            True,
-                            f"Sincronizacao identificada a frente no OTP #{c}. Contador saltou para {new_c}.",
-                            clean_otp
+                finally:
+                    wipe_buffer(secret_ba)
+                    del secret_ba
+                    gc.collect()
+        except PermissionError:
+            if sys.platform == "win32" and self.config_file == CONFIG_FILE:
+                try:
+                    subprocess.run(["schtasks", "/run", "/tn", "AdminBridge"], capture_output=True, check=False, creationflags=0x08000000)
+                    time.sleep(0.8)
+                    if self._is_daemon_alive_other_process():
+                        rpc_res = self._delegate_rpc_to_daemon(
+                            "sync",
+                            {
+                                "otp": clean_otp,
+                                "allow_lookahead": allow_lookahead,
+                                "max_lookahead": max_lookahead,
+                                "max_lookback": max_lookback
+                            },
+                            timeout=10.0
                         )
-                        diff = c - current_counter
-                        return {
-                            "success": True,
-                            "matched_counter": c,
-                            "current_counter": current_counter,
-                            "next_counter": new_c,
-                            "diff": diff,
-                            "status": "ahead",
-                            "status_label": "Compativel - A Frente",
-                            "summary": "Seu aplicativo avancou e o computador sincronizou com o salto!",
-                            "action_instruction": f"Seu celular esta no OTP #{c}. O computador avancou o contador e agora aguarda o OTP #{new_c}.",
-                            "message": f"Seu autenticador esta no OTP #{c}. O contador do computador pulou para #{new_c} e este sera o proximo aceito."
-                        }
-
-                # 3. Esgotamento das 10 posições acima sem correspondência: salta 10 posições e contabiliza falha
-                exhausted_c = current_counter + 10
-                cfg["counter"] = exhausted_c
-                self._record_failure_and_check_lockdown(
-                    cfg,
-                    current_counter,
-                    exhausted_c,
-                    clean_otp,
-                    None,
-                    "10 posicoes acima testadas sem correspondencia em diagnose_otp_sync"
-                )
-                return {
-                    "success": False,
-                    "matched_counter": None,
-                    "current_counter": current_counter,
-                    "next_counter": exhausted_c,
-                    "diff": None,
-                    "status": "not_found",
-                    "status_label": "Nao Reconhecido",
-                    "summary": "O codigo digitado nao correspondeu as 10 posicoes testadas.",
-                    "action_instruction": f"Foram testadas 10 posicoes acima do computador #{current_counter} e o contador saltou para o OTP #{exhausted_c}.",
-                    "message": f"Codigo OTP nao encontrado apos testar 10 posicoes acima. O contador do sistema saltou para #{exhausted_c}."
-                }
-
-            finally:
-                wipe_buffer(secret_ba)
-                del secret_ba
-                gc.collect()
+                        if rpc_res is not None and "result" in rpc_res and isinstance(rpc_res["result"], dict):
+                            return rpc_res["result"]
+                except Exception:
+                    pass
+            return {
+                "success": False,
+                "error": "Acesso negado ao cofre seguro e o servico SYSTEM esta offline. Execute como Administrador ou ative o servico."
+            }

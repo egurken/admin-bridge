@@ -1452,9 +1452,10 @@ class SyncTestDialog(QDialog):
         self.btn_verify.setText("Verificando...")
         QApplication.processEvents()
 
+        res = None
         try:
             res = self.hotp_auth.diagnose_otp_sync(otp, allow_lookahead=False)
-            if not res.get("success") and res.get("status") == "prompt_lookahead":
+            if res and not res.get("success") and res.get("status") == "prompt_lookahead":
                 ask = QMessageBox.question(
                     self,
                     "Pesquisar Posições Futuras?",
@@ -1477,9 +1478,22 @@ class SyncTestDialog(QDialog):
                     self.lbl_det_next.setText(f"OTP #{res.get('current_counter')}")
                     self.frame_details.show()
                     return
+        except Exception as e:
+            self.badge_status.setText("FALHA DE COMUNICAÇÃO")
+            self.badge_status.setStyleSheet("background-color: #f38ba8; color: #11111b; padding: 4px 10px; border-radius: 4px; font-weight: bold; font-size: 11px;")
+            self.lbl_verdict.setText("❌ Erro ao validar o código OTP.")
+            self.lbl_instruction.setText(f"Detalhes: {e}. Verifique se o serviço em segundo plano está ativo.")
+            self.lbl_det_code.setText(otp)
+            self.lbl_det_phone.setText("Erro")
+            self.lbl_det_next.setText("-")
+            self.frame_details.show()
+            return
         finally:
             self.btn_verify.setEnabled(True)
             self.btn_verify.setText("Verificar")
+
+        if not res:
+            return
 
         if res.get("success"):
             st = res.get("status")
@@ -2820,6 +2834,14 @@ class AdminBridgeWindow(QMainWindow):
     def quit_app(self, force_no_prompt: bool = False):
         """Exige a Palavra-passe de Recuperação antes de permitir encerrar a Central de Gestão."""
         if not force_no_prompt and self.hotp_auth.is_provisioned():
+            # Se o serviço estiver offline e o processo não for admin, tenta acordar o serviço via schtasks
+            if not is_admin() and not self.hotp_auth._is_daemon_alive_other_process():
+                try:
+                    subprocess.run(["schtasks", "/run", "/tn", "AdminBridge"], capture_output=True, check=False, creationflags=0x08000000)
+                    time.sleep(0.5)
+                except Exception:
+                    pass
+
             pwd, ok = ResponsivePasswordDialog.get_verified_password(
                 title="Autenticação Obrigatória • Encerrar Utilitário",
                 prompt="Digite sua Palavra-passe de Recuperação para encerrar o Admin Bridge:",
@@ -2828,6 +2850,18 @@ class AdminBridgeWindow(QMainWindow):
                 confirm_text="Encerrar"
             )
             if not ok or not pwd:
+                # Se falhou porque o serviço está offline e sem permissões, oferece encerramento com confirmação
+                if not is_admin() and not self.hotp_auth._is_daemon_alive_other_process():
+                    force_ans = QMessageBox.question(
+                        self,
+                        "Serviço Offline",
+                        "O serviço em segundo plano está offline e não foi possível validar a senha localmente.\n\nDeseja forçar o encerramento da interface gráfica agora?",
+                        QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                        QMessageBox.StandardButton.No
+                    )
+                    if force_ans == QMessageBox.StandardButton.Yes:
+                        self.tray_icon.hide()
+                        QApplication.quit()
                 return
         self.tray_icon.hide()
         QApplication.quit()
@@ -3383,6 +3417,24 @@ class AdminBridgeWindow(QMainWindow):
             return
 
         pwd = ""
+        # Se nao estiver elevado e o daemon estiver offline, solicita elevacao logo no inicio da desinstalacao
+        if not is_admin() and not self.hotp_auth._is_daemon_alive_other_process():
+            elev_ans = QMessageBox.question(
+                self,
+                "Elevacao Necessaria",
+                "O servico em segundo plano esta offline. Para desinstalar o utilitario com seguranca, e necessario executar o assistente com privilegios de Administrador.\n\nDeseja autorizar a elevacao agora?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.Yes
+            )
+            if elev_ans == QMessageBox.StandardButton.Yes:
+                try:
+                    request_elevation_with_args(["uninstall"])
+                    return
+                except Exception as e:
+                    QMessageBox.critical(self, "Erro de Elevacao", f"Nao foi possivel solicitar elevacao: {e}")
+                    return
+            return
+
         if self.hotp_auth.is_provisioned():
             pwd, ok_pw = ResponsivePasswordDialog.get_verified_password(
                 title="Autenticação Obrigatória • Desinstalação",
@@ -3977,6 +4029,23 @@ def run_cli_client(args, hotp_auth: HOTPAuth):
             print("[AVISO] Blindagem aplicada, mas a verificação de isolamento acusou pendências.", file=sys.stderr)
             sys.exit(1)
 
+    elif args.subcommand == "setup-service":
+        if not is_admin():
+            try:
+                request_elevation_with_args(["setup-service"])
+                return
+            except Exception as e:
+                print(f"[ERRO] Permissão de Administrador necessária: {e}", file=sys.stderr)
+                sys.exit(1)
+        print("[*] Registrando tarefas agendadas sob conta SYSTEM no Windows...")
+        ok = register_scheduled_task()
+        if ok:
+            print("[SUCESSO] Tarefa AdminBridge registrada e iniciada sob conta SYSTEM!")
+            sys.exit(0)
+        else:
+            print("[ERRO] Falha ao registrar tarefas no Agendador de Tarefas.", file=sys.stderr)
+            sys.exit(1)
+
     elif args.subcommand == "setup":
         run_cli_setup(args, hotp_auth)
         sys.exit(0)
@@ -4282,6 +4351,9 @@ def main():
     p_uninst.add_argument("--force", action="store_true", help="Pula pergunta de confirmação S/N")
     p_uninst.add_argument("--password", help="Palavra-passe de recuperação do proprietário")
 
+    # Comando setup-service
+    subparsers.add_parser("setup-service", help="Registra e inicia o serviço AdminBridge no Agendador de Tarefas do Windows sob conta SYSTEM")
+
     # Comando preauth (consome OTP imediatamente e gera ticket de pré-autorização)
     p_preauth = subparsers.add_parser("preauth", help="Consome o OTP imediatamente no início da interação e gera ticket válido por até 45 minutos")
     p_preauth.add_argument("--otp", required=True, help="Código OTP de 6 dígitos do autenticador")
@@ -4302,7 +4374,7 @@ def main():
 
     # Se um subcomando CLI foi invocado
     if args.subcommand:
-        if args.subcommand in ("setup", "reset", "uninstall", "harden") and not is_admin():
+        if args.subcommand in ("setup", "reset", "uninstall", "harden", "setup-service") and not is_admin():
             try:
                 request_elevation_with_args(sys.argv[1:])
                 return
@@ -4362,6 +4434,16 @@ def main():
         if wizard.exec() != QDialog.DialogCode.Accepted:
             _debug_log("Wizard cancelled, exiting with 0.")
             sys.exit(0)
+
+    # Se provisionado e o daemon não estiver ativo em outro processo, acorda ou registra
+    if is_prov and not hotp_auth._is_daemon_alive_other_process():
+        try:
+            if is_admin():
+                register_scheduled_task()
+            else:
+                subprocess.run(["schtasks", "/run", "/tn", "AdminBridge"], capture_output=True, check=False, creationflags=0x08000000)
+        except Exception:
+            pass
 
     _debug_log("Creating AdminBridgeWindow...")
     window = AdminBridgeWindow(hotp_auth)
