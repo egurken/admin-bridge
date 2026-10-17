@@ -1817,27 +1817,94 @@ APP_VERSION = "2.1.0"
 GITHUB_REPO_URL = "https://github.com/egurken/admin-bridge"
 
 
+def ensure_trocar_bat() -> Path:
+    """Garante que o script de troca elevada esteja sempre disponivel no diretorio TEMP sem problemas de codepage."""
+    bat_path = Path(os.environ.get("TEMP", "C:/Temp")) / "trocar.bat"
+    bat_content = (
+        "@echo off\r\n"
+        "chcp 65001 >nul\r\n"
+        "title Atualizacao do Admin Bridge para C:\\Utilitario\r\n\r\n"
+        "net session >nul 2>&1\r\n"
+        "if \"%errorlevel%\"==\"0\" goto :is_admin\r\n\r\n"
+        "echo [*] Solicitando elevacao de Administrador...\r\n"
+        "powershell -NoProfile -ExecutionPolicy Bypass -Command \"Start-Process cmd -ArgumentList '/k \\\"\\\"%~f0\\\"\\\"' -Verb RunAs\"\r\n"
+        "exit /b 0\r\n\r\n"
+        ":is_admin\r\n"
+        "echo ========================================================\r\n"
+        "echo        ATUALIZACAO DIRETA DO ADMIN BRIDGE\r\n"
+        "echo ========================================================\r\n"
+        "echo.\r\n\r\n"
+        "set \"DIST_EXE=%TEMP%\\AdminBridge_novo.exe\"\r\n"
+        "set \"DEST_EXE=C:\\Utilitario\\AdminBridge.exe\"\r\n\r\n"
+        "if not exist \"%DIST_EXE%\" goto :err_no_dist\r\n\r\n"
+        "echo [*] 1. Interrompendo tarefas agendadas e daemon...\r\n"
+        "schtasks /end /tn AdminBridge >nul 2>&1\r\n"
+        "schtasks /end /tn AdminBridgeWatchdog >nul 2>&1\r\n"
+        "taskkill /f /im AdminBridge.exe >nul 2>&1\r\n"
+        "timeout /t 2 /nobreak >nul\r\n\r\n"
+        "echo [*] 2. Removendo atributos de protecao...\r\n"
+        "attrib -r \"%DEST_EXE%\" 2>nul\r\n\r\n"
+        "echo [*] 3. Substituindo binario em C:\\Utilitario...\r\n"
+        "copy /y \"%DIST_EXE%\" \"%DEST_EXE%\"\r\n"
+        "if errorlevel 1 goto :err_copy\r\n\r\n"
+        "echo [*] 4. Atualizando Area de Trabalho...\r\n"
+        "if exist \"%USERPROFILE%\\OneDrive\\Desktop\" copy /y \"%DIST_EXE%\" \"%USERPROFILE%\\OneDrive\\Desktop\\AdminBridge.exe\" >nul 2>&1\r\n"
+        "if exist \"%USERPROFILE%\\Desktop\" copy /y \"%DIST_EXE%\" \"%USERPROFILE%\\Desktop\\AdminBridge.exe\" >nul 2>&1\r\n\r\n"
+        "echo [*] 5. Aplicando assinatura digital Authenticode...\r\n"
+        "powershell -NoProfile -ExecutionPolicy Bypass -Command \"$c = Get-ChildItem Cert:\\CurrentUser\\My -CodeSigningCert | Select-Object -First 1; $c | ForEach-Object { Set-AuthenticodeSignature -FilePath 'C:\\Utilitario\\AdminBridge.exe' -Certificate $_ -HashAlgorithm SHA256 }\"\r\n\r\n"
+        "echo [*] 6. Reiniciando servico de segundo plano...\r\n"
+        "schtasks /run /tn AdminBridge >nul 2>&1\r\n\r\n"
+        "echo.\r\n"
+        "echo ========================================================\r\n"
+        "echo [+] ADMIN BRIDGE ATUALIZADO COM SUCESSO EM C:\\UTILITARIO!\r\n"
+        "echo ========================================================\r\n"
+        "echo.\r\n"
+        "pause\r\n"
+        "exit /b 0\r\n\r\n"
+        ":err_no_dist\r\n"
+        "echo [ERRO] O binario %DIST_EXE% nao foi encontrado!\r\n"
+        "echo.\r\n"
+        "pause\r\n"
+        "exit /b 1\r\n\r\n"
+        ":err_copy\r\n"
+        "echo [ERRO] Falha ao copiar para C:\\Utilitario. Verifique se o processo fechou.\r\n"
+        "echo.\r\n"
+        "pause\r\n"
+        "exit /b 1\r\n"
+    )
+    try:
+        bat_path.write_text(bat_content, encoding="utf-8")
+    except Exception:
+        pass
+    return bat_path
+
+
 class UpdateCheckWorker(QThread):
     finished_signal = pyqtSignal(bool, str, dict)
 
     def run(self):
-        """Consulta as atualizações do aplicativo via Git local ou GitHub REST API."""
+        """Consulta as atualizações do aplicativo via Git local, manifesto version.json ou GitHub REST API."""
         result_data = {
             "current_version": APP_VERSION,
+            "remote_version": APP_VERSION,
             "remote_commit": "",
             "remote_date": "",
             "commit_msg": "",
             "has_update": False,
             "is_git_repo": False,
+            "download_url": "",
             "git_status": ""
         }
-        git_dir = BASE_DIR / ".git"
-        if not git_dir.exists():
-            curr_git = Path(__file__).resolve().parent / ".git"
-            if curr_git.exists():
-                git_dir = curr_git
+        git_dir = None
+        for candidate in (Path(__file__).resolve().parent / ".git", BASE_DIR / ".git"):
+            try:
+                if candidate.exists():
+                    git_dir = candidate
+                    break
+            except Exception:
+                pass
 
-        if git_dir.exists():
+        if git_dir and git_dir.exists():
             result_data["is_git_repo"] = True
             try:
                 subprocess.run(
@@ -1864,7 +1931,7 @@ class UpdateCheckWorker(QThread):
                     lines = unpulled.splitlines()
                     result_data["remote_commit"] = lines[0].split()[0]
                     result_data["commit_msg"] = "\n".join(lines[:5])
-                    self.finished_signal.emit(True, f"Há {len(lines)} nova(s) atualização(ões) no repositório GitHub!", result_data)
+                    self.finished_signal.emit(True, f"Há {len(lines)} nova[s] atualização[ões] no repositório GitHub!", result_data)
                     return
                 else:
                     self.finished_signal.emit(True, "Seu utilitário já está atualizado na versão mais recente do Git!", result_data)
@@ -1872,7 +1939,33 @@ class UpdateCheckWorker(QThread):
             except Exception as e:
                 result_data["git_status"] = f"Aviso Git: {e}"
 
-        # Fallback: GitHub REST API pública
+        # 2. Consulta remota via manifesto version.json no GitHub
+        manifest_url = "https://raw.githubusercontent.com/egurken/admin-bridge/main/version.json"
+        try:
+            import urllib.request
+            req = urllib.request.Request(manifest_url, headers={"User-Agent": "AdminBridge-Updater-Client"})
+            with urllib.request.urlopen(req, timeout=6.0) as resp:
+                vdata = json.loads(resp.read().decode("utf-8"))
+                remote_ver = vdata.get("version", "").strip()
+                result_data["remote_version"] = remote_ver
+                result_data["remote_commit"] = vdata.get("commit", "")[:7]
+                result_data["commit_msg"] = f"{vdata.get('title', '')}\n{vdata.get('notes', '')}"
+                result_data["remote_date"] = vdata.get("release_date", "")
+                result_data["download_url"] = vdata.get("download_url", "")
+
+                curr_clean = APP_VERSION.lstrip("v").strip()
+                rem_clean = remote_ver.lstrip("v").strip()
+                if rem_clean and rem_clean != curr_clean:
+                    result_data["has_update"] = True
+                    self.finished_signal.emit(True, f"Nova versão v{remote_ver} disponível no GitHub!", result_data)
+                    return
+                else:
+                    self.finished_signal.emit(True, f"O Admin Bridge {APP_VERSION} está alinhado com a versão oficial remota.", result_data)
+                    return
+        except Exception:
+            pass
+
+        # 3. Fallback: GitHub Commits API
         try:
             import urllib.request
             req = urllib.request.Request(
@@ -1970,7 +2063,7 @@ class UpdateDialog(QDialog):
         lbl_title.setStyleSheet("font-size: 15px; color: #89b4fa;")
         layout.addWidget(lbl_title)
 
-        self.lbl_info = QLabel(f"Versão Instalada: <b>v{APP_VERSION}</b>\nVerificando atualizações no repositório GitHub...")
+        self.lbl_info = QLabel(f"Versão Instalada: <b>{APP_VERSION}</b>\nVerificando atualizações no repositório GitHub...")
         self.lbl_info.setStyleSheet("font-size: 12px; color: #cdd6f4;")
         layout.addWidget(self.lbl_info)
 
@@ -2013,7 +2106,7 @@ class UpdateDialog(QDialog):
             return
 
         if data.get("has_update"):
-            self.lbl_info.setText(f"🚀 <b>Nova atualização disponível!</b>\nCommit: {data.get('remote_commit', '')}")
+            self.lbl_info.setText(f"🚀 <b>Nova atualização disponível!</b>\nVersão remota: v{data.get('remote_version', '')} • Commit: {data.get('remote_commit', '')}")
             self.lbl_info.setStyleSheet("color: #a6e3a1; font-size: 13px;")
             self.txt_notes.setPlainText(data.get("commit_msg", ""))
             self.txt_notes.show()
@@ -2031,25 +2124,48 @@ class UpdateDialog(QDialog):
         self.lbl_info.setText("🔄 Baixando e aplicando atualização do repositório...")
         self.progress_bar.show()
 
-        def _pull_worker():
+        def _update_worker():
             try:
-                git_dir = BASE_DIR / ".git"
-                if not git_dir.exists():
-                    curr_git = Path(__file__).resolve().parent / ".git"
-                    if curr_git.exists():
-                        git_dir = curr_git
-                if git_dir.exists():
-                    p = subprocess.run(
-                        ["git", "pull", "origin", "main"],
-                        cwd=str(git_dir.parent),
-                        capture_output=True,
-                        text=True,
-                        check=False,
-                        timeout=30,
-                        creationflags=0x08000000 if sys.platform == "win32" else 0
-                    )
-                    return True, p.stdout or "Atualizado com sucesso."
-                return False, "Repositório local não configurado para git pull."
+                # Caso 1: Ambiente de desenvolvimento com Git
+                if self.last_data.get("is_git_repo"):
+                    git_dir = Path(__file__).resolve().parent / ".git"
+                    if not git_dir.exists():
+                        git_dir = BASE_DIR / ".git"
+                    if git_dir.exists():
+                        p = subprocess.run(
+                            ["git", "pull", "origin", "main"],
+                            cwd=str(git_dir.parent),
+                            capture_output=True,
+                            text=True,
+                            check=False,
+                            timeout=30,
+                            creationflags=0x08000000 if sys.platform == "win32" else 0
+                        )
+                        dist_exe = git_dir.parent / "dist" / "AdminBridge.exe"
+                        if dist_exe.exists():
+                            temp_target = Path(os.environ.get("TEMP", "C:/Temp")) / "AdminBridge_novo.exe"
+                            import shutil
+                            shutil.copy2(dist_exe, temp_target)
+                            ensure_trocar_bat()
+                            return True, "Código atualizado do Git e novo binário preparado no diretório temporário para substituição."
+                        return True, p.stdout or "Código atualizado com sucesso do repositório."
+
+                # Caso 2: Binário standalone - download direto da release
+                dl_url = self.last_data.get("download_url") or "https://raw.githubusercontent.com/egurken/admin-bridge/main/dist/AdminBridge.exe"
+                import urllib.request
+                temp_exe = Path(os.environ.get("TEMP", "C:/Temp")) / "AdminBridge_novo.exe"
+                req = urllib.request.Request(dl_url, headers={"User-Agent": "AdminBridge-Updater-Client"})
+                with urllib.request.urlopen(req, timeout=60.0) as resp, open(temp_exe, "wb") as out_f:
+                    while True:
+                        chunk = resp.read(65536)
+                        if not chunk:
+                            break
+                        out_f.write(chunk)
+
+                if temp_exe.exists() and temp_exe.stat().st_size > 10000000:
+                    ensure_trocar_bat()
+                    return True, "Novo executável baixado com sucesso e preparado para substituição imediata."
+                return False, "O arquivo baixado parece incompleto ou corrompido."
             except Exception as e:
                 return False, str(e)
 
@@ -2058,18 +2174,31 @@ class UpdateDialog(QDialog):
             self.progress_bar.hide()
             self.btn_close.setEnabled(True)
             if ok:
-                self.lbl_info.setText("✅ <b>Atualização aplicada com sucesso!</b>\nReinicie a Central de Gestão para carregar os novos arquivos.")
+                bat_helper = ensure_trocar_bat()
+                self.lbl_info.setText("✅ <b>Atualização baixada com sucesso!</b>\nClique em 'Substituir Executável' para aplicar com elevação.")
                 self.lbl_info.setStyleSheet("color: #a6e3a1; font-size: 13px;")
-                self.txt_notes.setPlainText(msg)
-                self.btn_update.setText("Reiniciar Agora")
+                self.txt_notes.setPlainText(f"{msg}\n\nO instalador elevado atualizará C:\\Utilitario\\AdminBridge.exe e reiniciará o serviço.")
+                self.btn_update.setText("Substituir Executável")
                 self.btn_update.setEnabled(True)
                 self.btn_update.clicked.disconnect()
-                self.btn_update.clicked.connect(self.restart_app)
+                self.btn_update.clicked.connect(lambda: self.launch_swap_helper(bat_helper))
             else:
                 self.lbl_info.setText(f"❌ Falha ao aplicar atualização: {msg}")
                 self.lbl_info.setStyleSheet("color: #f38ba8; font-size: 12px;")
 
-        threading.Thread(target=lambda: _on_done(_pull_worker()), daemon=True).start()
+        threading.Thread(target=lambda: _on_done(_update_worker()), daemon=True).start()
+
+    def launch_swap_helper(self, bat_helper: Path):
+        """Lança o script de troca no TEMP solicitando elevação UAC com janela persistente."""
+        try:
+            cmd_line = f"Start-Process cmd -ArgumentList '/k \"\"{bat_helper}\"\"' -Verb RunAs"
+            subprocess.Popen(
+                ["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", cmd_line],
+                creationflags=0x08000000 if sys.platform == "win32" else 0
+            )
+        except Exception:
+            pass
+        QApplication.quit()
 
     def restart_app(self):
         try:
