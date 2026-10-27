@@ -4,6 +4,7 @@ title Atualizador do Admin Bridge
 
 rem 1. Copia binario e helper para TEMP para evitar problemas de codepage com acentos
 if exist "%~dp0dist\AdminBridge.exe" copy /y "%~dp0dist\AdminBridge.exe" "%TEMP%\AdminBridge_novo.exe" >nul 2>&1
+copy /y "%~f0" "%TEMP%\trocar.bat" >nul 2>&1
 
 rem 2. Verifica se possui privilegios administrativos
 net session >nul 2>&1
@@ -20,9 +21,21 @@ echo ========================================================
 echo.
 
 set "DIST_EXE=%~dp0dist\AdminBridge.exe"
+if not exist "%DIST_EXE%" (
+    if exist "%TEMP%\AdminBridge_novo.exe" (
+        set "DIST_EXE=%TEMP%\AdminBridge_novo.exe"
+    ) else if exist "c:\Users\epgur\.gemini\antigravity\Utilitário\dist\AdminBridge.exe" (
+        set "DIST_EXE=c:\Users\epgur\.gemini\antigravity\Utilitário\dist\AdminBridge.exe"
+    )
+)
 set "DEST_DIR=C:\Utilitario"
 set "DEST_EXE=C:\Utilitario\AdminBridge.exe"
 set "SIGN_SCRIPT=%~dp0assinar_executavel.ps1"
+if not exist "%SIGN_SCRIPT%" (
+    if exist "c:\Users\epgur\.gemini\antigravity\Utilitário\assinar_executavel.ps1" (
+        set "SIGN_SCRIPT=c:\Users\epgur\.gemini\antigravity\Utilitário\assinar_executavel.ps1"
+    )
+)
 
 if not exist "%DIST_EXE%" goto :err_no_dist
 

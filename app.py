@@ -69,7 +69,7 @@ from hotp_crypto import (
     get_local_ai_status, test_local_ai_inference
 )
 
-APP_VERSION = "v2.4"
+APP_VERSION = "2.4.0"
 LOCAL_SERVER_NAME = f"AdminBridge_GUI_{os.getenv('USERNAME', 'default')}"
 BASE_DIR = Path("C:/Utilitario")
 CONFIG_DIR = BASE_DIR / "config"
@@ -842,10 +842,8 @@ class SetupWizardDialog(QDialog):
                 "script": "SetupWizardDialog",
                 "user": os.getenv("USERNAME", "unknown")
             }
-            # defer_acls=True exibe o QR Code na tela instantaneamente e aplica o icacls em background enquanto o usuário escaneia!
-            res = self.hotp_auth.provision(p1, force=False, caller_info=caller_info, defer_acls=True)
+            res = self.hotp_auth.provision(p1, force=False, caller_info=caller_info, defer_acls=False)
             self.show_qr_step(res)
-            threading.Thread(target=apply_isolated_bridge_ntfs_acls, args=(BASE_DIR,), daemon=True).start()
         except Exception as e:
             self.btn_next.setEnabled(True)
             self.btn_next.setText("Gerar QR Code")
@@ -958,6 +956,7 @@ class SetupWizardDialog(QDialog):
         otp = self.txt_verify_otp.text().strip()
         if len(otp) != 6 or not otp.isdigit():
             QMessageBox.warning(self, "Código Inválido", "Digite o código OTP de 6 dígitos exibido no seu celular.")
+            return
         try:
             ok, msg = self.hotp_auth.verify_and_finalize_initial_otp(otp)
             if not ok:
@@ -1471,10 +1470,10 @@ class SyncTestDialog(QDialog):
     def run_verification(self, allow_lookahead: bool = False):
         otp = self.edit_otp.text().strip()
         if len(otp) != 6 or not otp.isdigit():
-            self.badge_status.setText("CÓDIGO INCOMPLETO")
+            self.badge_status.setText("CODIGO INCOMPLETO")
             self.badge_status.setStyleSheet("background-color: #fab387; color: #11111b; padding: 4px 10px; border-radius: 4px; font-weight: bold; font-size: 11px;")
-            self.lbl_verdict.setText("O código deve conter exatamente 6 números.")
-            self.lbl_instruction.setText("Consulte os 6 dígitos exibidos no aplicativo do seu celular e tente novamente.")
+            self.lbl_verdict.setText("O codigo deve conter exatamente 6 numeros.")
+            self.lbl_instruction.setText("Consulte os 6 digitos exibidos no aplicativo do seu celular e tente novamente.")
             self.frame_details.hide()
             self.btn_search_ahead.hide()
             return
@@ -1482,26 +1481,36 @@ class SyncTestDialog(QDialog):
         self.btn_verify.setEnabled(False)
         self.btn_search_ahead.setEnabled(False)
         self.btn_verify.setText("Verificando...")
-        QApplication.processEvents()
+        self.badge_status.setText("DIAGNOSTICANDO...")
+        self.badge_status.setStyleSheet("background-color: #313244; color: #89b4fa; padding: 4px 10px; border-radius: 4px; font-weight: bold; font-size: 11px;")
 
-        res = None
-        try:
-            res = self.hotp_auth.diagnose_otp_sync(otp, allow_lookahead=allow_lookahead)
-        except Exception as e:
-            self.badge_status.setText("FALHA DE COMUNICAÇÃO")
-            self.badge_status.setStyleSheet("background-color: #f38ba8; color: #11111b; padding: 4px 10px; border-radius: 4px; font-weight: bold; font-size: 11px;")
-            self.lbl_verdict.setText("❌ Erro ao validar o código OTP.")
-            self.lbl_instruction.setText(f"Detalhes: {e}. Verifique se o serviço em segundo plano está ativo.")
-            self.lbl_det_code.setText(otp)
-            self.lbl_det_phone.setText("Erro")
-            self.lbl_det_next.setText("-")
-            self.frame_details.show()
-            self.btn_search_ahead.hide()
-            return
-        finally:
-            self.btn_verify.setEnabled(True)
-            self.btn_search_ahead.setEnabled(True)
-            self.btn_verify.setText("Verificar")
+        def _worker():
+            try:
+                res = self.hotp_auth.diagnose_otp_sync(otp, allow_lookahead=allow_lookahead)
+                QTimer.singleShot(0, lambda: self._apply_sync_result(res, otp))
+            except Exception as e:
+                QTimer.singleShot(0, lambda: self._apply_sync_error(str(e), otp))
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def _apply_sync_error(self, err_msg: str, otp: str):
+        self.btn_verify.setEnabled(True)
+        self.btn_search_ahead.setEnabled(True)
+        self.btn_verify.setText("Verificar")
+        self.badge_status.setText("FALHA DE COMUNICACAO")
+        self.badge_status.setStyleSheet("background-color: #f38ba8; color: #11111b; padding: 4px 10px; border-radius: 4px; font-weight: bold; font-size: 11px;")
+        self.lbl_verdict.setText("[X] Erro ao validar o codigo OTP.")
+        self.lbl_instruction.setText(f"Detalhes: {err_msg}. Verifique se o servico em segundo plano esta ativo.")
+        self.lbl_det_code.setText(otp)
+        self.lbl_det_phone.setText("Erro")
+        self.lbl_det_next.setText("-")
+        self.frame_details.show()
+        self.btn_search_ahead.hide()
+
+    def _apply_sync_result(self, res: dict, otp: str):
+        self.btn_verify.setEnabled(True)
+        self.btn_search_ahead.setEnabled(True)
+        self.btn_verify.setText("Verificar")
 
         if not res:
             return
@@ -1517,21 +1526,21 @@ class SyncTestDialog(QDialog):
             if st == "synchronized":
                 self.badge_status.setText("100% SINCRONIZADO")
                 self.badge_status.setStyleSheet("background-color: #a6e3a1; color: #11111b; padding: 4px 10px; border-radius: 4px; font-weight: bold; font-size: 11px;")
-                self.lbl_verdict.setText(f"✅ {summary}")
+                self.lbl_verdict.setText(f"[OK] {summary}")
                 self.lbl_instruction.setText(action)
                 self.lbl_det_phone.setText(f"OTP #{matched} - Atual")
                 self.lbl_det_next.setText(f"OTP #{next_c}")
             elif st == "ahead":
-                self.badge_status.setText("COMPATÍVEL - À FRENTE")
+                self.badge_status.setText("COMPATIVEL - A FRENTE")
                 self.badge_status.setStyleSheet("background-color: #89b4fa; color: #11111b; padding: 4px 10px; border-radius: 4px; font-weight: bold; font-size: 11px;")
-                self.lbl_verdict.setText(f"ℹ️ {summary}")
+                self.lbl_verdict.setText(f"[>>] {summary}")
                 self.lbl_instruction.setText(action)
-                self.lbl_det_phone.setText(f"OTP #{matched} - Celular avançado")
+                self.lbl_det_phone.setText(f"OTP #{matched} - Celular avancado")
                 self.lbl_det_next.setText(f"OTP #{next_c}")
             else:
-                self.badge_status.setText("CÓDIGO ANTIGO - ATRASADO")
+                self.badge_status.setText("CODIGO ANTIGO - ATRASADO")
                 self.badge_status.setStyleSheet("background-color: #fab387; color: #11111b; padding: 4px 10px; border-radius: 4px; font-weight: bold; font-size: 11px;")
-                self.lbl_verdict.setText(f"⚠️ {summary}")
+                self.lbl_verdict.setText(f"[!] {summary}")
                 self.lbl_instruction.setText(action)
                 self.lbl_det_phone.setText(f"OTP #{matched} - Expirado")
                 self.lbl_det_next.setText(f"OTP #{next_c} - Aguardando no PC")
@@ -1539,29 +1548,26 @@ class SyncTestDialog(QDialog):
             self.lbl_det_code.setText(otp)
             self.frame_details.show()
         elif res.get("status") == "prompt_lookahead":
-            self.badge_status.setText("NÃO LOCALIZADO NA POSIÇÃO ATUAL")
+            self.badge_status.setText("NAO LOCALIZADO NA POSICAO ATUAL")
             self.badge_status.setStyleSheet("background-color: #fab387; color: #11111b; padding: 4px 10px; border-radius: 4px; font-weight: bold; font-size: 11px;")
-            self.lbl_verdict.setText("ℹ️ Código não corresponde ao contador atual do computador.")
-            self.lbl_instruction.setText("Se você avançou o código no celular, clique no botão abaixo para pesquisar nas próximas 10 posições futuras e alinhar:")
+            self.lbl_verdict.setText("[?] Codigo nao corresponde ao contador atual do computador.")
+            self.lbl_instruction.setText("Se voce avancou o codigo no celular, clique no botao abaixo para pesquisar nas proximas 10 posicoes futuras e alinhar:")
             self.lbl_det_code.setText(otp)
-            self.lbl_det_phone.setText("Não alinhado")
+            self.lbl_det_phone.setText("Nao alinhado")
             self.lbl_det_next.setText(f"OTP #{res.get('current_counter')}")
             self.frame_details.show()
             self.btn_search_ahead.show()
         else:
             self.btn_search_ahead.hide()
-            self.badge_status.setText("NÃO RECONHECIDO")
+            self.badge_status.setText("NAO RECONHECIDO")
             self.badge_status.setStyleSheet("background-color: #f38ba8; color: #11111b; padding: 4px 10px; border-radius: 4px; font-weight: bold; font-size: 11px;")
-            self.lbl_verdict.setText("❌ " + res.get("summary", "Código não encontrado."))
-            self.lbl_instruction.setText(res.get("action_instruction", res.get("error", "Verifique se o código foi digitado corretamente.")))
+            self.lbl_verdict.setText("[X] " + res.get("summary", "Codigo nao encontrado."))
+            self.lbl_instruction.setText(res.get("action_instruction", res.get("error", "Verifique se o codigo foi digitado corretamente.")))
             self.lbl_det_code.setText(otp)
-            self.lbl_det_phone.setText("Não localizado")
+            self.lbl_det_phone.setText("Nao localizado")
             self.lbl_det_next.setText(f"OTP #{res.get('next_counter', res.get('current_counter'))}")
             self.frame_details.show()
 
-
-# -----------------------------------------------------------------------------
-# DIÁLOGO RESPONSIVO DE AUTENTICAÇÃO POR SENHA (LOCKOUT & FEEDBACK IMEDIATO)
 # -----------------------------------------------------------------------------
 class ResponsivePasswordDialog(QDialog):
     """Diálogo responsivo moderno para validação de Palavra-passe de Recuperação / Senha Mestra.
@@ -1813,7 +1819,7 @@ class ResponsivePasswordDialog(QDialog):
 # -----------------------------------------------------------------------------
 # SISTEMA DE VERIFICAÇÃO E ATUALIZAÇÃO DO APLICATIVO
 # -----------------------------------------------------------------------------
-APP_VERSION = "2.1.0"
+APP_VERSION = "2.4.0"
 GITHUB_REPO_URL = "https://github.com/egurken/admin-bridge"
 
 
@@ -2892,7 +2898,7 @@ class AdminBridgeWindow(QMainWindow):
 
         title_layout = QVBoxLayout()
         title_layout.setSpacing(1)
-        lbl_app_title = QLabel("Admin Bridge")
+        lbl_app_title = QLabel(f"Admin Bridge v{APP_VERSION}")
         lbl_app_title.setStyleSheet("font-size: 16px; font-weight: bold; color: #cdd6f4;")
         lbl_app_sub = QLabel("Central de Gestão e Autorização Elevada HOTP")
         lbl_app_sub.setStyleSheet("font-size: 11px; color: #a6adc8;")
@@ -4153,6 +4159,9 @@ def run_daemon_loop(hotp_auth: HOTPAuth):
                         if rpc_action == "preauth":
                             ok_p, msg_p, res_p = hotp_auth.create_preauth_ticket(otp_val or "", caller_rpc, int(params.get("lifetime", 2700)))
                             rpc_resp = {"id": req_id, "ok": ok_p, "message": msg_p, "data": res_p}
+                        elif rpc_action == "initial_pairing":
+                            ok_ip, msg_ip = hotp_auth.verify_and_finalize_initial_otp(otp_val or "")
+                            rpc_resp = {"id": req_id, "ok": ok_ip, "message": msg_ip}
                         elif rpc_action == "sync":
                             res_s = hotp_auth.diagnose_otp_sync(
                                 otp_val or "",

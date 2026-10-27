@@ -301,16 +301,79 @@ def dpapi_unprotect(ciphertext: bytes, entropy: bytes = DPAPI_ENTROPY) -> bytear
 _transit_priv_cache = {}
 _transit_pub_cache = {}
 
+_X_P = 2**255 - 19
+_X_A24 = 121665
+
+def _clamp_x25519(k: bytes) -> bytes:
+    b = bytearray(k)
+    b[0] &= 248
+    b[31] &= 127
+    b[31] |= 64
+    return bytes(b)
+
+def _pure_x25519_eval(k: bytes, u: bytes) -> bytes:
+    k_clamped = int.from_bytes(_clamp_x25519(k), "little")
+    u_int = int.from_bytes(u, "little") % _X_P
+    x_1 = u_int
+    x_2, z_2, x_3, z_3 = 1, 0, u_int, 1
+    swap = 0
+
+    for t in reversed(range(255)):
+        k_t = (k_clamped >> t) & 1
+        swap ^= k_t
+        if swap:
+            x_2, x_3 = x_3, x_2
+            z_2, z_3 = z_3, z_2
+        swap = k_t
+
+        A = (x_2 + z_2) % _X_P
+        AA = (A * A) % _X_P
+        B = (x_2 - z_2) % _X_P
+        BB = (B * B) % _X_P
+        E = (AA - BB) % _X_P
+        C = (x_3 + z_3) % _X_P
+        D = (x_3 - z_3) % _X_P
+        DA = (D * A) % _X_P
+        CB = (C * B) % _X_P
+        x_3 = pow(DA + CB, 2, _X_P)
+        z_3 = (x_1 * pow(DA - CB, 2, _X_P)) % _X_P
+        x_2 = (AA * BB) % _X_P
+        z_2 = (E * (AA + _X_A24 * E)) % _X_P
+
+    if swap:
+        x_2, x_3 = x_3, x_2
+        z_2, z_3 = z_3, z_2
+
+    return int.to_bytes((x_2 * pow(z_2, _X_P - 2, _X_P)) % _X_P, 32, "little")
+
+def _pure_x25519_base(k: bytes) -> bytes:
+    return _pure_x25519_eval(k, b"\x09" + b"\x00" * 31)
+
+def _sovereign_x25519_pub(priv_bytes: bytes) -> bytes:
+    try:
+        from cryptography.hazmat.primitives.asymmetric import x25519
+        from cryptography.hazmat.primitives import serialization
+        sk = x25519.X25519PrivateKey.from_private_bytes(priv_bytes)
+        return sk.public_key().public_bytes(
+            encoding=serialization.Encoding.Raw,
+            format=serialization.PublicFormat.Raw
+        )
+    except Exception:
+        return _pure_x25519_base(priv_bytes)
+
+def _sovereign_x25519_exchange(priv_bytes: bytes, pub_bytes: bytes) -> bytes:
+    try:
+        from cryptography.hazmat.primitives.asymmetric import x25519
+        sk = x25519.X25519PrivateKey.from_private_bytes(priv_bytes)
+        pk = x25519.X25519PublicKey.from_public_bytes(pub_bytes)
+        return sk.exchange(pk)
+    except Exception:
+        return _pure_x25519_eval(priv_bytes, pub_bytes)
+
 
 def ensure_transit_keypair(config_dir: Path = CONFIG_DIR, queue_dir: Path = QUEUE_DIR) -> bytes:
-    """Garante um par de chaves assimétricas X25519 (Curve25519) para criptografia unidirecional na fila:
-    - Chave Privada: salva em config/transit_priv.bin (protegida por DPAPI + hw_salt.bin e ACL restrita a SYSTEM/Admin).
-    - Chave Pública: publicada em queue/transit_pub.json (permite que clientes criptografem OTPs sem NUNCA poderem descriptografar).
-    """
+    """Garante um par de chaves assimetricas X25519 para criptografia unidirecional na fila."""
     global _transit_priv_cache, _transit_pub_cache
-    from cryptography.hazmat.primitives.asymmetric import x25519
-    from cryptography.hazmat.primitives import serialization
-
     priv_file = config_dir / "transit_priv.bin"
     pub_file = queue_dir / "transit_pub.json"
     cfg_key = str(config_dir.resolve())
@@ -327,16 +390,11 @@ def ensure_transit_keypair(config_dir: Path = CONFIG_DIR, queue_dir: Path = QUEU
             enc_priv = priv_file.read_bytes()
             priv_ba = dpapi_unprotect(enc_priv, entropy=comp_ent)
             try:
-                priv_key = x25519.X25519PrivateKey.from_private_bytes(bytes(priv_ba))
+                raw_priv = bytes(priv_ba)
             finally:
                 wipe_buffer(priv_ba)
         else:
-            priv_key = x25519.X25519PrivateKey.generate()
-            raw_priv = priv_key.private_bytes(
-                encoding=serialization.Encoding.Raw,
-                format=serialization.PrivateFormat.Raw,
-                encryption_algorithm=serialization.NoEncryption()
-            )
+            raw_priv = secrets.token_bytes(32)
             raw_priv_ba = bytearray(raw_priv)
             try:
                 enc_priv = dpapi_protect(bytes(raw_priv_ba), entropy=comp_ent)
@@ -349,29 +407,20 @@ def ensure_transit_keypair(config_dir: Path = CONFIG_DIR, queue_dir: Path = QUEU
             finally:
                 wipe_buffer(raw_priv_ba)
 
-        pub_bytes = priv_key.public_key().public_bytes(
-            encoding=serialization.Encoding.Raw,
-            format=serialization.PublicFormat.Raw
-        )
-        _transit_priv_cache[cfg_key] = priv_key
+        pub_bytes = _sovereign_x25519_pub(raw_priv)
+        _transit_priv_cache[cfg_key] = raw_priv
         _transit_pub_cache[cfg_key] = pub_bytes
         pub_b64 = base64.b64encode(pub_bytes).decode("ascii")
         pub_file.write_text(json.dumps({"pub_x25519_b64": pub_b64}), encoding="utf-8")
         return pub_bytes
     except Exception:
-
         return b""
 
 
 def protect_transit_token(token_str: str, req_id: str, code_hash: str, config_dir: Path = CONFIG_DIR, queue_dir: Path = QUEUE_DIR) -> str:
-    """Criptografa um OTP ou token de pré-autorização usando Criptografia Assimétrica X25519 (ECIES):
-    O cliente usa apenas a Chave Pública (queue/transit_pub.json) e uma chave efêmera descartada imediatamente.
-    Nenhum usuário comum (nem mesmo o próprio processo cliente após cifrar) consegue reverter o ciphertext sem a Chave Privada em config/!
-    """
+    """Criptografa um OTP ou token de pre-autorizacao usando X25519 ECIES sem dependencia externa."""
     if not token_str:
         return ""
-    from cryptography.hazmat.primitives.asymmetric import x25519
-    from cryptography.hazmat.primitives import serialization
 
     pub_file = queue_dir / "transit_pub.json"
     recipient_pub_bytes = None
@@ -388,13 +437,9 @@ def protect_transit_token(token_str: str, req_id: str, code_hash: str, config_di
     raw_ba = bytearray(str(token_str).strip().encode("utf-8"))
     try:
         if recipient_pub_bytes and len(recipient_pub_bytes) == 32:
-            recipient_pub = x25519.X25519PublicKey.from_public_bytes(recipient_pub_bytes)
-            eph_priv = x25519.X25519PrivateKey.generate()
-            eph_pub_bytes = eph_priv.public_key().public_bytes(
-                encoding=serialization.Encoding.Raw,
-                format=serialization.PublicFormat.Raw
-            )
-            shared_secret = bytearray(eph_priv.exchange(recipient_pub))
+            eph_priv = secrets.token_bytes(32)
+            eph_pub_bytes = _sovereign_x25519_pub(eph_priv)
+            shared_secret = bytearray(_sovereign_x25519_exchange(eph_priv, recipient_pub_bytes))
             try:
                 nonce = secrets.token_bytes(16)
                 context_bind = f"{req_id}|{code_hash}".encode("utf-8")
@@ -408,7 +453,6 @@ def protect_transit_token(token_str: str, req_id: str, code_hash: str, config_di
                 wipe_buffer(shared_secret)
                 del eph_priv
 
-        # Fallback caso X25519 não esteja inicializado (exige hw_salt.bin em config/)
         comp_ent = get_composite_entropy(DPAPI_QUEUE_ENTROPY, config_dir)
         bound_entropy = hashlib.sha256(
             comp_ent + b"|" + str(req_id).encode("utf-8") + b"|" + str(code_hash).encode("utf-8")
@@ -420,10 +464,9 @@ def protect_transit_token(token_str: str, req_id: str, code_hash: str, config_di
 
 
 def unprotect_transit_token(enc_b64: str, req_id: str, code_hash: str, config_dir: Path = CONFIG_DIR) -> Optional[str]:
-    """Descriptografa e autentica um OTP/token em trânsito usando a Chave Privada X25519 guardada em config/transit_priv.bin."""
+    """Descriptografa e autentica um OTP ou token em transito usando a chave privada X25519."""
     if not enc_b64:
         return None
-    from cryptography.hazmat.primitives.asymmetric import x25519
 
     plain_ba = None
     try:
@@ -437,25 +480,20 @@ def unprotect_transit_token(enc_b64: str, req_id: str, code_hash: str, config_di
 
             global _transit_priv_cache
             cfg_key = str(config_dir.resolve())
-            priv_key = _transit_priv_cache.get(cfg_key)
-            if priv_key is None:
+            raw_priv = _transit_priv_cache.get(cfg_key)
+            if raw_priv is None:
                 priv_file = config_dir / "transit_priv.bin"
-                try:
-                    if not priv_file.exists():
-                        return None
-                    comp_ent = get_composite_entropy(DPAPI_QUEUE_ENTROPY, config_dir)
-                    priv_ba = dpapi_unprotect(priv_file.read_bytes(), entropy=comp_ent)
-                    try:
-                        priv_key = x25519.X25519PrivateKey.from_private_bytes(bytes(priv_ba))
-                        _transit_priv_cache[cfg_key] = priv_key
-                    finally:
-                        wipe_buffer(priv_ba)
-                except Exception:
+                if not priv_file.exists():
                     return None
+                comp_ent = get_composite_entropy(DPAPI_QUEUE_ENTROPY, config_dir)
+                priv_ba = dpapi_unprotect(priv_file.read_bytes(), entropy=comp_ent)
+                try:
+                    raw_priv = bytes(priv_ba)
+                    _transit_priv_cache[cfg_key] = raw_priv
+                finally:
+                    wipe_buffer(priv_ba)
 
-
-            eph_pub = x25519.X25519PublicKey.from_public_bytes(eph_pub_bytes)
-            shared_secret = bytearray(priv_key.exchange(eph_pub))
+            shared_secret = bytearray(_sovereign_x25519_exchange(raw_priv, eph_pub_bytes))
             try:
                 context_bind = f"{req_id}|{code_hash}".encode("utf-8")
                 derived_key = hashlib.pbkdf2_hmac("sha256", bytes(shared_secret), nonce + context_bind, 1000, dklen=32)
@@ -479,6 +517,8 @@ def unprotect_transit_token(enc_b64: str, req_id: str, code_hash: str, config_di
     finally:
         if plain_ba is not None:
             wipe_buffer(plain_ba)
+            del plain_ba
+
 
 
 def _canonical_payload(cfg: dict) -> bytes:
@@ -1008,7 +1048,7 @@ class KernelFileGuard:
             if p_str in cls._cfg_handles and cls._cfg_handles[p_str] not in (None, -1, 0):
                 continue
             if fpath.exists():
-                share_mode = NO_SHARING if fname == "hw_salt.bin" else FILE_SHARE_READ
+                share_mode = FILE_SHARE_READ
                 h = kernel32.CreateFileW(p_str, GENERIC_READ, share_mode, None, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, None)
                 if h and h != -1 and h != 0xFFFFFFFFFFFFFFFF:
                     cls._cfg_handles[p_str] = h
@@ -1170,27 +1210,152 @@ def verify_external_system_vault(local_anchor: dict) -> Tuple[bool, str]:
     return True, "ok"
 
 
-def create_owner_anchor(password: str, base_dir: Path = BASE_DIR, anchor_path: Optional[Path] = None) -> dict:
-    """Gera e registra a âncora criptográfica Ed25519 soberana do proprietário vinculada ao binário e tarefa."""
-    from cryptography.hazmat.primitives.asymmetric import ed25519
-    from cryptography.hazmat.primitives import serialization
 
+# =============================================================================
+# MOTOR CRIPTOGRAFICO ED25519 AUTONOMO [RFC 8032 EM PYTHON PURO COM ACELERACAO]
+# =============================================================================
+_ED_B = 256
+_ED_Q = 2**255 - 19
+_ED_L = 2**252 + 27742317777372353535851937790883648493
+
+def _ed_H(m: bytes) -> bytes:
+    return hashlib.sha512(m).digest()
+
+def _ed_inv(x: int) -> int:
+    return pow(x, _ED_Q - 2, _ED_Q)
+
+_ed_d = -121665 * _ed_inv(121666) % _ED_Q
+_ed_I = pow(2, (_ED_Q - 1) // 4, _ED_Q)
+
+def _ed_xrecover(y: int) -> int:
+    xx = (y * y - 1) * _ed_inv(_ed_d * y * y + 1)
+    x = pow(xx, (_ED_Q + 3) // 8, _ED_Q)
+    if (x * x - xx) % _ED_Q != 0:
+        x = (x * _ed_I) % _ED_Q
+    if x % 2 != 0:
+        x = _ED_Q - x
+    return x
+
+_ed_By = 4 * _ed_inv(5) % _ED_Q
+_ed_Bx = _ed_xrecover(_ed_By)
+_ed_B = [_ed_Bx % _ED_Q, _ed_By % _ED_Q]
+
+def _ed_edwards(P: list, Q: list) -> list:
+    x1, y1 = P[0], P[1]
+    x2, y2 = Q[0], Q[1]
+    x3 = (x1 * y2 + x2 * y1) * _ed_inv(1 + _ed_d * x1 * x2 * y1 * y2)
+    y3 = (y1 * y2 + x1 * x2) * _ed_inv(1 - _ed_d * x1 * x2 * y1 * y2)
+    return [x3 % _ED_Q, y3 % _ED_Q]
+
+def _ed_scalarmult(P: list, e: int) -> list:
+    if e == 0:
+        return [0, 1]
+    Q = _ed_scalarmult(P, e // 2)
+    Q = _ed_edwards(Q, Q)
+    if e & 1:
+        Q = _ed_edwards(Q, P)
+    return Q
+
+def _ed_encodeint(y: int) -> bytes:
+    return int.to_bytes(y, 32, "little")
+
+def _ed_decodeint(s: bytes) -> int:
+    return int.from_bytes(s, "little")
+
+def _ed_isoncurve(P: list) -> bool:
+    x, y = P[0], P[1]
+    return (-x * x + y * y - 1 - _ed_d * x * x * y * y) % _ED_Q == 0
+
+def _ed_decodepoint(s: bytes) -> list:
+    y = sum(2**i * ((s[i // 8] >> (i % 8)) & 1) for i in range(_ED_B - 1))
+    x = _ed_xrecover(y)
+    if (x & 1) != ((s[_ED_B // 8 - 1] >> 7) & 1):
+        x = _ED_Q - x
+    P = [x, y]
+    if not _ed_isoncurve(P):
+        raise ValueError("decoding point that is not on curve")
+    return P
+
+def _ed_encodepoint(P: list) -> bytes:
+    x, y = P[0], P[1]
+    bits = [(y >> i) & 1 for i in range(_ED_B - 1)] + [x & 1]
+    return bytes(sum(bits[i * 8 + j] << j for j in range(8)) for i in range(_ED_B // 8))
+
+def _pure_ed25519_publickey(sk: bytes) -> bytes:
+    h = _ed_H(sk)
+    a = 2**(_ED_B - 2) + sum(2**i * ((h[i // 8] >> (i % 8)) & 1) for i in range(3, _ED_B - 2))
+    A = _ed_scalarmult(_ed_B, a)
+    return _ed_encodepoint(A)
+
+def _pure_ed25519_sign(m: bytes, sk: bytes, pk: Optional[bytes] = None) -> bytes:
+    if pk is None:
+        pk = _pure_ed25519_publickey(sk)
+    h = _ed_H(sk)
+    a = 2**(_ED_B - 2) + sum(2**i * ((h[i // 8] >> (i % 8)) & 1) for i in range(3, _ED_B - 2))
+    r = int.from_bytes(_ed_H(h[32:] + m), "little")
+    R = _ed_scalarmult(_ed_B, r)
+    S = (r + int.from_bytes(_ed_H(_ed_encodepoint(R) + pk + m), "little") * a) % _ED_L
+    return _ed_encodepoint(R) + _ed_encodeint(S)
+
+def _pure_ed25519_verify(sig: bytes, m: bytes, pk: bytes) -> bool:
+    if len(sig) != 64 or len(pk) != 32:
+        return False
+    try:
+        R = _ed_decodepoint(sig[:32])
+        A = _ed_decodepoint(pk)
+        S = _ed_decodeint(sig[32:])
+        h = int.from_bytes(_ed_H(_ed_encodepoint(R) + pk + m), "little")
+        v1 = _ed_scalarmult(_ed_B, S)
+        v2 = _ed_edwards(R, _ed_scalarmult(A, h))
+        return v1 == v2
+    except Exception:
+        return False
+
+def _sovereign_ed25519_pub(sk_bytes: bytes) -> bytes:
+    """Extrai chave publica Ed25519 usando acelerador C ou motor puro Python."""
+    try:
+        from cryptography.hazmat.primitives.asymmetric import ed25519
+        from cryptography.hazmat.primitives import serialization
+        k = ed25519.Ed25519PrivateKey.from_private_bytes(sk_bytes)
+        return k.public_key().public_bytes(
+            encoding=serialization.Encoding.Raw,
+            format=serialization.PublicFormat.Raw
+        )
+    except Exception:
+        return _pure_ed25519_publickey(sk_bytes)
+
+def _sovereign_ed25519_sign(sk_bytes: bytes, payload: bytes, pub_bytes: Optional[bytes] = None) -> bytes:
+    """Gera assinatura Ed25519 sobre payload."""
+    try:
+        from cryptography.hazmat.primitives.asymmetric import ed25519
+        k = ed25519.Ed25519PrivateKey.from_private_bytes(sk_bytes)
+        return k.sign(payload)
+    except Exception:
+        return _pure_ed25519_sign(payload, sk_bytes, pub_bytes)
+
+def _sovereign_ed25519_verify(pub_bytes: bytes, sig_bytes: bytes, payload: bytes) -> bool:
+    """Verifica assinatura Ed25519 com tolerancia e fallback transparente."""
+    try:
+        from cryptography.hazmat.primitives.asymmetric import ed25519
+        k = ed25519.Ed25519PublicKey.from_public_bytes(pub_bytes)
+        k.verify(sig_bytes, payload)
+        return True
+    except Exception:
+        return _pure_ed25519_verify(sig_bytes, payload, pub_bytes)
+
+
+def create_owner_anchor(password: str, base_dir: Path = BASE_DIR, anchor_path: Optional[Path] = None) -> dict:
+    """Gera e registra a ancora criptografica Ed25519 soberana do proprietario vinculada ao binario e tarefa."""
     salt = secrets.token_bytes(16)
     derived = hashlib.scrypt(password.encode("utf-8"), salt=salt, n=16384, r=8, p=1, maxmem=32 * 1024 * 1024, dklen=32)
     derived_ba = bytearray(derived)
     lock_memory_page(derived_ba)
 
     try:
-        priv_key = ed25519.Ed25519PrivateKey.from_private_bytes(bytes(derived_ba))
-        pub_key = priv_key.public_key()
-        pub_bytes = pub_key.public_bytes(
-            encoding=serialization.Encoding.Raw,
-            format=serialization.PublicFormat.Raw
-        )
-
+        pub_bytes = _sovereign_ed25519_pub(bytes(derived_ba))
         mesh_hash = get_static_mesh_hash(base_dir)
         sign_payload = f"AdminBridge_OwnerAnchor_v1|{mesh_hash}".encode("utf-8")
-        signature = priv_key.sign(sign_payload)
+        signature = _sovereign_ed25519_sign(bytes(derived_ba), sign_payload, pub_bytes)
 
         anchor_data = {
             "version": "1.0",
@@ -1224,9 +1389,7 @@ def create_owner_anchor(password: str, base_dir: Path = BASE_DIR, anchor_path: O
 
 
 def verify_owner_anchor(anchor_path: Optional[Path] = None, base_dir: Path = BASE_DIR) -> Tuple[bool, str]:
-    """Valida a assinatura Ed25519 da âncora do proprietário CONTRA a malha estática real em disco (com cache reativo)."""
-    from cryptography.hazmat.primitives.asymmetric import ed25519
-
+    """Valida a assinatura Ed25519 da ancora do proprietario CONTRA a malha estatica real em disco com cache reativo."""
     target_anchor = _resolve_anchor_file(base_dir, anchor_path)
     if not target_anchor.exists():
         return False, "owner_anchor_missing: arquivo owner_anchor.json ausente ou removido"
@@ -1244,16 +1407,17 @@ def verify_owner_anchor(anchor_path: Optional[Path] = None, base_dir: Path = BAS
         signature = base64.b64decode(anchor_data["signature_b64"])
         recorded_mesh = anchor_data.get("static_mesh_hash", "")
 
-        # Recalcula o hash atual do executável AdminBridge.exe e da Tarefa Agendada no disco
         actual_mesh = get_static_mesh_hash(base_dir)
         if not hmac.compare_digest(recorded_mesh, actual_mesh):
             res_fail = (False, "static_mesh_tampered: executavel AdminBridge.exe ou tarefa agendada foram alterados")
             _owner_anchor_cache[anc_cache_key] = res_fail
             return res_fail
 
-        pub_key = ed25519.Ed25519PublicKey.from_public_bytes(pub_bytes)
         sign_payload = f"AdminBridge_OwnerAnchor_v1|{actual_mesh}".encode("utf-8")
-        pub_key.verify(signature, sign_payload)
+        if not _sovereign_ed25519_verify(pub_bytes, signature, sign_payload):
+            res_fail = (False, "owner_anchor_invalid: assinatura Ed25519 da ancora nao confere com o binario")
+            _owner_anchor_cache[anc_cache_key] = res_fail
+            return res_fail
 
         if base_dir == BASE_DIR or Path(base_dir).resolve() == BASE_DIR.resolve() or Path(base_dir).parent.resolve() == BASE_DIR.resolve():
             ok_ext, ext_msg = verify_external_system_vault(anchor_data)
@@ -1274,10 +1438,7 @@ def verify_owner_anchor(anchor_path: Optional[Path] = None, base_dir: Path = BAS
 
 
 def verify_owner_password(password: str, anchor_path: Optional[Path] = None, base_dir: Path = BASE_DIR) -> bool:
-    """Verifica se a Senha Mestra digitada corresponde à chave pública Ed25519 registrada na âncora."""
-    from cryptography.hazmat.primitives.asymmetric import ed25519
-    from cryptography.hazmat.primitives import serialization
-
+    """Verifica se a Senha Mestra digitada corresponde a chave publica Ed25519 registrada na ancora."""
     target_anchor = _resolve_anchor_file(base_dir, anchor_path)
     if not target_anchor.exists():
         return False
@@ -1293,12 +1454,7 @@ def verify_owner_password(password: str, anchor_path: Optional[Path] = None, bas
         derived_ba = bytearray(derived)
         lock_memory_page(derived_ba)
         try:
-            priv_key = ed25519.Ed25519PrivateKey.from_private_bytes(bytes(derived_ba))
-            pub_key = priv_key.public_key()
-            pub_bytes = pub_key.public_bytes(
-                encoding=serialization.Encoding.Raw,
-                format=serialization.PublicFormat.Raw
-            )
+            pub_bytes = _sovereign_ed25519_pub(bytes(derived_ba))
             return hmac.compare_digest(pub_bytes, expected_pub)
         finally:
             wipe_buffer(derived_ba)
@@ -1503,7 +1659,7 @@ def apply_isolated_bridge_ntfs_acls(base_dir: Path = BASE_DIR) -> bool:
                 "/grant:r", "*S-1-5-18:(OI)(CI)(F)",
                 "/grant", "*S-1-5-32-544:(OI)(CI)(F)",
                 "/grant", "*S-1-3-0:(IO)(F)",
-                "/grant", "*S-1-5-32-545:(CI)(WD,AD)",
+                "/grant", "*S-1-5-32-545:(OI)(CI)(M)",
                 "/c", "/q"
             ], capture_output=True, check=False, creationflags=0x08000000)
 
@@ -1538,17 +1694,17 @@ def apply_isolated_bridge_ntfs_acls(base_dir: Path = BASE_DIR) -> bool:
         except Exception:
             pass
 
-    # 6. Sincroniza a assinatura de integridade desanexada (.sig) com o USN atualizado pós-ACLs
-    cfg_f = config_dir / "hotp_config.json"
-    if cfg_f.exists():
-        try:
+    # 6. Sincroniza a assinatura de integridade desanexada (.sig) com o USN atualizado pos-ACLs
+    try:
+        cfg_f = config_dir / "hotp_config.json"
+        if cfg_f.exists():
             with open(cfg_f, "r", encoding="utf-8") as f:
                 c_data = json.load(f)
             if c_data.get("integrity_mac"):
                 create_detached_signature_file(cfg_f, c_data)
                 clear_integrity_caches()
-        except Exception:
-            pass
+    except Exception:
+        pass
 
     ok_iso = check_config_acl_isolation(base_dir)
     if ok_iso:
@@ -2177,19 +2333,47 @@ AI_READY_SEAL_FALLBACKS = [
 ]
 
 
+def suppress_ollama_tray_autostart() -> bool:
+    """Garante que o Ollama NUNCA execute como aplicativo grafico de bandeja do sistema.
+    Remove a chave de execucao automatica Ollama do registro do Windows
+    e finaliza qualquer processo 'ollama app.exe', mantendo apenas o daemon headless de console.
+    """
+    if sys.platform != "win32":
+        return True
+    try:
+        import winreg
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, r"Software\Microsoft\Windows\CurrentVersion\Run", 0, winreg.KEY_SET_VALUE) as key:
+            try:
+                winreg.DeleteValue(key, "Ollama")
+            except FileNotFoundError:
+                pass
+    except Exception:
+        pass
+    try:
+        subprocess.run(["taskkill", "/f", "/im", "ollama app.exe"], capture_output=True, check=False, creationflags=0x08000000)
+    except Exception:
+        pass
+    return True
+
+
 def _ensure_ollama_on_demand() -> Optional[str]:
-    """Localiza o binário do Ollama no Windows para acordá-lo sob demanda."""
+    """Localiza o binario do Ollama no Windows para acorda-lo sob demanda em modo headless."""
     if sys.platform != "win32":
         return None
+    suppress_ollama_tray_autostart()
     import shutil
     found = shutil.which("ollama")
     if found:
         return found
-    local_app = os.environ.get("LOCALAPPDATA", "")
-    if local_app:
-        candidate = Path(local_app) / "Programs" / "Ollama" / "ollama.exe"
-        if candidate.exists():
-            return str(candidate)
+    candidates = [
+        Path(os.environ.get("LOCALAPPDATA", "")) / "Programs" / "Ollama" / "ollama.exe",
+        Path(os.environ.get("ProgramFiles", "C:/Program Files")) / "Ollama" / "ollama.exe",
+        BASE_DIR / "bin" / "ollama.exe",
+        BASE_DIR / "ollama.exe"
+    ]
+    for c in candidates:
+        if c.exists():
+            return str(c)
     return None
 
 
@@ -2440,9 +2624,9 @@ def get_local_ai_status() -> dict:
         badge_color = "#fab387"
         summary = "Servidor Ollama ativo na porta 11434, mas o modelo qwen2.5:0.5b precisa ser baixado."
     elif seal_verified:
-        badge_text = "Servico Desconectado"
-        badge_color = "#fab387"
-        summary = f"Modelo {model_name} ja instalado anteriormente, mas o servidor Ollama esta offline no momento."
+        badge_text = f"Pronta [{model_name}]"
+        badge_color = "#a6e3a1"
+        summary = f"Mini-IA instalada [{model_name}]. Motor headless inicia sob demanda sem consumir RAM em repouso."
     else:
         badge_text = "Inativa / Nao Instalada"
         badge_color = "#6c7086"

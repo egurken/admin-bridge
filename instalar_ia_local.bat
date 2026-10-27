@@ -4,18 +4,22 @@ setlocal enabledelayedexpansion
 echo ========================================================
 echo   ATIVANDO E TESTANDO MINI-IA LOCAL (QWEN 2.5 - 0.5B)
 echo   Download direto via API Local do Ollama (127.0.0.1:11434)
+echo   Modo 100%% Headless (sem janela e sem icone de bandeja)
 echo ========================================================
 echo.
 
 powershell -NoProfile -ExecutionPolicy Bypass -Command ^
     "$ErrorActionPreference = 'Continue'; " ^
+    "try { taskkill /f /im 'ollama app.exe' 2>$null; } catch {} " ^
+    "try { Remove-ItemProperty -Path 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run' -Name 'Ollama' -ErrorAction SilentlyContinue; } catch {} " ^
     "try { " ^
     "    $tags = Invoke-RestMethod -Uri 'http://127.0.0.1:11434/api/tags' -Method Get -TimeoutSec 2; " ^
     "    Write-Host '[*] Servidor Ollama detectado em http://127.0.0.1:11434!' -ForegroundColor Cyan; " ^
     "} catch { " ^
     "    $ollamaExe = Join-Path $env:LOCALAPPDATA 'Programs\Ollama\ollama.exe'; " ^
+    "    if (-not (Test-Path $ollamaExe)) { $ollamaExe = Join-Path $env:ProgramFiles 'Ollama\ollama.exe'; } " ^
     "    if (Test-Path $ollamaExe) { " ^
-    "        Write-Host '[*] Iniciando servidor Ollama local...' -ForegroundColor Cyan; " ^
+    "        Write-Host '[*] Iniciando servidor Ollama local em modo headless...' -ForegroundColor Cyan; " ^
     "        Start-Process -FilePath $ollamaExe -ArgumentList 'serve' -WindowStyle Hidden; " ^
     "        Start-Sleep -Seconds 2; " ^
     "    } " ^

@@ -6,7 +6,7 @@ net session >nul 2>&1
 if "%errorlevel%"=="0" goto :is_admin
 
 echo [*] Solicitando permissao de Administrador para exclusao total...
-powershell -NoProfile -ExecutionPolicy Bypass -Command "Start-Process cmd -ArgumentList '/k \"\"%TEMP%\apagar_utilitario.bat\"\"' -Verb RunAs"
+powershell -NoProfile -ExecutionPolicy Bypass -Command "Start-Process cmd -ArgumentList '/k \"\"%~f0\"\"' -Verb RunAs"
 exit /b 0
 
 :is_admin

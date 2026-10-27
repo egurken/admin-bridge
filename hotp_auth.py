@@ -615,18 +615,12 @@ class HOTPAuth:
 
         if self._is_daemon_alive_other_process():
             rpc_res = self._delegate_rpc_to_daemon(
-                "sync",
-                {"otp": clean_otp, "allow_lookahead": False, "max_lookahead": 3, "max_lookback": 0},
+                "initial_pairing",
+                {"otp": clean_otp},
                 timeout=12.0
             )
-            if rpc_res is not None and "result" in rpc_res:
-                res_dict = rpc_res["result"]
-                if isinstance(res_dict, dict):
-                    ok = bool(res_dict.get("success", False))
-                    msg = str(res_dict.get("summary") or res_dict.get("message") or res_dict.get("error", ""))
-                    return ok, msg
-                elif isinstance(res_dict, (tuple, list)) and len(res_dict) >= 2:
-                    return bool(res_dict[0]), str(res_dict[1])
+            if rpc_res is not None:
+                return bool(rpc_res.get("ok", False)), str(rpc_res.get("message", ""))
 
         try:
             with AtomicLock():
@@ -635,18 +629,12 @@ class HOTPAuth:
                     return False, "Configuracao nao encontrada para validacao inicial."
         except (PermissionError, OSError):
             rpc_res = self._delegate_rpc_to_daemon(
-                "sync",
-                {"otp": clean_otp, "allow_lookahead": False, "max_lookahead": 3, "max_lookback": 0},
+                "initial_pairing",
+                {"otp": clean_otp},
                 timeout=12.0
             )
-            if rpc_res is not None and "result" in rpc_res:
-                res_dict = rpc_res["result"]
-                if isinstance(res_dict, dict):
-                    ok = bool(res_dict.get("success", False))
-                    msg = str(res_dict.get("summary") or res_dict.get("message") or res_dict.get("error", ""))
-                    return ok, msg
-                elif isinstance(res_dict, (tuple, list)) and len(res_dict) >= 2:
-                    return bool(res_dict[0]), str(res_dict[1])
+            if rpc_res is not None:
+                return bool(rpc_res.get("ok", False)), str(rpc_res.get("message", ""))
             return False, "Acesso ao cofre negado pelo sistema operacional. Servico em segundo plano offline."
 
         with AtomicLock():

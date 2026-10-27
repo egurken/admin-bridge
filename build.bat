@@ -8,9 +8,21 @@ echo ========================================================
 
 cd /d "%~dp0"
 
+set "PYTHON_CMD=python"
+where python >nul 2>&1
+if %ERRORLEVEL% NEQ 0 (
+    if exist "C:\Users\epgur\AppData\Local\Programs\Python\Python313\python.exe" (
+        set "PYTHON_CMD=C:\Users\epgur\AppData\Local\Programs\Python\Python313\python.exe"
+    ) else if exist "C:\Program Files\Python313\python.exe" (
+        set "PYTHON_CMD=C:\Program Files\Python313\python.exe"
+    ) else (
+        set "PYTHON_CMD=py"
+    )
+)
+
 echo.
-echo [1/2] Executando testes automatizados de seguranca...
-python test_security_rules.py
+echo [1/3] Executando testes automatizados de seguranca...
+"%PYTHON_CMD%" test_security_rules.py
 if %ERRORLEVEL% NEQ 0 (
     echo.
     echo [ERRO CRITICO] Falha nos testes de seguranca! Compilacao abortada.
@@ -19,8 +31,18 @@ if %ERRORLEVEL% NEQ 0 (
 )
 
 echo.
-echo [2/2] Gerando executavel standalone (Onefile)...
-python -m PyInstaller ^
+echo [2/3] Executando teste ativo de ciclo de vida completo...
+"%PYTHON_CMD%" test_full_lifecycle.py
+if %ERRORLEVEL% NEQ 0 (
+    echo.
+    echo [ERRO CRITICO] Falha no teste ativo do ciclo de vida! Compilacao abortada.
+    pause
+    exit /b 1
+)
+
+echo.
+echo [3/3] Gerando executavel standalone (Onefile)...
+"%PYTHON_CMD%" -m PyInstaller ^
     --noconsole ^
     --onefile ^
     --icon="icon.ico" ^
