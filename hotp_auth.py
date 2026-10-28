@@ -212,11 +212,35 @@ class HOTPAuth:
             except Exception:
                 pass
 
-        # 3. Gravação atômica
-        tmp_file = self.config_file.with_suffix(".tmp")
-        with open(tmp_file, "w", encoding="utf-8") as f:
-            json.dump(config_data, f, indent=2, ensure_ascii=False)
-        tmp_file.replace(self.config_file)
+        # 3. Gravação atômica com suspensão pontual de handles de kernel
+        KernelFileGuard.suspend_config_locks_for_atomic_io()
+        try:
+            tmp_file = self.config_file.with_suffix(".tmp")
+            if tmp_file.exists():
+                try:
+                    if hasattr(ctypes, "windll"):
+                        ctypes.windll.kernel32.SetFileAttributesW(str(tmp_file), 0x80)
+                    tmp_file.unlink(missing_ok=True)
+                except Exception:
+                    pass
+            with open(tmp_file, "w", encoding="utf-8") as f:
+                json.dump(config_data, f, indent=2, ensure_ascii=False)
+
+            replaced = False
+            for attempt in range(3):
+                try:
+                    if self.config_file.exists() and hasattr(ctypes, "windll"):
+                        ctypes.windll.kernel32.SetFileAttributesW(str(self.config_file), 0x80)
+                    tmp_file.replace(self.config_file)
+                    replaced = True
+                    break
+                except (PermissionError, OSError):
+                    import time
+                    time.sleep(0.05)
+            if not replaced:
+                tmp_file.replace(self.config_file)
+        finally:
+            KernelFileGuard.resume_config_locks_after_atomic_io()
 
         # 4. Restaura atributo somente-leitura antes de capturar o USN final
         if hasattr(ctypes, "windll"):

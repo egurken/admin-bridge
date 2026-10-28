@@ -78,17 +78,30 @@ def _get_machine_guid_bytes() -> bytes:
     return b"FallbackMachineGuid"
 
 
+_hw_salt_cache: Dict[str, bytes] = {}
+
+
 def get_composite_entropy(base_entropy: bytes = DPAPI_ENTROPY, config_dir: Optional[Path] = None) -> bytes:
     """Combina a entropia base com o MachineGuid do Windows e o salt local protegido em config/."""
     target_cfg_dir = config_dir or CONFIG_DIR
     salt_file = target_cfg_dir / "hw_salt.bin"
     hw_salt = b""
     try:
-        if salt_file.exists():
-            with open(salt_file, "rb") as sf:
-                hw_salt = sf.read(32)
+        cfg_key = str(target_cfg_dir.resolve())
     except Exception:
-        hw_salt = b""
+        cfg_key = str(target_cfg_dir)
+
+    if cfg_key in _hw_salt_cache:
+        hw_salt = _hw_salt_cache[cfg_key]
+    else:
+        try:
+            if salt_file.exists():
+                with open(salt_file, "rb") as sf:
+                    hw_salt = sf.read(32)
+                if hw_salt and len(hw_salt) >= 32:
+                    _hw_salt_cache[cfg_key] = hw_salt
+        except Exception:
+            hw_salt = b""
     return hashlib.sha256(base_entropy + b"|" + _get_machine_guid_bytes() + b"|" + hw_salt).digest()
 
 
@@ -104,6 +117,10 @@ def ensure_hw_salt(config_dir: Optional[Path] = None) -> bytes:
         new_salt = secrets.token_bytes(32)
         with open(salt_file, "wb") as sf:
             sf.write(new_salt)
+        try:
+            _hw_salt_cache[str(target_cfg_dir.resolve())] = new_salt
+        except Exception:
+            pass
         if sys.platform == "win32" and not any(k in str(salt_file).lower() for k in ("temp", "tmp", "appdata")):
             subprocess.run(
                 ["icacls", str(salt_file), "/inheritance:r", "/grant:r", "*S-1-5-18:(F)", "*S-1-5-32-544:(F)", "/c", "/q"],
@@ -794,12 +811,7 @@ def check_integrity_mac(cfg: dict, config_path: Optional[Path] = None) -> Tuple[
                 if sig_usn and sig_usn != "0x0":
                     curr_usn = get_file_usn(cp)
                     if curr_usn != "0x0" and curr_usn != sig_usn:
-                        if curr_hash == sig_data.get("sha256") and sig_data.get("integrity_mac") == mac_b64:
-                            try:
-                                create_detached_signature_file(cp, cfg)
-                            except Exception:
-                                pass
-                        else:
+                        if curr_hash != sig_data.get("sha256") or sig_data.get("integrity_mac") != mac_b64:
                             return False, "usn_tampered"
                 recorded_mesh = sig_data.get("static_mesh_hash")
                 if recorded_mesh:
@@ -822,7 +834,14 @@ def check_integrity_mac(cfg: dict, config_path: Optional[Path] = None) -> Tuple[
                     try:
                         curr_salt_usn = get_file_usn(salt_file)
                         if curr_salt_usn != "0x0" and curr_salt_usn != rec_salt_usn:
-                            return False, "hw_salt_usn_tampered"
+                            if not rec_salt_hash:
+                                return False, "hw_salt_usn_tampered"
+                            try:
+                                curr_salt_hash = hashlib.sha256(salt_file.read_bytes()).hexdigest()
+                                if not hmac.compare_digest(rec_salt_hash, curr_salt_hash):
+                                    return False, "hw_salt_usn_tampered"
+                            except PermissionError:
+                                pass
                     except PermissionError:
                         pass
             except PermissionError:
@@ -1096,7 +1115,7 @@ class KernelFileGuard:
         for fpath in list(cls._guarded_cfg_paths):
             p_str = str(fpath)
             if p_str not in cls._cfg_handles and fpath.exists():
-                share_mode = NO_SHARING if fpath.name == "hw_salt.bin" else FILE_SHARE_READ
+                share_mode = FILE_SHARE_READ
                 h = kernel32.CreateFileW(p_str, GENERIC_READ, share_mode, None, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, None)
                 if h and h != -1 and h != 0xFFFFFFFFFFFFFFFF:
                     cls._cfg_handles[p_str] = h

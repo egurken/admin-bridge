@@ -4073,6 +4073,14 @@ class AdminBridgeWindow(QMainWindow):
 # -----------------------------------------------------------------------------
 def run_daemon_loop(hotp_auth: HOTPAuth):
     """Executa o loop contínuo de processamento de comandos em segundo plano como SYSTEM."""
+    # Singleton Mutex para evitar que múltiplas instâncias concorrentes do daemon executem
+    if sys.platform == "win32" and hasattr(ctypes, "windll"):
+        ERROR_ALREADY_EXISTS = 183
+        mutex = ctypes.windll.kernel32.CreateMutexW(None, True, "Global\\AdminBridgeDaemonSingleton")
+        if ctypes.windll.kernel32.GetLastError() == ERROR_ALREADY_EXISTS:
+            logging.info("[DAEMON] Outra instância do daemon já está em execução. Encerrando.")
+            sys.exit(0)
+
     logging.info("[DAEMON] Admin Bridge daemon iniciado sob conta de servico.")
     harden_process_dacl()
     apply_isolated_bridge_ntfs_acls()
@@ -4090,6 +4098,13 @@ def run_daemon_loop(hotp_auth: HOTPAuth):
     PROCESSING_DIR.mkdir(parents=True, exist_ok=True)
     RESPONSES_DIR.mkdir(parents=True, exist_ok=True)
     SCRIPTS_DIR.mkdir(parents=True, exist_ok=True)
+
+    # Limpa requisicoes orfas residuais em processing de execucoes anteriores
+    try:
+        for old_proc in PROCESSING_DIR.glob("*.json"):
+            old_proc.unlink(missing_ok=True)
+    except Exception:
+        pass
 
     last_hb_write = 0.0
     while True:
@@ -4152,45 +4167,49 @@ def run_daemon_loop(hotp_auth: HOTPAuth):
                     caller_rpc = data.get("caller") or {}
                     rpc_resp = {"id": req_id, "ok": False, "message": "Operacao RPC invalida."}
 
-                    if hmac.compare_digest(actual_hash, expected_hash):
-                        otp_val = unprotect_transit_token(params["otp_dpapi"], req_id, actual_hash) if params.get("otp_dpapi") else None
-                        pw_val = unprotect_transit_token(params["password_dpapi"], req_id, actual_hash) if params.get("password_dpapi") else None
+                    try:
+                        if hmac.compare_digest(actual_hash, expected_hash):
+                            otp_val = unprotect_transit_token(params["otp_dpapi"], req_id, actual_hash) if params.get("otp_dpapi") else None
+                            pw_val = unprotect_transit_token(params["password_dpapi"], req_id, actual_hash) if params.get("password_dpapi") else None
 
-                        if rpc_action == "preauth":
-                            ok_p, msg_p, res_p = hotp_auth.create_preauth_ticket(otp_val or "", caller_rpc, int(params.get("lifetime", 2700)))
-                            rpc_resp = {"id": req_id, "ok": ok_p, "message": msg_p, "data": res_p}
-                        elif rpc_action == "initial_pairing":
-                            ok_ip, msg_ip = hotp_auth.verify_and_finalize_initial_otp(otp_val or "")
-                            rpc_resp = {"id": req_id, "ok": ok_ip, "message": msg_ip}
-                        elif rpc_action == "sync":
-                            res_s = hotp_auth.diagnose_otp_sync(
-                                otp_val or "",
-                                allow_lookahead=bool(params.get("allow_lookahead", False)),
-                                max_lookahead=int(params.get("max_lookahead", 10)),
-                                max_lookback=params.get("max_lookback", 50)
-                            )
-                            rpc_resp = {"id": req_id, "ok": bool(res_s.get("success")), "result": res_s}
-                        elif rpc_action == "revoke_preauth":
-                            ok_r, msg_r = hotp_auth.revoke_preauth_ticket()
-                            rpc_resp = {"id": req_id, "ok": ok_r, "message": msg_r}
-                        elif rpc_action == "repair":
-                            ok_rep, msg_rep = hotp_auth.repair_corrupted_installation(pw_val or "")
-                            rpc_resp = {"id": req_id, "ok": ok_rep, "message": msg_rep}
-                        elif rpc_action == "verify_password":
-                            ok_vp, msg_vp = hotp_auth.verify_quit_password(pw_val or "")
-                            rpc_resp = {"id": req_id, "ok": ok_vp, "message": msg_vp}
-                        elif rpc_action == "uninstall_unlock":
-                            ok_u, msg_u = hotp_auth.authorize_and_prepare_uninstall(pw_val or "", caller_rpc)
-                            rpc_resp = {"id": req_id, "ok": ok_u, "message": msg_u}
-                            with open(RESPONSES_DIR / f"{req_id}.json", "w", encoding="utf-8") as rf:
-                                json.dump(rpc_resp, rf, indent=2, ensure_ascii=False)
-                            proc_file.unlink(missing_ok=True)
-                            if ok_u:
-                                # Proprietário autenticado para desinstalar: libera locks, remove tarefas e encerra o daemon
-                                KernelFileGuard.release_all_locks()
-                                unregister_scheduled_task()
-                                return
-                            continue
+                            if rpc_action == "preauth":
+                                ok_p, msg_p, res_p = hotp_auth.create_preauth_ticket(otp_val or "", caller_rpc, int(params.get("lifetime", 2700)))
+                                rpc_resp = {"id": req_id, "ok": ok_p, "message": msg_p, "data": res_p}
+                            elif rpc_action == "initial_pairing":
+                                ok_ip, msg_ip = hotp_auth.verify_and_finalize_initial_otp(otp_val or "")
+                                rpc_resp = {"id": req_id, "ok": ok_ip, "message": msg_ip}
+                            elif rpc_action == "sync":
+                                res_s = hotp_auth.diagnose_otp_sync(
+                                    otp_val or "",
+                                    allow_lookahead=bool(params.get("allow_lookahead", False)),
+                                    max_lookahead=int(params.get("max_lookahead", 10)),
+                                    max_lookback=params.get("max_lookback", 50)
+                                )
+                                rpc_resp = {"id": req_id, "ok": bool(res_s.get("success")), "result": res_s}
+                            elif rpc_action == "revoke_preauth":
+                                ok_r, msg_r = hotp_auth.revoke_preauth_ticket()
+                                rpc_resp = {"id": req_id, "ok": ok_r, "message": msg_r}
+                            elif rpc_action == "repair":
+                                ok_rep, msg_rep = hotp_auth.repair_corrupted_installation(pw_val or "")
+                                rpc_resp = {"id": req_id, "ok": ok_rep, "message": msg_rep}
+                            elif rpc_action == "verify_password":
+                                ok_vp, msg_vp = hotp_auth.verify_quit_password(pw_val or "")
+                                rpc_resp = {"id": req_id, "ok": ok_vp, "message": msg_vp}
+                            elif rpc_action == "uninstall_unlock":
+                                ok_u, msg_u = hotp_auth.authorize_and_prepare_uninstall(pw_val or "", caller_rpc)
+                                rpc_resp = {"id": req_id, "ok": ok_u, "message": msg_u}
+                                with open(RESPONSES_DIR / f"{req_id}.json", "w", encoding="utf-8") as rf:
+                                    json.dump(rpc_resp, rf, indent=2, ensure_ascii=False)
+                                proc_file.unlink(missing_ok=True)
+                                if ok_u:
+                                    # Proprietário autenticado para desinstalar: libera locks, remove tarefas e encerra o daemon
+                                    KernelFileGuard.release_all_locks()
+                                    unregister_scheduled_task()
+                                    return
+                                continue
+                    except Exception as e:
+                        logging.error(f"[DAEMON RPC ERROR]: {e}")
+                        rpc_resp = {"id": req_id, "ok": False, "message": f"Erro interno no daemon RPC: {e}"}
 
                     with open(RESPONSES_DIR / f"{req_id}.json", "w", encoding="utf-8") as rf:
                         json.dump(rpc_resp, rf, indent=2, ensure_ascii=False)
@@ -4377,9 +4396,13 @@ def safe_input(prompt: str = "") -> str:
         except Exception:
             pass
 
+    # Ambientes não-interativos [daemons, automações, subprocessos sem TTY] não devem travar em MessageBoxW
+    if sys.stdin is None or not hasattr(sys.stdin, "isatty") or not sys.stdin.isatty():
+        return ""
+
     if sys.platform == "win32":
         try:
-            # Diálogo nativo MB_ICONQUESTION (0x20) | MB_YESNO (0x04)
+            # Diálogo nativo MB_ICONQUESTION [0x20] | MB_YESNO [0x04]
             ret = ctypes.windll.user32.MessageBoxW(0, prompt or "Confirmar ação?", "Admin Bridge", 0x24)
             if ret == 6:  # IDYES
                 return "s"
@@ -4428,18 +4451,22 @@ def run_cli_client(args, hotp_auth: HOTPAuth):
     elif args.subcommand in ("sync", "check-otp"):
         lookahead = getattr(args, "lookahead", 10)
         lookback = getattr(args, "lookback", None)
-        res = hotp_auth.diagnose_otp_sync(args.otp, allow_lookahead=False, max_lookahead=min(lookahead, 10), max_lookback=lookback)
+        auto_yes = getattr(args, "yes", False)
+        res = hotp_auth.diagnose_otp_sync(args.otp, allow_lookahead=auto_yes, max_lookahead=min(lookahead, 10), max_lookback=lookback)
         if not res.get("success") and res.get("status") == "prompt_lookahead":
-            print("=" * 65)
-            print("  [AVISO]: Código não encontrado no contador atual nem nos anteriores.")
-            print("  Deseja pesquisar nas próximas 10 posições futuras do seu autenticador?")
-            print("  Atenção: caso não encontre, o contador do sistema saltará 10 posições.")
-            ans = safe_input("  Autorizar busca à frente? [s/n]: ").strip().lower()
-            if ans in ("s", "sim", "y", "yes"):
+            if auto_yes:
                 res = hotp_auth.diagnose_otp_sync(args.otp, allow_lookahead=True, max_lookahead=min(lookahead, 10), max_lookback=lookback)
             else:
-                print("  Busca à frente cancelada. O contador permaneceu inalterado.")
-                sys.exit(1)
+                print("=" * 65)
+                print("  [AVISO]: Código não encontrado no contador atual nem nos anteriores.")
+                print("  Deseja pesquisar nas próximas 10 posições futuras do seu autenticador?")
+                print("  Atenção: caso não encontre, o contador do sistema saltará 10 posições.")
+                ans = safe_input("  Autorizar busca à frente? [s/n]: ").strip().lower()
+                if ans in ("s", "sim", "y", "yes"):
+                    res = hotp_auth.diagnose_otp_sync(args.otp, allow_lookahead=True, max_lookahead=min(lookahead, 10), max_lookback=lookback)
+                else:
+                    print("  Busca à frente cancelada. O contador permaneceu inalterado.")
+                    sys.exit(1)
         print("=" * 65)
         print("          DIAGNÓSTICO E SINCRONIZAÇÃO HOTP")
         print("=" * 65)
@@ -4783,6 +4810,12 @@ def run_cli_setup(args, hotp_auth: HOTPAuth):
         print("Para redefinir a chave, utilize o comando: AdminBridge.exe reset\n")
         sys.exit(1)
 
+    # Se forçado e o daemon estiver ativo, interrompe as tarefas agendadas para liberar os locks de kernel
+    if getattr(args, "force", False):
+        subprocess.run(["schtasks", "/end", "/tn", "AdminBridge"], capture_output=True, check=False, creationflags=0x08000000)
+        subprocess.run(["schtasks", "/end", "/tn", "AdminBridgeWatchdog"], capture_output=True, check=False, creationflags=0x08000000)
+        time.sleep(0.5)
+
     pw = getattr(args, "password", None)
     if not pw:
         import getpass
@@ -4888,6 +4921,7 @@ def main():
     # Comando sync (teste passivo de sincronia do contador)
     p_sync = subparsers.add_parser("sync", help="Diagnóstico e teste de sincronia HOTP sem avançar o contador")
     p_sync.add_argument("--otp", required=True, help="Código OTP de 6 dígitos gerado no aplicativo do celular")
+    p_sync.add_argument("-y", "--yes", action="store_true", help="Autoriza busca à frente automaticamente sem confirmação interativa")
     p_sync.add_argument("--lookahead", type=int, default=10, help="Janela máxima de busca à frente (padrão: 10)")
     p_sync.add_argument("--lookback", type=int, default=None, help="Janela máxima de busca atrás (padrão: até o zero)")
 
